@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title description">
+  <title id="title">Steady Ink project icon</title>
+  <desc id="description">A red ink stroke and pen nib crossing a white annotation canvas on a blue tile.</desc>
+  <rect x="32" y="32" width="448" height="448" rx="96" fill="#2563eb"/>
+  <rect x="104" y="96" width="304" height="320" rx="56" fill="#ffffff"/>
+  <path
+    d="M168 194C198 158 272 154 314 184C347 208 336 243 301 260C273 274 232 272 207 286C176 304 174 337 202 354C235 375 292 365 329 332"
+    fill="none"
+    stroke="#dc2626"
+    stroke-width="28"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
+  <path d="M151 377H361" fill="none" stroke="#2563eb" stroke-width="16" stroke-linecap="round"/>
+  <g transform="translate(342 319) rotate(-43)">
+    <path d="M-17-34H17L24 24L0 45L-24 24Z" fill="#111827"/>
+    <circle cx="0" cy="4" r="6" fill="#ffffff"/>
+    <path d="M0 10V36" fill="none" stroke="#ffffff" stroke-width="6" stroke-linecap="round"/>
+  </g>
+</svg>

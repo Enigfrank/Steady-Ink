@@ -1,0 +1,348 @@
+use serde::{Deserialize, Serialize};
+
+/// 画布中的物理像素坐标。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CanvasPoint {
+    pub x: f32,
+    pub y: f32,
+}
+
+impl CanvasPoint {
+    /// 创建一个画布坐标点。
+    pub const fn new(x: f32, y: f32) -> Self {
+        Self { x, y }
+    }
+}
+
+/// 一个墨迹操作影响到的轴对齐包围框。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct InkBounds {
+    pub left: f32,
+    pub top: f32,
+    pub right: f32,
+    pub bottom: f32,
+}
+
+impl InkBounds {
+    /// 从点集和额外半径计算包围框；空点集返回 `None`。
+    pub fn from_points(points: &[CanvasPoint], radius: f32) -> Option<Self> {
+        let first = points.first()?;
+        let mut bounds = Self {
+            left: first.x,
+            top: first.y,
+            right: first.x,
+            bottom: first.y,
+        };
+
+        for point in &points[1..] {
+            bounds.left = bounds.left.min(point.x);
+            bounds.top = bounds.top.min(point.y);
+            bounds.right = bounds.right.max(point.x);
+            bounds.bottom = bounds.bottom.max(point.y);
+        }
+
+        Some(bounds.expanded(radius))
+    }
+
+    /// 返回向四周扩展指定物理像素后的包围框。
+    pub const fn expanded(self, amount: f32) -> Self {
+        Self {
+            left: self.left - amount,
+            top: self.top - amount,
+            right: self.right + amount,
+            bottom: self.bottom + amount,
+        }
+    }
+
+    /// 返回同时覆盖当前包围框和另一个包围框的并集。
+    pub fn union(self, other: Self) -> Self {
+        Self {
+            left: self.left.min(other.left),
+            top: self.top.min(other.top),
+            right: self.right.max(other.right),
+            bottom: self.bottom.max(other.bottom),
+        }
+    }
+
+    /// 返回两个轴对齐包围框是否存在交集。
+    pub const fn intersects(self, other: Self) -> bool {
+        self.left <= other.right
+            && self.right >= other.left
+            && self.top <= other.bottom
+            && self.bottom >= other.top
+    }
+}
+
+/// 快速画笔颜色。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InkColor {
+    Red,
+    Yellow,
+    Blue,
+    Green,
+    Black,
+    White,
+}
+
+impl InkColor {
+    /// 返回供 Skia 和 egui 共用的非预乘 RGBA 颜色。
+    pub const fn rgba(self) -> [u8; 4] {
+        match self {
+            Self::Red => [220, 38, 38, 255],
+            Self::Yellow => [250, 204, 21, 255],
+            Self::Blue => [37, 99, 235, 255],
+            Self::Green => [22, 163, 74, 255],
+            Self::Black => [17, 24, 39, 255],
+            Self::White => [255, 255, 255, 255],
+        }
+    }
+}
+
+impl Default for InkColor {
+    /// 返回产品默认画笔颜色红色。
+    fn default() -> Self {
+        Self::Red
+    }
+}
+
+/// 固定画笔粗细档位。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PenWidth {
+    Px4,
+    Px8,
+    Px16,
+    Px24,
+}
+
+impl PenWidth {
+    /// 返回当前档位对应的物理像素宽度。
+    pub const fn pixels(self) -> f32 {
+        match self {
+            Self::Px4 => 4.0,
+            Self::Px8 => 8.0,
+            Self::Px16 => 16.0,
+            Self::Px24 => 24.0,
+        }
+    }
+}
+
+impl Default for PenWidth {
+    /// 返回产品默认画笔粗细 8px。
+    fn default() -> Self {
+        Self::Px8
+    }
+}
+
+/// 固定区域橡皮擦直径档位。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EraserSize {
+    Px24,
+    Px48,
+    Px72,
+}
+
+impl EraserSize {
+    /// 返回当前档位对应的物理像素直径。
+    pub const fn pixels(self) -> f32 {
+        match self {
+            Self::Px24 => 24.0,
+            Self::Px48 => 48.0,
+            Self::Px72 => 72.0,
+        }
+    }
+}
+
+impl Default for EraserSize {
+    /// 返回产品默认橡皮擦大小 48px。
+    fn default() -> Self {
+        Self::Px48
+    }
+}
+
+/// 当前选择的墨迹工具。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InkTool {
+    Pen,
+    RegionEraser,
+}
+
+impl Default for InkTool {
+    /// 返回默认画笔工具。
+    fn default() -> Self {
+        Self::Pen
+    }
+}
+
+/// 文档内单调递增的墨迹操作标识。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct OperationId(u64);
+
+impl OperationId {
+    /// 从文档分配器生成新的操作标识。
+    pub(crate) const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// 返回标识的原始整数值，供诊断和性能记录使用。
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// 一条固定颜色和固定宽度的画笔笔画。
+#[derive(Debug, Clone, PartialEq)]
+pub struct DrawStroke {
+    pub id: OperationId,
+    pub points: Vec<CanvasPoint>,
+    pub color: InkColor,
+    pub width: PenWidth,
+    pub bounds: InkBounds,
+}
+
+impl DrawStroke {
+    /// 创建画笔笔画，并预计算用于脏区重绘的包围框。
+    pub(crate) fn new(
+        id: OperationId,
+        points: Vec<CanvasPoint>,
+        color: InkColor,
+        width: PenWidth,
+    ) -> Option<Self> {
+        let bounds = InkBounds::from_points(&points, width.pixels() / 2.0)?;
+        Some(Self {
+            id,
+            points,
+            color,
+            width,
+            bounds,
+        })
+    }
+}
+
+/// 区域橡皮擦的一次椭圆采样。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EraseSample {
+    pub center: CanvasPoint,
+    pub radius_x: f32,
+    pub radius_y: f32,
+    pub rotation_radians: f32,
+}
+
+impl EraseSample {
+    /// 创建普通圆形橡皮擦采样。
+    pub const fn circle(center: CanvasPoint, diameter: f32) -> Self {
+        let radius = diameter / 2.0;
+        Self {
+            center,
+            radius_x: radius,
+            radius_y: radius,
+            rotation_radians: 0.0,
+        }
+    }
+
+    /// 返回覆盖该旋转椭圆的保守轴对齐包围框。
+    pub fn bounds(self) -> InkBounds {
+        let sin = self.rotation_radians.sin();
+        let cos = self.rotation_radians.cos();
+        let half_width = ((self.radius_x * cos).powi(2) + (self.radius_y * sin).powi(2)).sqrt();
+        let half_height = ((self.radius_x * sin).powi(2) + (self.radius_y * cos).powi(2)).sqrt();
+        InkBounds {
+            left: self.center.x - half_width,
+            top: self.center.y - half_height,
+            right: self.center.x + half_width,
+            bottom: self.center.y + half_height,
+        }
+    }
+}
+
+/// 一次完整普通或手掌区域擦除会话。
+#[derive(Debug, Clone, PartialEq)]
+pub struct EraseStroke {
+    pub id: OperationId,
+    pub samples: Vec<EraseSample>,
+    pub bounds: InkBounds,
+}
+
+impl EraseStroke {
+    /// 创建区域擦除操作，并合并全部采样的影响范围。
+    pub(crate) fn new(id: OperationId, samples: Vec<EraseSample>) -> Option<Self> {
+        let mut sample_iter = samples.iter().copied();
+        let first_bounds = sample_iter.next()?.bounds();
+        let bounds = sample_iter.fold(first_bounds, |current, sample| {
+            current.union(sample.bounds())
+        });
+        Some(Self {
+            id,
+            samples,
+            bounds,
+        })
+    }
+}
+
+/// 清屏操作及其清屏前可见内容范围。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ClearOperation {
+    pub id: OperationId,
+    pub affected_bounds: Option<InkBounds>,
+}
+
+/// 墨迹文档中的可撤销操作。
+#[derive(Debug, Clone, PartialEq)]
+pub enum InkOperation {
+    DrawStroke(DrawStroke),
+    EraseStroke(EraseStroke),
+    Clear(ClearOperation),
+}
+
+impl InkOperation {
+    /// 返回操作的文档内标识。
+    pub const fn id(&self) -> OperationId {
+        match self {
+            Self::DrawStroke(stroke) => stroke.id,
+            Self::EraseStroke(stroke) => stroke.id,
+            Self::Clear(clear) => clear.id,
+        }
+    }
+
+    /// 返回操作影响到的画布区域。
+    pub const fn bounds(&self) -> Option<InkBounds> {
+        match self {
+            Self::DrawStroke(stroke) => Some(stroke.bounds),
+            Self::EraseStroke(stroke) => Some(stroke.bounds),
+            Self::Clear(clear) => clear.affected_bounds,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 验证局部撤销重建使用的包围框相交判定覆盖接触边界。
+    #[test]
+    fn bounds_intersection_includes_touching_edges() {
+        let first = InkBounds {
+            left: 0.0,
+            top: 0.0,
+            right: 10.0,
+            bottom: 10.0,
+        };
+        let touching = InkBounds {
+            left: 10.0,
+            top: 5.0,
+            right: 20.0,
+            bottom: 15.0,
+        };
+        let separate = InkBounds {
+            left: 11.0,
+            top: 0.0,
+            right: 20.0,
+            bottom: 10.0,
+        };
+
+        assert!(first.intersects(touching));
+        assert!(!first.intersects(separate));
+    }
+}

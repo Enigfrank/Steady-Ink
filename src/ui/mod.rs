@@ -30,14 +30,14 @@ pub fn configure_context(context: &egui::Context) {
     context.set_style_of(egui::Theme::Light, style);
 }
 
-/// 把 egui 内建标题、复选框、菜单和滚动条尺寸纳入统一的 81.648% 界面比例。
+/// 把 egui 内建标题、复选框、菜单和滚动条尺寸纳入统一的 80% 界面比例。
 fn scale_builtin_style(style: &mut egui::Style) {
     let scale = design_tokens::INTERFACE_SCALE as f32;
     for font in style.text_styles.values_mut() {
         font.size *= scale;
     }
-    style.spacing.window_margin = egui::Margin::same(design_tokens::SPACE_2 as i8);
-    style.spacing.menu_margin = egui::Margin::same(design_tokens::SPACE_2 as i8);
+    style.spacing.window_margin = egui::Margin::same(design_tokens::MARGIN_SPACE_2);
+    style.spacing.menu_margin = egui::Margin::same(design_tokens::MARGIN_SPACE_2);
     style.spacing.indent *= scale;
     style.spacing.interact_size *= scale;
     style.spacing.slider_width *= scale;

@@ -661,7 +661,7 @@ mod tests {
     fn floating_window_top_preserves_dragged_position_within_monitor() {
         let monitor_position = PhysicalPosition::new(100, 50);
         let monitor_size = PhysicalSize::new(1_920, 1_080);
-        let window_size = PhysicalSize::new(72, 202);
+        let window_size = PhysicalSize::new(70, 198);
 
         assert_eq!(
             clamp_window_top(320, monitor_position, monitor_size, window_size),
@@ -673,7 +673,7 @@ mod tests {
         );
         assert_eq!(
             clamp_window_top(2_000, monitor_position, monitor_size, window_size),
-            928
+            932
         );
     }
 

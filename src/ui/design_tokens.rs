@@ -1,6 +1,6 @@
 use egui::Color32;
 
-pub const INTERFACE_SCALE: f64 = 0.81648;
+pub const INTERFACE_SCALE: f64 = 0.8;
 pub const INTERFACE_ALPHA: u8 = 128;
 
 pub const COLOR_BACKGROUND: Color32 =
@@ -32,11 +32,12 @@ pub const SPACE_2: f32 = scale_points(8.0);
 pub const SPACE_3: f32 = scale_points(12.0);
 pub const SPACE_4: f32 = scale_points(16.0);
 pub const SPACE_6: f32 = scale_points(24.0);
-pub const CARD_RADIUS: u8 = 7;
-pub const CAPSULE_RADIUS: u8 = 13;
-pub const BUTTON_RADIUS: u8 = 5;
+pub const MARGIN_SPACE_2: i8 = scale_integer_points(8) as i8;
+pub const MARGIN_SPACE_4: i8 = scale_integer_points(16) as i8;
+pub const CARD_RADIUS: u8 = scale_integer_points(8);
+pub const CAPSULE_RADIUS: u8 = scale_integer_points(16);
+pub const BUTTON_RADIUS: u8 = scale_integer_points(6);
 pub const TOUCH_TARGET: f32 = scale_points(64.0);
-pub const TOOL_BUTTON_WIDTH: f32 = scale_points(64.0);
 pub const ICON_SIZE: f32 = scale_points(20.0);
 pub const PAGE_NUMBER_WIDTH: f32 = scale_points(80.0);
 pub const DIAGNOSTIC_LABEL_WIDTH: f32 = scale_points(112.0);
@@ -53,6 +54,11 @@ pub const fn scale_window_points(value: f64) -> f64 {
     value * INTERFACE_SCALE
 }
 
+/// 按统一界面比例缩放 egui 整数尺寸，并四舍五入到最近的逻辑点。
+const fn scale_integer_points(value: u8) -> u8 {
+    (value as f64 * INTERFACE_SCALE + 0.5) as u8
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -60,9 +66,12 @@ mod tests {
     /// 验证全局界面缩放和表面透明度保持产品要求。
     #[test]
     fn interface_scale_and_alpha_match_product_settings() {
-        assert_eq!(INTERFACE_SCALE, 0.81648);
+        assert_eq!(INTERFACE_SCALE, 0.8);
         assert_eq!(INTERFACE_ALPHA, 128);
-        assert!((TOUCH_TARGET - 52.25472).abs() < f32::EPSILON);
+        assert!((TOUCH_TARGET - 51.2).abs() < f32::EPSILON);
+        assert_eq!(MARGIN_SPACE_2, 6);
+        assert_eq!(MARGIN_SPACE_4, 13);
+        assert_eq!(CARD_RADIUS, 6);
         assert_eq!(COLOR_SURFACE.a(), INTERFACE_ALPHA);
         assert_eq!(COLOR_PRIMARY_SURFACE.a(), INTERFACE_ALPHA);
         assert_eq!(COLOR_ERROR_SURFACE.a(), INTERFACE_ALPHA);

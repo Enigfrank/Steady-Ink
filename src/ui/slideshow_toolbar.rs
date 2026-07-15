@@ -59,7 +59,7 @@ fn render_navigation_group(
                 .fill(tokens::COLOR_BACKGROUND)
                 .stroke(Stroke::new(1.0, tokens::COLOR_BORDER))
                 .corner_radius(CornerRadius::same(tokens::CAPSULE_RADIUS))
-                .inner_margin(Margin::same(tokens::SPACE_2 as i8))
+                .inner_margin(Margin::same(tokens::MARGIN_SPACE_2))
                 .show(ui, |ui| {
                     ui.add_enabled_ui(view.slideshow_controls_enabled, |ui| {
                         ui.horizontal(|ui| {
@@ -193,7 +193,7 @@ fn render_toolbar_body(
                 .fill(tokens::COLOR_BACKGROUND)
                 .stroke(Stroke::new(1.0, tokens::COLOR_BORDER))
                 .corner_radius(CornerRadius::same(tokens::CAPSULE_RADIUS))
-                .inner_margin(Margin::same(tokens::SPACE_2 as i8))
+                .inner_margin(Margin::same(tokens::MARGIN_SPACE_2))
                 .show(ui, |ui| {
                     ui.set_min_width(toolbar_body_content_width());
                     ui.set_max_width(toolbar_body_content_width());
@@ -253,7 +253,7 @@ fn render_toolbar_toggle(
                 .fill(tokens::COLOR_BACKGROUND)
                 .stroke(Stroke::new(1.0, tokens::COLOR_BORDER))
                 .corner_radius(CornerRadius::same(tokens::CAPSULE_RADIUS))
-                .inner_margin(Margin::same(tokens::SPACE_2 as i8))
+                .inner_margin(Margin::same(tokens::MARGIN_SPACE_2))
                 .show(ui, |ui| {
                     ui.add_enabled_ui(view.mode != AppMode::SlideShowConnectionLost, |ui| {
                         let (label, icon) = if expanded {
@@ -286,8 +286,8 @@ fn render_connection_status(context: &Context) {
                 .stroke(Stroke::new(1.0, tokens::COLOR_ERROR_SURFACE))
                 .corner_radius(CornerRadius::same(tokens::CARD_RADIUS))
                 .inner_margin(Margin::symmetric(
-                    tokens::SPACE_4 as i8,
-                    tokens::SPACE_2 as i8,
+                    tokens::MARGIN_SPACE_4,
+                    tokens::MARGIN_SPACE_2,
                 ))
                 .show(ui, |ui| {
                     ui.label(
@@ -312,7 +312,7 @@ fn render_dismiss_confirmation(context: &Context) -> Option<UiCommand> {
                 .fill(tokens::COLOR_SURFACE)
                 .stroke(Stroke::new(1.0, tokens::COLOR_BORDER))
                 .corner_radius(CornerRadius::same(tokens::CARD_RADIUS))
-                .inner_margin(Margin::same(tokens::SPACE_2 as i8))
+                .inner_margin(Margin::same(tokens::MARGIN_SPACE_2))
                 .show(ui, |ui| {
                     ui.vertical_centered(|ui| {
                         ui.label(
@@ -350,7 +350,7 @@ fn bottom_toolbar_top(screen: Rect) -> f32 {
 
 /// 返回八个功能按钮及间距占用的固定内容宽度。
 const fn toolbar_body_content_width() -> f32 {
-    BODY_BUTTON_COUNT * tokens::TOOL_BUTTON_WIDTH + (BODY_BUTTON_COUNT - 1.0) * tokens::SPACE_2
+    BODY_BUTTON_COUNT * tokens::TOUCH_TARGET + (BODY_BUTTON_COUNT - 1.0) * tokens::SPACE_2
 }
 
 /// 返回包含左右内边距的底部工具栏主体宽度。

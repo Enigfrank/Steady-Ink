@@ -30,7 +30,7 @@ fn render_preferences_panel(ui: &mut Ui, view: UiViewState<'_>) -> Option<UiComm
         .fill(tokens::COLOR_BACKGROUND)
         .stroke(Stroke::new(1.0, tokens::COLOR_BORDER))
         .corner_radius(CornerRadius::same(tokens::CARD_RADIUS))
-        .inner_margin(Margin::same(tokens::SPACE_2 as i8))
+        .inner_margin(Margin::same(tokens::MARGIN_SPACE_2))
         .show(ui, |ui| {
             ui.with_layout(Layout::top_down(Align::Min), |ui| {
                 ui.set_min_width(tokens::QUICK_SETTINGS_CONTENT_WIDTH);

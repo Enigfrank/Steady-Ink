@@ -153,7 +153,7 @@ pub(super) fn render_idle_toolbar(ui: &mut Ui) -> Option<UiCommand> {
         .fill(tokens::COLOR_BACKGROUND)
         .stroke(Stroke::new(1.0, tokens::COLOR_BORDER))
         .corner_radius(CornerRadius::same(tokens::CARD_RADIUS))
-        .inner_margin(Margin::same(tokens::SPACE_2 as i8))
+        .inner_margin(Margin::same(tokens::MARGIN_SPACE_2))
         .show(ui, |ui| {
             ui.vertical_centered(|ui| {
                 let annotation = icon_button(ui, "批注", Icon::Pen, false, None);
@@ -208,7 +208,7 @@ fn render_annotation_toolbar(
                 .fill(tokens::COLOR_BACKGROUND)
                 .stroke(Stroke::new(1.0, tokens::COLOR_BORDER))
                 .corner_radius(CornerRadius::same(tokens::CARD_RADIUS))
-                .inner_margin(Margin::same(tokens::SPACE_2 as i8))
+                .inner_margin(Margin::same(tokens::MARGIN_SPACE_2))
                 .show(ui, |ui| {
                     ui.vertical_centered(|ui| {
                         let mut interaction = render_ink_tool_buttons(
@@ -271,7 +271,7 @@ struct NormalToolbarState {
 fn normal_toolbar_size() -> Vec2 {
     const BUTTON_COUNT: f32 = 8.0;
     Vec2::new(
-        tokens::TOOL_BUTTON_WIDTH + tokens::SPACE_2 * 2.0,
+        tokens::TOUCH_TARGET + tokens::SPACE_2 * 2.0,
         BUTTON_COUNT * tokens::TOUCH_TARGET
             + (BUTTON_COUNT - 1.0) * tokens::SPACE_2
             + tokens::SPACE_2 * 2.0,
@@ -449,7 +449,7 @@ pub(super) fn icon_button(
     selected: bool,
     swatch: Option<Color32>,
 ) -> Response {
-    let desired_size = Vec2::new(tokens::TOOL_BUTTON_WIDTH, tokens::TOUCH_TARGET);
+    let desired_size = Vec2::splat(tokens::TOUCH_TARGET);
     let (rect, response) = ui.allocate_exact_size(desired_size, Sense::click_and_drag());
     if ui.is_rect_visible(rect) {
         let enabled = ui.is_enabled();

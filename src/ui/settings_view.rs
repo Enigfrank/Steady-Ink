@@ -17,7 +17,7 @@ pub fn render(ui: &mut Ui, view: UiViewState<'_>) -> Option<UiCommand> {
         .fill(tokens::COLOR_BACKGROUND)
         .stroke(Stroke::new(1.0, tokens::COLOR_BORDER))
         .corner_radius(CornerRadius::same(tokens::CARD_RADIUS))
-        .inner_margin(Margin::same(tokens::SPACE_4 as i8))
+        .inner_margin(Margin::same(tokens::MARGIN_SPACE_4))
         .show(ui, |ui| {
             ui.set_min_size(ui.available_size());
             let mut command = render_header(ui);

@@ -226,7 +226,7 @@ fn draw_selection_visual(ui: &Ui, center: Pos2, visual: SelectionVisual) {
             ui.painter().circle_stroke(
                 center,
                 radius,
-                Stroke::new(2.0, tokens::COLOR_TEXT_SECONDARY),
+                Stroke::new(tokens::scale_points(2.0), tokens::COLOR_TEXT_SECONDARY),
             );
         }
     }

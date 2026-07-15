@@ -6,7 +6,7 @@ use egui::{
 use super::{
     design_tokens as tokens,
     settings_controls::render_tool_preferences,
-    toolbar::{UiCommand, UiViewState},
+    toolbar::{Icon, UiCommand, UiViewState, icon_button},
 };
 use crate::slideshow::{ComCandidateStatus, ComDiagnostics};
 
@@ -70,6 +70,13 @@ pub fn render(ui: &mut Ui, view: UiViewState<'_>) -> Option<UiCommand> {
                     "Steady Ink",
                     tokens::COLOR_TEXT_PRIMARY,
                 );
+
+                ui.separator();
+                section_heading(ui, "应用操作");
+                let exit_clicked = icon_button(ui, "退出软件", Icon::Power, false, None).clicked();
+                if exit_clicked && command.is_none() {
+                    command = Some(UiCommand::ExitApplication);
+                }
             });
             command
         })
@@ -90,7 +97,7 @@ fn render_header(ui: &mut Ui) -> Option<UiCommand> {
     command
 }
 
-/// 绘制 64pt 触摸命中区域的关闭图标按钮。
+/// 绘制统一缩放后触摸命中区域的关闭图标按钮。
 fn close_button(ui: &mut Ui) -> egui::Response {
     let size = Vec2::splat(tokens::TOUCH_TARGET);
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
@@ -114,14 +121,14 @@ fn close_button(ui: &mut Ui) -> egui::Response {
                 rect.center() + egui::vec2(-half, -half),
                 rect.center() + egui::vec2(half, half),
             ],
-            Stroke::new(2.0, tokens::COLOR_TEXT_SECONDARY),
+            Stroke::new(tokens::scale_points(2.0), tokens::COLOR_TEXT_SECONDARY),
         );
         ui.painter().line_segment(
             [
                 rect.center() + egui::vec2(half, -half),
                 rect.center() + egui::vec2(-half, half),
             ],
-            Stroke::new(2.0, tokens::COLOR_TEXT_SECONDARY),
+            Stroke::new(tokens::scale_points(2.0), tokens::COLOR_TEXT_SECONDARY),
         );
     }
     response.on_hover_text("关闭设置")
@@ -165,8 +172,8 @@ fn render_diagnostics(ui: &mut Ui, view: UiViewState<'_>) {
     diagnostic_row(
         ui,
         "图形设备",
-        &view.gl_diagnostics.renderer,
-        if view.gl_diagnostics.software_fallback {
+        &view.graphics_diagnostics.renderer,
+        if view.graphics_diagnostics.software_fallback {
             tokens::COLOR_ERROR
         } else {
             tokens::COLOR_TEXT_PRIMARY

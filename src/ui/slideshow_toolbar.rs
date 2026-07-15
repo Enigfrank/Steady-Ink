@@ -1,13 +1,14 @@
 use egui::{
-    Align2, Area, Context, CornerRadius, FontId, Frame, Id, Margin, Order, Pos2, Rect, Sense,
-    Stroke, StrokeKind, Ui, Vec2,
+    Align2, Area, Context, CornerRadius, FontId, Frame, Id, Margin, Order, Pos2, Rect, RectAlign,
+    Sense, Stroke, StrokeKind, Ui, Vec2,
 };
 
 use super::{
     design_tokens as tokens,
+    settings_controls::SelectorOrientation,
     toolbar::{Icon, UiCommand, UiViewState, icon_button, render_ink_tool_buttons},
 };
-use crate::app::AppMode;
+use crate::{app::AppMode, window::DockSide};
 
 const BODY_BUTTON_COUNT: f32 = 8.0;
 
@@ -16,11 +17,11 @@ pub fn render(context: &Context, view: UiViewState<'_>) -> Option<UiCommand> {
     let mut command = None;
     keep_first(
         &mut command,
-        render_navigation_group(context, Align2::LEFT_CENTER, view),
+        render_navigation_group(context, DockSide::Left, view),
     );
     keep_first(
         &mut command,
-        render_navigation_group(context, Align2::RIGHT_CENTER, view),
+        render_navigation_group(context, DockSide::Right, view),
     );
     keep_first(&mut command, render_bottom_toolbar(context, view));
 
@@ -45,20 +46,10 @@ fn keep_first(target: &mut Option<UiCommand>, candidate: Option<UiCommand>) {
 /// 在屏幕指定一侧绘制完整的上一页、可选页码和下一页控件组。
 fn render_navigation_group(
     context: &Context,
-    anchor: Align2,
+    side: DockSide,
     view: UiViewState<'_>,
 ) -> Option<UiCommand> {
-    let (id, offset) = if anchor == Align2::LEFT_CENTER {
-        (
-            Id::new("slideshow_navigation_left"),
-            Vec2::new(tokens::SPACE_6, 0.0),
-        )
-    } else {
-        (
-            Id::new("slideshow_navigation_right"),
-            Vec2::new(-tokens::SPACE_6, 0.0),
-        )
-    };
+    let (id, anchor, offset) = navigation_placement(side);
 
     Area::new(id)
         .anchor(anchor, offset)
@@ -91,6 +82,22 @@ fn render_navigation_group(
                 .inner
         })
         .inner
+}
+
+/// 返回左右翻页组在对应屏幕下角的稳定锚点，并让控件外框紧贴屏幕边缘。
+fn navigation_placement(side: DockSide) -> (Id, Align2, Vec2) {
+    match side {
+        DockSide::Left => (
+            Id::new("slideshow_navigation_left"),
+            Align2::LEFT_BOTTOM,
+            Vec2::ZERO,
+        ),
+        DockSide::Right => (
+            Id::new("slideshow_navigation_right"),
+            Align2::RIGHT_BOTTOM,
+            Vec2::ZERO,
+        ),
+    }
 }
 
 /// 绘制仅在页码可靠时出现的页码区域，不为未知页码预留空白宽度。
@@ -133,7 +140,7 @@ fn render_bottom_toolbar(context: &Context, view: UiViewState<'_>) -> Option<UiC
     let overlap = tokens::SPACE_2;
     let full_width = toggle_width + body_width - overlap;
     let toggle_left = screen.center().x - full_width / 2.0;
-    let toolbar_top = screen.bottom() - tokens::SPACE_6 - toolbar_outer_height();
+    let toolbar_top = bottom_toolbar_top(screen);
     let body_origin_x = toggle_left + toggle_width - overlap;
     let expanded = view.mode != AppMode::SlideShowAnnotatingCollapsed;
     let progress = context.animate_bool_with_time(
@@ -191,7 +198,12 @@ fn render_toolbar_body(
                     ui.set_min_width(toolbar_body_content_width());
                     ui.set_max_width(toolbar_body_content_width());
                     ui.horizontal(|ui| {
-                        let interaction = render_ink_tool_buttons(ui, view.tools);
+                        let interaction = render_ink_tool_buttons(
+                            ui,
+                            view.tools,
+                            RectAlign::TOP_START,
+                            SelectorOrientation::Horizontal,
+                        );
                         let mut command = interaction.command;
                         let (exit_label, exit_enabled, requested_command) =
                             if view.mode == AppMode::SlideShowConnectionLost {
@@ -264,17 +276,14 @@ fn render_connection_status(context: &Context) {
     Area::new("slideshow_connection_status".into())
         .anchor(
             Align2::CENTER_BOTTOM,
-            Vec2::new(
-                0.0,
-                -(tokens::SPACE_6 + toolbar_outer_height() + tokens::SPACE_2),
-            ),
+            Vec2::new(0.0, -(toolbar_outer_height() + tokens::SPACE_2)),
         )
         .order(Order::Foreground)
         .interactable(false)
         .show(context, |ui| {
             Frame::new()
                 .fill(tokens::COLOR_SURFACE)
-                .stroke(Stroke::new(1.0, tokens::COLOR_ERROR))
+                .stroke(Stroke::new(1.0, tokens::COLOR_ERROR_SURFACE))
                 .corner_radius(CornerRadius::same(tokens::CARD_RADIUS))
                 .inner_margin(Margin::symmetric(
                     tokens::SPACE_4 as i8,
@@ -295,10 +304,7 @@ fn render_dismiss_confirmation(context: &Context) -> Option<UiCommand> {
     Area::new("slideshow_dismiss_confirmation".into())
         .anchor(
             Align2::CENTER_BOTTOM,
-            Vec2::new(
-                0.0,
-                -(tokens::SPACE_6 + toolbar_outer_height() + tokens::SPACE_2),
-            ),
+            Vec2::new(0.0, -(toolbar_outer_height() + tokens::SPACE_2)),
         )
         .order(Order::Foreground)
         .show(context, |ui| {
@@ -337,6 +343,11 @@ const fn toolbar_outer_height() -> f32 {
     tokens::TOUCH_TARGET + tokens::SPACE_2 * 2.0
 }
 
+/// 返回底部胶囊工具栏紧贴屏幕底边时的顶部坐标。
+fn bottom_toolbar_top(screen: Rect) -> f32 {
+    screen.bottom() - toolbar_outer_height()
+}
+
 /// 返回八个功能按钮及间距占用的固定内容宽度。
 const fn toolbar_body_content_width() -> f32 {
     BODY_BUTTON_COUNT * tokens::TOOL_BUTTON_WIDTH + (BODY_BUTTON_COUNT - 1.0) * tokens::SPACE_2
@@ -345,4 +356,32 @@ const fn toolbar_body_content_width() -> f32 {
 /// 返回包含左右内边距的底部工具栏主体宽度。
 const fn toolbar_body_width() -> f32 {
     toolbar_body_content_width() + tokens::SPACE_2 * 2.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 验证双侧翻页组固定在左右下角，并同时紧贴横向和纵向屏幕边缘。
+    #[test]
+    fn navigation_groups_use_bottom_corner_anchors() {
+        let (_, left_anchor, left_offset) = navigation_placement(DockSide::Left);
+        let (_, right_anchor, right_offset) = navigation_placement(DockSide::Right);
+
+        assert_eq!(left_anchor, Align2::LEFT_BOTTOM);
+        assert_eq!(right_anchor, Align2::RIGHT_BOTTOM);
+        assert_eq!(left_offset, Vec2::ZERO);
+        assert_eq!(right_offset, Vec2::ZERO);
+    }
+
+    /// 验证放映态中央工具栏的外框底边与屏幕底边完全重合。
+    #[test]
+    fn bottom_toolbar_touches_screen_bottom() {
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1_920.0, 1_080.0));
+
+        assert_eq!(
+            bottom_toolbar_top(screen) + toolbar_outer_height(),
+            screen.bottom()
+        );
+    }
 }

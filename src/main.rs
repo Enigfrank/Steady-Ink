@@ -1,4 +1,4 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![windows_subsystem = "windows"]
 
 /// 启动 Steady Ink，并把启动错误写入标准错误流。
 fn main() {

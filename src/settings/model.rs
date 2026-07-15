@@ -12,7 +12,7 @@ pub struct ToolPreferences {
 }
 
 impl Default for ToolPreferences {
-    /// 返回产品确认的红色、8px 画笔和 48px 橡皮擦默认值。
+    /// 返回产品确认的红色、4pt 画笔和 48px 橡皮擦默认值。
     fn default() -> Self {
         Self {
             color: InkColor::default(),

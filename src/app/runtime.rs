@@ -28,7 +28,7 @@ use crate::{
         ComDetector, ComDetectorEvent, ComDiagnostics, SlideShowControlAction, SlideShowSession,
     },
     ui::{self, IdlePanel, ToolState, UiCommand, UiViewState},
-    window::{GlWindowContext, IdleWindowView},
+    window::{D3DWindowContext, IdleWindowView},
 };
 
 /// egui 请求立即或延迟重绘时发送给 winit 的用户事件。
@@ -133,7 +133,7 @@ impl ActiveGesture {
 /// 组合窗口、渲染器、状态机和输入路由的单窗口运行时。
 struct DesktopRuntime {
     compositor: Compositor,
-    gl_window: GlWindowContext,
+    window_context: D3DWindowContext,
     state: AppState,
     empty_document: InkDocument,
     tools: ToolState,
@@ -174,15 +174,15 @@ impl DesktopRuntime {
             pen_width: settings.tools.pen_width,
             eraser_size: settings.tools.eraser_size,
         };
-        let gl_window = GlWindowContext::new(event_loop)?;
-        let compositor = Compositor::new(event_loop, &gl_window)?;
+        let window_context = D3DWindowContext::new(event_loop)?;
+        let compositor = Compositor::new(event_loop, &window_context)?;
         let wake_proxy = event_proxy;
         let slideshow_detector = ComDetector::spawn(move || {
             let _ = wake_proxy.send_event(UserEvent::ExternalEvent);
         });
         Ok(Self {
             compositor,
-            gl_window,
+            window_context,
             state: AppState::default(),
             empty_document: InkDocument::new(),
             tools,
@@ -205,28 +205,32 @@ impl DesktopRuntime {
 
     /// 返回当前运行时窗口标识。
     fn window_id(&self) -> WindowId {
-        self.gl_window.window().id()
+        self.window_context.window().id()
     }
 
     /// 处理非重绘窗口事件，并返回 egui 是否请求重绘。
     fn handle_window_event(&mut self, event: &WindowEvent) -> Result<bool, AppError> {
         let surface_rebuilt = if let WindowEvent::Resized(size) = event {
-            self.gl_window.resize(*size);
-            self.compositor.resize((*size).into())?;
+            self.compositor
+                .resize(&mut self.window_context, (*size).into())?;
             self.performance.record_surface_rebuild();
+            if self.state.mode() == AppMode::IdleFloatingToolbar {
+                self.window_context
+                    .correct_idle_size(self.current_idle_window_view(), *size);
+            }
             true
         } else {
             false
         };
         if self.idle_window_dragging && window_drag_finished(event) {
             self.idle_window_dragging = false;
-            self.gl_window
+            self.window_context
                 .finish_idle_window_drag(self.current_idle_window_view());
         }
 
         let event_response = self
             .compositor
-            .on_window_event(self.gl_window.window(), event);
+            .on_window_event(self.window_context.window(), event);
         if let Some(pointer_action) = self.input_router.route(
             event,
             event_response.consumed,
@@ -292,8 +296,8 @@ impl DesktopRuntime {
         }
     }
 
-    /// 运行 UI、合成 Skia 与 egui，并在一帧末尾交换一次缓冲区。
-    fn render(&mut self) -> Result<(), AppError> {
+    /// 运行 UI、合成 Skia 与 egui，并返回本帧是否请求退出应用。
+    fn render(&mut self) -> Result<bool, AppError> {
         let frame_started_at = self.performance.begin_frame();
         let mode = self.state.mode();
         let tools = self.tools;
@@ -308,7 +312,7 @@ impl DesktopRuntime {
         let view = UiViewState {
             mode,
             idle_panel: self.idle_panel,
-            dock_side: self.gl_window.dock_side(),
+            dock_side: self.window_context.dock_side(),
             tools,
             slideshow_integration_enabled: self.settings.slideshow_integration_enabled,
             slide_page_numbers,
@@ -319,34 +323,31 @@ impl DesktopRuntime {
             slideshow_control_error: self.slideshow_control_error.as_deref(),
             settings_error: self.settings_error.as_deref(),
             settings_path: self.settings_store.path(),
-            gl_diagnostics: self.gl_window.diagnostics(),
+            graphics_diagnostics: self.window_context.diagnostics(),
         };
         let mut ui_command = None;
-        self.compositor.run_ui(self.gl_window.window(), |ui| {
+        self.compositor.run_ui(self.window_context.window(), |ui| {
             ui_command = ui::render(ui, view)
         });
 
         let document = self.state.active_document().unwrap_or(&self.empty_document);
         let preview = self.active_gesture.as_ref().map(ActiveGesture::preview);
         self.compositor
-            .paint(self.gl_window.window(), document, preview);
-        self.gl_window.swap_buffers()?;
+            .paint(&self.window_context, document, preview)?;
+        self.window_context.present()?;
         self.performance.finish_frame(frame_started_at);
-        self.gl_window.window().set_visible(true);
 
-        if let Some(command) = ui_command {
-            self.apply_ui_command(command);
-        }
-        Ok(())
+        Ok(ui_command.is_some_and(|command| self.apply_ui_command(command)))
     }
 
-    /// 执行工具栏命令，并在模式变化时同步窗口几何和缓存生命周期。
-    fn apply_ui_command(&mut self, command: UiCommand) {
+    /// 执行工具栏命令，并返回该命令是否要求事件循环退出。
+    fn apply_ui_command(&mut self, command: UiCommand) -> bool {
         match command {
+            UiCommand::ExitApplication => return true,
             UiCommand::EnterAnnotation => {
                 if self.state.enter_normal_annotation() {
                     self.idle_panel = IdlePanel::Toolbar;
-                    self.gl_window.set_annotation_mode(true);
+                    self.window_context.set_annotation_mode(true);
                     self.compositor.invalidate_ink_cache();
                 }
             }
@@ -354,14 +355,12 @@ impl DesktopRuntime {
                 if self.state.exit_normal_annotation() {
                     self.active_gesture = None;
                     self.input_router.cancel();
-                    self.gl_window.set_annotation_mode(false);
+                    self.window_context.set_annotation_mode(false);
                     self.compositor.invalidate_ink_cache();
                 }
             }
             UiCommand::SelectPen => self.tools.tool = InkTool::Pen,
             UiCommand::SelectEraser => self.tools.tool = InkTool::RegionEraser,
-            UiCommand::CycleColor => self.tools.cycle_color(),
-            UiCommand::CyclePenWidth => self.tools.cycle_pen_width(),
             UiCommand::CycleEraserSize => self.tools.cycle_eraser_size(),
             UiCommand::SetColor(color) => {
                 self.tools.color = color;
@@ -396,14 +395,15 @@ impl DesktopRuntime {
             UiCommand::OpenSettings => {
                 if self.state.mode() == AppMode::IdleFloatingToolbar {
                     self.idle_panel = IdlePanel::Settings;
-                    self.gl_window
+                    self.window_context
                         .set_idle_window_view(IdleWindowView::Settings);
                 }
             }
             UiCommand::CloseSettings => {
                 if self.state.mode() == AppMode::IdleFloatingToolbar {
                     self.idle_panel = IdlePanel::Toolbar;
-                    self.gl_window.set_idle_window_view(IdleWindowView::Toolbar);
+                    self.window_context
+                        .set_idle_window_view(IdleWindowView::Toolbar);
                 }
             }
             UiCommand::ToggleQuickSettings => {
@@ -418,17 +418,17 @@ impl DesktopRuntime {
                     } else {
                         IdleWindowView::Toolbar
                     };
-                    self.gl_window.set_idle_window_view(window_view);
+                    self.window_context.set_idle_window_view(window_view);
                 }
             }
             UiCommand::BeginIdleToolbarDrag => {
                 if self.state.mode() == AppMode::IdleFloatingToolbar {
                     self.idle_window_dragging = true;
-                    self.gl_window.begin_window_drag();
+                    self.window_context.begin_window_drag();
                 }
             }
             UiCommand::SetDockSide(side) => {
-                self.gl_window.set_dock_side(side);
+                self.window_context.set_dock_side(side);
             }
             UiCommand::SetSlideshowIntegrationEnabled(enabled) => {
                 self.settings.slideshow_integration_enabled = enabled;
@@ -474,6 +474,7 @@ impl DesktopRuntime {
             }
         }
         self.request_redraw(RedrawReason::UiCommand);
+        false
     }
 
     /// 保存当前用户偏好，并把失败信息留给设置诊断界面。
@@ -532,7 +533,7 @@ impl DesktopRuntime {
                 self.compositor.cancel_egui_pointer();
             }
             let ui_hit = event.position().is_some_and(|position| {
-                let scale_factor = self.gl_window.window().scale_factor() as f32;
+                let scale_factor = self.window_context.window().scale_factor() as f32;
                 let logical_position =
                     egui::pos2(position.x / scale_factor, position.y / scale_factor);
                 self.compositor
@@ -635,14 +636,14 @@ impl DesktopRuntime {
         self.active_gesture = None;
         self.input_router.cancel();
         self.idle_panel = IdlePanel::Toolbar;
-        self.gl_window.set_annotation_mode(annotation_enabled);
+        self.window_context.set_annotation_mode(annotation_enabled);
         self.compositor.invalidate_ink_cache();
     }
 
     /// 记录原因并向唯一窗口请求一次按需重绘。
     fn request_redraw(&mut self, reason: RedrawReason) {
         self.performance.record_redraw(reason);
-        self.gl_window.window().request_redraw();
+        self.window_context.window().request_redraw();
     }
 }
 
@@ -747,7 +748,7 @@ impl ApplicationHandler<UserEvent> for DesktopApplication {
                 self.install_repaint_callback(&runtime);
                 self.runtime = Some(runtime);
                 if let Some(runtime) = self.runtime.as_mut() {
-                    if let Err(error) = runtime.gl_window.show() {
+                    if let Err(error) = runtime.window_context.show() {
                         self.startup_error = Some(error);
                         event_loop.exit();
                         return;
@@ -783,11 +784,13 @@ impl ApplicationHandler<UserEvent> for DesktopApplication {
 
         if matches!(event, WindowEvent::RedrawRequested) {
             self.next_repaint = None;
-            if let Err(error) = runtime.render() {
-                self.startup_error = Some(error);
-                event_loop.exit();
-            } else {
-                self.update_control_flow(event_loop);
+            match runtime.render() {
+                Ok(true) => event_loop.exit(),
+                Ok(false) => self.update_control_flow(event_loop),
+                Err(error) => {
+                    self.startup_error = Some(error);
+                    event_loop.exit();
+                }
             }
             return;
         }

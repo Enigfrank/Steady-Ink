@@ -129,9 +129,9 @@ impl PenWidth {
 }
 
 impl Default for PenWidth {
-    /// 返回产品默认画笔粗细 8px。
+    /// 返回产品默认画笔粗细 4pt 对应的最细档位。
     fn default() -> Self {
-        Self::Px8
+        Self::Px4
     }
 }
 
@@ -319,6 +319,12 @@ impl InkOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 验证首次运行和缺省设置使用 4pt 对应的最细画笔档位。
+    #[test]
+    fn default_pen_width_is_four_points() {
+        assert_eq!(PenWidth::default(), PenWidth::Px4);
+    }
 
     /// 验证局部撤销重建使用的包围框相交判定覆盖接触边界。
     #[test]

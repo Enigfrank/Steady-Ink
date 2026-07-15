@@ -1,14 +1,20 @@
 use egui::{
-    Align2, Color32, CornerRadius, FontId, Frame, Margin, Pos2, Rect, Response, Sense, Shape,
-    Stroke, StrokeKind, Ui, Vec2,
+    Align2, Color32, CornerRadius, FontId, Frame, Margin, Popup, PopupCloseBehavior, Pos2, Rect,
+    RectAlign, Response, Sense, Shape, Stroke, StrokeKind, Ui, Vec2,
 };
 
-use super::design_tokens as tokens;
+use super::{
+    design_tokens as tokens,
+    settings_controls::{
+        SelectorOrientation, color_selector_width, pen_width_selector_width, render_color_selector,
+        render_pen_width_selector,
+    },
+};
 use crate::{
     app::AppMode,
     ink::{EraserSize, InkColor, InkTool, PenWidth},
     slideshow::ComDiagnostics,
-    window::{DockSide, GlDiagnostics},
+    window::{DockSide, GraphicsDiagnostics},
 };
 
 /// UI 按钮需要交给应用状态机执行的命令。
@@ -18,8 +24,6 @@ pub enum UiCommand {
     ExitAnnotation,
     SelectPen,
     SelectEraser,
-    CycleColor,
-    CyclePenWidth,
     CycleEraserSize,
     SetColor(InkColor),
     SetPenWidth(PenWidth),
@@ -28,6 +32,7 @@ pub enum UiCommand {
     Clear,
     OpenSettings,
     CloseSettings,
+    ExitApplication,
     ToggleQuickSettings,
     BeginIdleToolbarDrag,
     SetDockSide(DockSide),
@@ -65,7 +70,7 @@ pub struct UiViewState<'a> {
     pub slideshow_control_error: Option<&'a str>,
     pub settings_error: Option<&'a str>,
     pub settings_path: &'a std::path::Path,
-    pub gl_diagnostics: &'a GlDiagnostics,
+    pub graphics_diagnostics: &'a GraphicsDiagnostics,
 }
 
 /// 普通批注工具栏当前选择。
@@ -91,6 +96,11 @@ impl ToolbarInteraction {
         if response.clicked() && self.command.is_none() {
             self.command = Some(command);
         }
+        self.observe_drag(response);
+    }
+
+    /// 合并不直接产生命令的弹层触发按钮拖动状态。
+    fn observe_drag(&mut self, response: &Response) {
         if response.dragged() {
             self.drag_delta += response.drag_delta();
         }
@@ -99,7 +109,7 @@ impl ToolbarInteraction {
 }
 
 impl Default for ToolState {
-    /// 返回已确认的默认画笔、红色、8px 和 48px 配置。
+    /// 返回已确认的默认画笔、红色、4pt 和 48px 配置。
     fn default() -> Self {
         Self {
             tool: InkTool::default(),
@@ -111,28 +121,6 @@ impl Default for ToolState {
 }
 
 impl ToolState {
-    /// 按固定颜色顺序切换快速颜色。
-    pub fn cycle_color(&mut self) {
-        self.color = match self.color {
-            InkColor::Red => InkColor::Yellow,
-            InkColor::Yellow => InkColor::Blue,
-            InkColor::Blue => InkColor::Green,
-            InkColor::Green => InkColor::Black,
-            InkColor::Black => InkColor::White,
-            InkColor::White => InkColor::Red,
-        };
-    }
-
-    /// 按 4px、8px、16px、24px 的固定顺序切换画笔粗细。
-    pub fn cycle_pen_width(&mut self) {
-        self.pen_width = match self.pen_width {
-            PenWidth::Px4 => PenWidth::Px8,
-            PenWidth::Px8 => PenWidth::Px16,
-            PenWidth::Px16 => PenWidth::Px24,
-            PenWidth::Px24 => PenWidth::Px4,
-        };
-    }
-
     /// 按 24px、48px、72px 的固定顺序切换区域橡皮擦大小。
     pub fn cycle_eraser_size(&mut self) {
         self.eraser_size = match self.eraser_size {
@@ -223,7 +211,12 @@ fn render_annotation_toolbar(
                 .inner_margin(Margin::same(tokens::SPACE_2 as i8))
                 .show(ui, |ui| {
                     ui.vertical_centered(|ui| {
-                        let mut interaction = render_ink_tool_buttons(ui, tools);
+                        let mut interaction = render_ink_tool_buttons(
+                            ui,
+                            tools,
+                            normal_picker_placement(dock_side),
+                            SelectorOrientation::Vertical,
+                        );
                         let exit = icon_button(ui, "退出批注", Icon::Exit, false, None);
                         interaction.observe(&exit, UiCommand::ExitAnnotation);
                         interaction
@@ -256,7 +249,8 @@ fn render_annotation_toolbar(
         } else {
             DockSide::Right
         };
-        state.position = normal_toolbar_position(screen, toolbar_size, state.dock_side);
+        state.position =
+            normal_toolbar_docked_position(screen, toolbar_size, state.dock_side, state.position.y);
         if command.is_none() {
             command = Some(UiCommand::SetDockSide(state.dock_side));
         }
@@ -286,6 +280,16 @@ fn normal_toolbar_size() -> Vec2 {
 
 /// 根据吸附边缘计算普通批注工具栏的稳定屏幕位置。
 fn normal_toolbar_position(screen: Rect, size: Vec2, dock_side: DockSide) -> Pos2 {
+    normal_toolbar_docked_position(screen, size, dock_side, screen.center().y - size.y / 2.0)
+}
+
+/// 吸附普通批注工具栏的横向位置，同时保留并约束用户选择的纵向位置。
+fn normal_toolbar_docked_position(
+    screen: Rect,
+    size: Vec2,
+    dock_side: DockSide,
+    preferred_y: f32,
+) -> Pos2 {
     let preferred_x = if dock_side == DockSide::Left {
         screen.left() + tokens::SPACE_6
     } else {
@@ -300,13 +304,21 @@ fn normal_toolbar_position(screen: Rect, size: Vec2, dock_side: DockSide) -> Pos
             tokens::SPACE_6,
         ),
         constrain_axis_position(
-            screen.center().y - size.y / 2.0,
+            preferred_y,
             screen.top(),
             screen.bottom(),
             size.y,
             tokens::SPACE_6,
         ),
     )
+}
+
+/// 根据普通批注工具栏所在侧，把纵向选择栏放到面向屏幕内部的一边。
+const fn normal_picker_placement(dock_side: DockSide) -> RectAlign {
+    match dock_side {
+        DockSide::Left => RectAlign::RIGHT_START,
+        DockSide::Right => RectAlign::LEFT_START,
+    }
 }
 
 /// 将浮动控件约束在单轴可用范围内；空间不足时保持居中并允许对称溢出。
@@ -327,12 +339,21 @@ fn constrain_axis_position(
 }
 
 /// 绘制普通和放映工具栏共用的七个墨迹工具按钮。
-pub(super) fn render_ink_tool_buttons(ui: &mut Ui, tools: ToolState) -> ToolbarInteraction {
+pub(super) fn render_ink_tool_buttons(
+    ui: &mut Ui,
+    tools: ToolState,
+    picker_placement: RectAlign,
+    picker_orientation: SelectorOrientation,
+) -> ToolbarInteraction {
     let mut interaction = ToolbarInteraction::default();
     let pen = icon_button(ui, "画笔", Icon::Pen, tools.tool == InkTool::Pen, None);
     interaction.observe(&pen, UiCommand::SelectPen);
     let color = icon_button(ui, "颜色", Icon::Color, false, Some(color32(tools.color)));
-    interaction.observe(&color, UiCommand::CycleColor);
+    interaction.observe_drag(&color);
+    keep_picker_command(
+        &mut interaction,
+        render_color_picker(&color, tools.color, picker_placement, picker_orientation),
+    );
     let pen_width = icon_button(
         ui,
         pen_width_label(tools.pen_width),
@@ -340,7 +361,16 @@ pub(super) fn render_ink_tool_buttons(ui: &mut Ui, tools: ToolState) -> ToolbarI
         false,
         None,
     );
-    interaction.observe(&pen_width, UiCommand::CyclePenWidth);
+    interaction.observe_drag(&pen_width);
+    keep_picker_command(
+        &mut interaction,
+        render_pen_width_picker(
+            &pen_width,
+            tools.pen_width,
+            picker_placement,
+            picker_orientation,
+        ),
+    );
     let eraser = icon_button(
         ui,
         "橡皮擦",
@@ -362,6 +392,53 @@ pub(super) fn render_ink_tool_buttons(ui: &mut Ui, tools: ToolState) -> ToolbarI
     let clear = icon_button(ui, "清屏", Icon::Clear, false, None);
     interaction.observe(&clear, UiCommand::Clear);
     interaction
+}
+
+/// 在工具栏尚未产生其他命令时保留弹层选择命令。
+fn keep_picker_command(interaction: &mut ToolbarInteraction, candidate: Option<UiCommand>) {
+    if interaction.command.is_none() {
+        interaction.command = candidate;
+    }
+}
+
+/// 切换颜色弹层，并复用设置页的固定色样选择控件。
+fn render_color_picker(
+    trigger: &Response,
+    selected: InkColor,
+    placement: RectAlign,
+    orientation: SelectorOrientation,
+) -> Option<UiCommand> {
+    let selector_width = color_selector_width(orientation);
+    Popup::from_toggle_button_response(trigger)
+        .align(placement)
+        .width(selector_width)
+        .close_behavior(PopupCloseBehavior::CloseOnClick)
+        .show(|ui| {
+            ui.set_min_width(selector_width);
+            ui.set_max_width(selector_width);
+            render_color_selector(ui, selected, orientation)
+        })
+        .and_then(|response| response.inner)
+}
+
+/// 切换粗细弹层，并复用设置页具有线宽差异预览的选择控件。
+fn render_pen_width_picker(
+    trigger: &Response,
+    selected: PenWidth,
+    placement: RectAlign,
+    orientation: SelectorOrientation,
+) -> Option<UiCommand> {
+    let selector_width = pen_width_selector_width(orientation);
+    Popup::from_toggle_button_response(trigger)
+        .align(placement)
+        .width(selector_width)
+        .close_behavior(PopupCloseBehavior::CloseOnClick)
+        .show(|ui| {
+            ui.set_min_width(selector_width);
+            ui.set_max_width(selector_width);
+            render_pen_width_selector(ui, selected, orientation)
+        })
+        .and_then(|response| response.inner)
 }
 
 /// 绘制固定触摸尺寸、图标在上文字在下的功能按钮。
@@ -435,7 +512,7 @@ fn draw_icon(
 ) {
     let painter = ui.painter();
     let half = tokens::ICON_SIZE / 2.0;
-    let stroke = Stroke::new(2.0, foreground);
+    let stroke = Stroke::new(tokens::scale_points(2.0), foreground);
     match icon {
         Icon::Pen => {
             painter.line_segment(
@@ -472,13 +549,17 @@ fn draw_icon(
             }
         }
         Icon::Sliders => {
-            for (offset, knob) in [(-6.0, -3.0), (0.0, 4.0), (6.0, -1.0)] {
+            for (offset, knob) in [
+                (-half * 0.6, -half * 0.3),
+                (0.0, half * 0.4),
+                (half * 0.6, -half * 0.1),
+            ] {
                 let y = center.y + offset;
                 painter.line_segment(
                     [Pos2::new(center.x - half, y), Pos2::new(center.x + half, y)],
                     stroke,
                 );
-                painter.circle_filled(Pos2::new(center.x + knob, y), 2.5, foreground);
+                painter.circle_filled(Pos2::new(center.x + knob, y), half * 0.25, foreground);
             }
         }
         Icon::Color => {
@@ -486,7 +567,11 @@ fn draw_icon(
             painter.circle_stroke(center, half * 0.65, stroke);
         }
         Icon::PenWidth => {
-            for (offset, width) in [(-5.0, 1.0), (0.0, 2.0), (5.0, 3.0)] {
+            for (offset, width) in [
+                (-half * 0.5, tokens::scale_points(1.0)),
+                (0.0, tokens::scale_points(2.0)),
+                (half * 0.5, tokens::scale_points(3.0)),
+            ] {
                 painter.line_segment(
                     [
                         Pos2::new(center.x - half * 0.75, center.y + offset),
@@ -510,10 +595,14 @@ fn draw_icon(
             painter.circle_stroke(center, half * 0.35, stroke);
         }
         Icon::Undo => {
-            painter.circle_stroke(center + egui::vec2(2.0, 1.0), half * 0.65, stroke);
+            painter.circle_stroke(
+                center + egui::vec2(tokens::scale_points(2.0), tokens::scale_points(1.0)),
+                half * 0.65,
+                stroke,
+            );
             painter.add(Shape::convex_polygon(
                 vec![
-                    center + egui::vec2(-half, -2.0),
+                    center + egui::vec2(-half, -tokens::scale_points(2.0)),
                     center + egui::vec2(-half * 0.35, -half * 0.7),
                     center + egui::vec2(-half * 0.35, half * 0.35),
                 ],
@@ -522,11 +611,14 @@ fn draw_icon(
             ));
         }
         Icon::Clear => {
-            let rect = Rect::from_center_size(center, egui::vec2(16.0, 13.0));
-            painter.rect_stroke(rect, 2.0, stroke, StrokeKind::Inside);
+            let rect = Rect::from_center_size(
+                center,
+                egui::vec2(tokens::scale_points(16.0), tokens::scale_points(13.0)),
+            );
+            painter.rect_stroke(rect, tokens::scale_points(2.0), stroke, StrokeKind::Inside);
             painter.line_segment(
                 [rect.left_top(), rect.right_bottom()],
-                Stroke::new(2.0, accent),
+                Stroke::new(tokens::scale_points(2.0), accent),
             );
         }
         Icon::Exit => {
@@ -556,7 +648,7 @@ fn draw_icon(
                     center + egui::vec2(-half * 0.15, 0.0),
                     center + egui::vec2(half * 0.75, 0.0),
                 ],
-                Stroke::new(2.0, accent),
+                Stroke::new(tokens::scale_points(2.0), accent),
             );
             painter.add(Shape::convex_polygon(
                 vec![
@@ -652,14 +744,14 @@ fn draw_icon(
                     center + egui::vec2(-half * 0.7, 0.0),
                     center + egui::vec2(-half * 0.2, half * 0.55),
                 ],
-                Stroke::new(2.0, foreground),
+                Stroke::new(tokens::scale_points(2.0), foreground),
             );
             painter.line_segment(
                 [
                     center + egui::vec2(-half * 0.2, half * 0.55),
                     center + egui::vec2(half * 0.75, -half * 0.55),
                 ],
-                Stroke::new(2.0, foreground),
+                Stroke::new(tokens::scale_points(2.0), foreground),
             );
         }
         Icon::Cancel => {
@@ -668,14 +760,24 @@ fn draw_icon(
                     center + egui::vec2(-half * 0.65, -half * 0.65),
                     center + egui::vec2(half * 0.65, half * 0.65),
                 ],
-                Stroke::new(2.0, foreground),
+                Stroke::new(tokens::scale_points(2.0), foreground),
             );
             painter.line_segment(
                 [
                     center + egui::vec2(half * 0.65, -half * 0.65),
                     center + egui::vec2(-half * 0.65, half * 0.65),
                 ],
-                Stroke::new(2.0, foreground),
+                Stroke::new(tokens::scale_points(2.0), foreground),
+            );
+        }
+        Icon::Power => {
+            painter.circle_stroke(center, half * 0.72, stroke);
+            painter.line_segment(
+                [
+                    center + egui::vec2(0.0, -half),
+                    center + egui::vec2(0.0, -half * 0.15),
+                ],
+                Stroke::new(tokens::scale_points(2.0), accent),
             );
         }
     }
@@ -684,10 +786,10 @@ fn draw_icon(
 /// 返回画笔粗细按钮使用的紧凑标签。
 pub(super) const fn pen_width_label(width: PenWidth) -> &'static str {
     match width {
-        PenWidth::Px4 => "4px",
-        PenWidth::Px8 => "8px",
-        PenWidth::Px16 => "16px",
-        PenWidth::Px24 => "24px",
+        PenWidth::Px4 => "4pt",
+        PenWidth::Px8 => "8pt",
+        PenWidth::Px16 => "16pt",
+        PenWidth::Px24 => "24pt",
     }
 }
 
@@ -724,6 +826,7 @@ pub(super) enum Icon {
     Expand,
     Confirm,
     Cancel,
+    Power,
 }
 
 #[cfg(test)]
@@ -740,7 +843,10 @@ mod tests {
         let state_id = egui::Id::new("normal_annotation_toolbar_state");
         let compact_viewport = Rect::from_min_size(
             Pos2::ZERO,
-            Vec2::new(IDLE_WIDTH_POINTS as f32, IDLE_HEIGHT_POINTS as f32),
+            Vec2::new(
+                IDLE_WIDTH_POINTS.round() as f32,
+                IDLE_HEIGHT_POINTS.round() as f32,
+            ),
         );
 
         let _ = context.run_ui(
@@ -755,10 +861,15 @@ mod tests {
         let compact_state = context
             .data_mut(|data| data.get_temp::<NormalToolbarState>(state_id))
             .expect("普通批注工具栏应保存临时布局状态");
-        assert_eq!(compact_state.viewport_size, compact_viewport.size());
-        assert_eq!(
-            compact_state.position,
-            normal_toolbar_position(compact_viewport, normal_toolbar_size(), DockSide::Right,)
+        assert!(
+            (compact_state.viewport_size - compact_viewport.size()).length() < 0.01,
+            "紧凑 viewport 应保持缩放后的实际尺寸"
+        );
+        let expected_compact_position =
+            normal_toolbar_position(compact_viewport, normal_toolbar_size(), DockSide::Right);
+        assert!(
+            (compact_state.position - expected_compact_position).length() < 0.01,
+            "紧凑 viewport 中的工具栏位置应稳定"
         );
 
         let expanded_viewport = Rect::from_min_size(Pos2::ZERO, Vec2::new(1920.0, 1080.0));
@@ -778,6 +889,34 @@ mod tests {
         assert_eq!(
             expanded_state.position,
             normal_toolbar_position(expanded_viewport, normal_toolbar_size(), DockSide::Right,)
+        );
+    }
+
+    /// 验证普通工具栏吸附左右侧时只改变横坐标，并保留可见的纵向位置。
+    #[test]
+    fn normal_toolbar_side_snap_preserves_vertical_position() {
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1_920.0, 1_080.0));
+        let size = normal_toolbar_size();
+        let preferred_y = 120.0;
+        let left = normal_toolbar_docked_position(screen, size, DockSide::Left, preferred_y);
+        let right = normal_toolbar_docked_position(screen, size, DockSide::Right, preferred_y);
+
+        assert_eq!(left.y, preferred_y);
+        assert_eq!(right.y, preferred_y);
+        assert_eq!(left.x, tokens::SPACE_6);
+        assert_eq!(right.x, screen.right() - tokens::SPACE_6 - size.x);
+    }
+
+    /// 验证普通工具栏两侧的纵向选择栏始终向屏幕内部展开。
+    #[test]
+    fn normal_picker_opens_toward_screen_interior() {
+        assert_eq!(
+            normal_picker_placement(DockSide::Left),
+            RectAlign::RIGHT_START
+        );
+        assert_eq!(
+            normal_picker_placement(DockSide::Right),
+            RectAlign::LEFT_START
         );
     }
 }

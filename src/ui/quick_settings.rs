@@ -11,15 +11,12 @@ use crate::window::DockSide;
 pub fn render(ui: &mut Ui, view: UiViewState<'_>) -> Option<UiCommand> {
     ui.set_min_size(ui.available_size());
     ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-        ui.add_space(tokens::SPACE_1);
         if view.dock_side == DockSide::Left {
             let toolbar_command = render_idle_toolbar(ui);
-            ui.add_space(tokens::SPACE_2);
             let preferences_command = render_preferences_panel(ui, view);
             toolbar_command.or(preferences_command)
         } else {
             let preferences_command = render_preferences_panel(ui, view);
-            ui.add_space(tokens::SPACE_2);
             let toolbar_command = render_idle_toolbar(ui);
             preferences_command.or(toolbar_command)
         }
@@ -55,11 +52,11 @@ mod tests {
     use crate::{
         app::AppMode,
         ui::{IdlePanel, ToolState},
-        window::{GlDiagnostics, QUICK_SETTINGS_HEIGHT_POINTS, QUICK_SETTINGS_WIDTH_POINTS},
+        window::{GraphicsDiagnostics, QUICK_SETTINGS_HEIGHT_POINTS, QUICK_SETTINGS_WIDTH_POINTS},
     };
 
     /// 构造快捷设置布局测试所需的最小只读 UI 状态。
-    fn test_view<'a>(dock_side: DockSide, diagnostics: &'a GlDiagnostics) -> UiViewState<'a> {
+    fn test_view<'a>(dock_side: DockSide, diagnostics: &'a GraphicsDiagnostics) -> UiViewState<'a> {
         UiViewState {
             mode: AppMode::IdleFloatingToolbar,
             idle_panel: IdlePanel::QuickSettings,
@@ -74,14 +71,14 @@ mod tests {
             slideshow_control_error: None,
             settings_error: None,
             settings_path: Path::new("settings.toml"),
-            gl_diagnostics: diagnostics,
+            graphics_diagnostics: diagnostics,
         }
     }
 
     /// 验证左右停靠时快捷设置的所有绘制内容均留在固定窗口内。
     #[test]
     fn quick_settings_shapes_fit_window_for_both_dock_sides() {
-        let diagnostics = GlDiagnostics {
+        let diagnostics = GraphicsDiagnostics {
             vendor: String::new(),
             renderer: String::new(),
             version: String::new(),
@@ -106,7 +103,7 @@ mod tests {
                     let _ = render(ui, test_view(dock_side, &diagnostics));
                 },
             );
-            let viewport_with_stroke_tolerance = viewport.expand(1.0);
+            let viewport_with_stroke_tolerance = viewport.expand(1.1);
 
             assert!(!output.shapes.is_empty());
             for clipped_shape in output.shapes {

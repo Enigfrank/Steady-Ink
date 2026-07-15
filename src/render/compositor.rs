@@ -23,6 +23,7 @@ pub struct Compositor {
     framebuffer_info: FramebufferInfo,
     num_samples: usize,
     stencil_size: usize,
+    window_clear_color: Color,
 }
 
 impl Compositor {
@@ -61,6 +62,9 @@ impl Compositor {
             true,
         );
         ui::configure_context(&egui.egui_ctx);
+        let clear_rgba = gl_window.transparency_clear_rgba();
+        let window_clear_color =
+            Color::from_argb(clear_rgba[3], clear_rgba[0], clear_rgba[1], clear_rgba[2]);
 
         Ok(Self {
             egui,
@@ -70,6 +74,7 @@ impl Compositor {
             framebuffer_info,
             num_samples: gl_window.num_samples(),
             stencil_size: gl_window.stencil_size(),
+            window_clear_color,
         })
     }
 
@@ -119,7 +124,7 @@ impl Compositor {
         self.ink_cache.sync(document);
 
         let canvas = self.window_surface.canvas();
-        canvas.clear(Color::TRANSPARENT);
+        canvas.clear(self.window_clear_color);
         let ink_image = self.ink_cache.snapshot();
         canvas.draw_image(ink_image, (0.0, 0.0), None);
         if let Some(preview) = active_preview {

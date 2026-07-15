@@ -210,11 +210,14 @@ impl DesktopRuntime {
 
     /// 处理非重绘窗口事件，并返回 egui 是否请求重绘。
     fn handle_window_event(&mut self, event: &WindowEvent) -> Result<bool, AppError> {
-        if let WindowEvent::Resized(size) = event {
+        let surface_rebuilt = if let WindowEvent::Resized(size) = event {
             self.gl_window.resize(*size);
             self.compositor.resize((*size).into())?;
             self.performance.record_surface_rebuild();
-        }
+            true
+        } else {
+            false
+        };
         if self.idle_window_dragging && window_drag_finished(event) {
             self.idle_window_dragging = false;
             self.gl_window
@@ -234,7 +237,7 @@ impl DesktopRuntime {
             self.apply_pointer_action(pointer_action);
             self.request_redraw(RedrawReason::PointerInput);
         }
-        Ok(event_response.repaint)
+        Ok(surface_rebuilt || event_response.repaint)
     }
 
     /// 将统一指针动作应用到当前活动手势或普通批注文档。
@@ -744,7 +747,11 @@ impl ApplicationHandler<UserEvent> for DesktopApplication {
                 self.install_repaint_callback(&runtime);
                 self.runtime = Some(runtime);
                 if let Some(runtime) = self.runtime.as_mut() {
-                    runtime.gl_window.window().set_visible(true);
+                    if let Err(error) = runtime.gl_window.show() {
+                        self.startup_error = Some(error);
+                        event_loop.exit();
+                        return;
+                    }
                     runtime.request_redraw(RedrawReason::Startup);
                 }
                 self.update_control_flow(event_loop);

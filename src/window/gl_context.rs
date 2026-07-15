@@ -9,7 +9,7 @@ use glutin::{
     surface::{Surface, SurfaceAttributesBuilder, SwapInterval, WindowSurface},
 };
 use glutin_winit::DisplayBuilder;
-use raw_window_handle::HasWindowHandle;
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::{
     dpi::{LogicalSize, PhysicalPosition, PhysicalSize},
     event_loop::ActiveEventLoop,
@@ -19,13 +19,31 @@ use winit::{
 
 use crate::error::AppError;
 
-const IDLE_WIDTH_POINTS: f64 = 88.0;
-const IDLE_HEIGHT_POINTS: f64 = 248.0;
-const QUICK_SETTINGS_WIDTH_POINTS: f64 = 544.0;
-const QUICK_SETTINGS_HEIGHT_POINTS: f64 = 336.0;
+pub(crate) const IDLE_WIDTH_POINTS: f64 = 88.0;
+pub(crate) const IDLE_HEIGHT_POINTS: f64 = 248.0;
+pub(crate) const QUICK_SETTINGS_WIDTH_POINTS: f64 = 544.0;
+pub(crate) const QUICK_SETTINGS_HEIGHT_POINTS: f64 = 336.0;
 const SETTINGS_WIDTH_POINTS: f64 = 560.0;
 const SETTINGS_HEIGHT_POINTS: f64 = 640.0;
 const EDGE_MARGIN_POINTS: f64 = 16.0;
+const LAYERED_COLOR_KEY_RGBA: [u8; 4] = [1, 2, 3, 255];
+
+/// Windows 窗口实际使用的透明合成后端。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransparencyBackend {
+    DwmAlpha,
+    LayeredColorKey,
+}
+
+impl TransparencyBackend {
+    /// 返回 Skia 每帧清理窗口 framebuffer 时必须使用的 RGBA 颜色。
+    const fn clear_rgba(self) -> [u8; 4] {
+        match self {
+            Self::DwmAlpha => [0, 0, 0, 0],
+            Self::LayeredColorKey => LAYERED_COLOR_KEY_RGBA,
+        }
+    }
+}
 
 /// 非批注模式下窗口需要承载的可见界面。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -124,6 +142,7 @@ pub struct GlWindowContext {
     dock_side: Cell<DockSide>,
     num_samples: usize,
     stencil_size: usize,
+    transparency_backend: TransparencyBackend,
 }
 
 impl GlWindowContext {
@@ -155,6 +174,7 @@ impl GlWindowContext {
             .build(event_loop, template, choose_gl_config)
             .map_err(|error| AppError::Graphics(format!("OpenGL 配置创建失败: {error}")))?;
         let window = window.ok_or_else(|| AppError::Graphics("OpenGL 未创建窗口".to_owned()))?;
+        let transparency_backend = select_transparency_backend(config.supports_transparency());
         // 首次 WM_GETMINMAXINFO 早于 winit 窗口状态初始化，创建完成后必须再次应用窄窗约束。
         window.set_min_inner_size(Some(geometry.idle_size));
         window.set_outer_position(geometry.idle_position);
@@ -216,6 +236,9 @@ impl GlWindowContext {
             renderer = diagnostics.renderer,
             version = diagnostics.version,
             software_fallback = diagnostics.software_fallback,
+            alpha_size = config.alpha_size(),
+            supports_transparency = ?config.supports_transparency(),
+            ?transparency_backend,
             num_samples,
             stencil_size,
             "OpenGL 呈现后端已创建"
@@ -235,12 +258,19 @@ impl GlWindowContext {
             dock_side: Cell::new(DockSide::Right),
             num_samples,
             stencil_size,
+            transparency_backend,
         })
     }
 
     /// 返回 winit 窗口引用。
     pub const fn window(&self) -> &Window {
         &self.window
+    }
+
+    /// 显示窗口后重新应用原生透明后端，避免 winit 的可见性样式更新覆盖 layered 位。
+    pub fn show(&self) -> Result<(), AppError> {
+        self.window.set_visible(true);
+        apply_transparency_backend(&self.window, self.transparency_backend)
     }
 
     /// 返回共享 glow 上下文。
@@ -266,6 +296,11 @@ impl GlWindowContext {
     /// 返回窗口 framebuffer 的模板位数。
     pub const fn stencil_size(&self) -> usize {
         self.stencil_size
+    }
+
+    /// 返回当前 Windows 透明后端要求的 framebuffer 清屏色。
+    pub const fn transparency_clear_rgba(&self) -> [u8; 4] {
+        self.transparency_backend.clear_rgba()
     }
 
     /// 将窗口切换到主显示器全屏批注几何或右侧悬浮几何。
@@ -368,6 +403,111 @@ impl GlWindowContext {
     }
 }
 
+/// 在 winit 完成可见性样式更新后应用已选定的 Windows 透明后端。
+fn apply_transparency_backend(
+    window: &Window,
+    backend: TransparencyBackend,
+) -> Result<(), AppError> {
+    match backend {
+        TransparencyBackend::DwmAlpha => enable_full_client_transparency(window)?,
+        TransparencyBackend::LayeredColorKey => enable_layered_color_key_transparency(window)?,
+    }
+    Ok(())
+}
+
+/// 只有 WGL 明确报告透明支持时才使用默认 framebuffer alpha。
+const fn select_transparency_backend(supports_transparency: Option<bool>) -> TransparencyBackend {
+    if matches!(supports_transparency, Some(true)) {
+        TransparencyBackend::DwmAlpha
+    } else {
+        TransparencyBackend::LayeredColorKey
+    }
+}
+
+/// 把整个 Win32 客户区扩展为 DWM glass，使默认 framebuffer 的 alpha 参与桌面合成。
+fn enable_full_client_transparency(window: &Window) -> Result<(), AppError> {
+    use windows::Win32::Graphics::Dwm::DwmExtendFrameIntoClientArea;
+
+    let hwnd = window_hwnd(window)?;
+    let margins = full_client_glass_margins();
+    // SAFETY: HWND 来自仍存活且由当前线程创建的 winit 窗口，MARGINS 在调用期间有效。
+    unsafe { DwmExtendFrameIntoClientArea(hwnd, &margins) }
+        .map_err(|error| AppError::Graphics(format!("无法启用 DWM 全客户区透明合成: {error}")))?;
+    tracing::info!("DWM 全客户区透明合成已启用");
+    Ok(())
+}
+
+/// 在 DWM 无法使用 WGL alpha 时启用硬件窗口 color-key 透明兜底。
+fn enable_layered_color_key_transparency(window: &Window) -> Result<(), AppError> {
+    use windows::Win32::{
+        Foundation::COLORREF,
+        Graphics::Dwm::{DWM_BB_ENABLE, DWM_BLURBEHIND, DwmEnableBlurBehindWindow},
+        UI::WindowsAndMessaging::{
+            GWL_EXSTYLE, GetWindowLongPtrW, LWA_COLORKEY, SetLayeredWindowAttributes,
+            SetWindowLongPtrW, WS_EX_LAYERED,
+        },
+    };
+
+    let hwnd = window_hwnd(window)?;
+    let blur = DWM_BLURBEHIND {
+        dwFlags: DWM_BB_ENABLE,
+        fEnable: false.into(),
+        ..Default::default()
+    };
+    // SAFETY: HWND 来自当前存活窗口，blur 在调用期间保持有效。
+    if let Err(error) = unsafe { DwmEnableBlurBehindWindow(hwnd, &raw const blur) } {
+        tracing::warn!(%error, "无法关闭 DWM blur，继续尝试 layered color-key");
+    }
+
+    // SAFETY: 只修改当前窗口的扩展样式，并保留 winit 已设置的其他位。
+    let current_style = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) };
+    let layered_style = current_style | WS_EX_LAYERED.0 as isize;
+    // SAFETY: HWND 有效，GWL_EXSTYLE 接受合并后的扩展样式值。
+    if unsafe { SetWindowLongPtrW(hwnd, GWL_EXSTYLE, layered_style) } == 0 {
+        return Err(AppError::Graphics(format!(
+            "无法启用 Windows layered 窗口: {}",
+            windows::core::Error::from_thread()
+        )));
+    }
+
+    let color_key = COLORREF(colorref_from_rgba(LAYERED_COLOR_KEY_RGBA));
+    // SAFETY: 窗口已启用 WS_EX_LAYERED，color key 与 Skia 清屏色使用同一常量。
+    unsafe { SetLayeredWindowAttributes(hwnd, color_key, 255, LWA_COLORKEY) }
+        .map_err(|error| AppError::Graphics(format!("无法启用 Windows color-key 透明: {error}")))?;
+    tracing::info!(
+        color_key = "#010203",
+        "Windows layered color-key 透明已启用"
+    );
+    Ok(())
+}
+
+/// 从 winit 窗口读取当前 Win32 HWND。
+fn window_hwnd(window: &Window) -> Result<windows::Win32::Foundation::HWND, AppError> {
+    use windows::Win32::Foundation::HWND;
+
+    let raw_handle = window
+        .window_handle()
+        .map_err(|error| AppError::Graphics(format!("透明窗口句柄读取失败: {error}")))?
+        .as_raw();
+    let RawWindowHandle::Win32(handle) = raw_handle else {
+        return Err(AppError::Graphics("透明合成仅支持 Win32 HWND".to_owned()));
+    };
+    Ok(HWND(handle.hwnd.get() as *mut std::ffi::c_void))
+}
+
+/// 把 RGBA 颜色转为 Win32 COLORREF 使用的 0x00BBGGRR 布局。
+const fn colorref_from_rgba(rgba: [u8; 4]) -> u32 {
+    u32::from_le_bytes([rgba[0], rgba[1], rgba[2], 0])
+}
+
+/// 返回 Win32 约定的全客户区 glass 边距；仅首字段为 -1。
+fn full_client_glass_margins() -> windows::Win32::UI::Controls::MARGINS {
+    windows::Win32::UI::Controls::MARGINS {
+        cxLeftWidth: -1,
+        ..Default::default()
+    }
+}
+
 /// 从候选中优先选择透明、硬件加速且 MSAA 最低的配置。
 fn choose_gl_config(configs: Box<dyn Iterator<Item = Config> + '_>) -> Config {
     configs
@@ -466,5 +606,44 @@ mod tests {
         assert_eq!(left.x, 132);
         assert_eq!(right.x, 3_732);
         assert_eq!(left.y, right.y);
+    }
+
+    /// 验证 DWM 全客户区 glass 使用 Win32 规定的单个 -1 哨兵值。
+    #[test]
+    fn full_client_glass_uses_left_margin_sentinel_only() {
+        let margins = full_client_glass_margins();
+
+        assert_eq!(margins.cxLeftWidth, -1);
+        assert_eq!(margins.cxRightWidth, 0);
+        assert_eq!(margins.cyTopHeight, 0);
+        assert_eq!(margins.cyBottomHeight, 0);
+    }
+
+    /// 验证 WGL 未明确支持透明时不再进入会黑屏的 DWM alpha 路径。
+    #[test]
+    fn transparency_backend_falls_back_when_wgl_alpha_is_unavailable() {
+        assert_eq!(
+            select_transparency_backend(Some(true)),
+            TransparencyBackend::DwmAlpha
+        );
+        assert_eq!(
+            select_transparency_backend(Some(false)),
+            TransparencyBackend::LayeredColorKey
+        );
+        assert_eq!(
+            select_transparency_backend(None),
+            TransparencyBackend::LayeredColorKey
+        );
+    }
+
+    /// 验证 layered color-key 的 Win32 颜色布局与 Skia 清屏色严格一致。
+    #[test]
+    fn layered_color_key_uses_dedicated_opaque_clear_color() {
+        assert_eq!(TransparencyBackend::DwmAlpha.clear_rgba(), [0, 0, 0, 0]);
+        assert_eq!(
+            TransparencyBackend::LayeredColorKey.clear_rgba(),
+            [1, 2, 3, 255]
+        );
+        assert_eq!(colorref_from_rgba(LAYERED_COLOR_KEY_RGBA), 0x0003_0201);
     }
 }

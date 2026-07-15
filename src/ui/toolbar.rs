@@ -204,10 +204,11 @@ fn render_annotation_toolbar(
     let toolbar_size = normal_toolbar_size();
     let mut state = context.data_mut(|data| {
         data.get_temp::<NormalToolbarState>(state_id)
-            .filter(|state| state.dock_side == dock_side)
+            .filter(|state| state.dock_side == dock_side && state.viewport_size == screen.size())
             .unwrap_or_else(|| NormalToolbarState {
                 position: normal_toolbar_position(screen, toolbar_size, dock_side),
                 dock_side,
+                viewport_size: screen.size(),
             })
     });
 
@@ -233,13 +234,19 @@ fn render_annotation_toolbar(
         });
     let interaction = area_response.inner;
     state.position += interaction.drag_delta;
-    state.position.x = state.position.x.clamp(
-        screen.left() + tokens::SPACE_6,
-        screen.right() - tokens::SPACE_6 - toolbar_size.x,
+    state.position.x = constrain_axis_position(
+        state.position.x,
+        screen.left(),
+        screen.right(),
+        toolbar_size.x,
+        tokens::SPACE_6,
     );
-    state.position.y = state.position.y.clamp(
-        screen.top() + tokens::SPACE_6,
-        screen.bottom() - tokens::SPACE_6 - toolbar_size.y,
+    state.position.y = constrain_axis_position(
+        state.position.y,
+        screen.top(),
+        screen.bottom(),
+        toolbar_size.y,
+        tokens::SPACE_6,
     );
 
     let mut command = interaction.command;
@@ -263,6 +270,7 @@ fn render_annotation_toolbar(
 struct NormalToolbarState {
     position: Pos2,
     dock_side: DockSide,
+    viewport_size: Vec2,
 }
 
 /// 返回八个纵向按钮及卡片内边距形成的固定工具栏尺寸。
@@ -278,14 +286,44 @@ fn normal_toolbar_size() -> Vec2 {
 
 /// 根据吸附边缘计算普通批注工具栏的稳定屏幕位置。
 fn normal_toolbar_position(screen: Rect, size: Vec2, dock_side: DockSide) -> Pos2 {
+    let preferred_x = if dock_side == DockSide::Left {
+        screen.left() + tokens::SPACE_6
+    } else {
+        screen.right() - tokens::SPACE_6 - size.x
+    };
     Pos2::new(
-        if dock_side == DockSide::Left {
-            screen.left() + tokens::SPACE_6
-        } else {
-            screen.right() - tokens::SPACE_6 - size.x
-        },
-        screen.center().y - size.y / 2.0,
+        constrain_axis_position(
+            preferred_x,
+            screen.left(),
+            screen.right(),
+            size.x,
+            tokens::SPACE_6,
+        ),
+        constrain_axis_position(
+            screen.center().y - size.y / 2.0,
+            screen.top(),
+            screen.bottom(),
+            size.y,
+            tokens::SPACE_6,
+        ),
     )
+}
+
+/// 将浮动控件约束在单轴可用范围内；空间不足时保持居中并允许对称溢出。
+fn constrain_axis_position(
+    position: f32,
+    viewport_min: f32,
+    viewport_max: f32,
+    item_extent: f32,
+    margin: f32,
+) -> f32 {
+    let minimum = viewport_min + margin;
+    let maximum = viewport_max - margin - item_extent;
+    if minimum <= maximum {
+        position.clamp(minimum, maximum)
+    } else {
+        (viewport_min + viewport_max - item_extent) / 2.0
+    }
 }
 
 /// 绘制普通和放映工具栏共用的七个墨迹工具按钮。
@@ -686,4 +724,60 @@ pub(super) enum Icon {
     Expand,
     Confirm,
     Cancel,
+}
+
+#[cfg(test)]
+mod tests {
+    use egui::{Context, RawInput};
+
+    use super::*;
+    use crate::window::{IDLE_HEIGHT_POINTS, IDLE_WIDTH_POINTS};
+
+    /// 验证扩窗过渡帧不会因 viewport 小于普通批注工具栏而崩溃，并会在扩窗后重新定位。
+    #[test]
+    fn normal_toolbar_survives_small_viewport_and_recenters_after_resize() {
+        let context = Context::default();
+        let state_id = egui::Id::new("normal_annotation_toolbar_state");
+        let compact_viewport = Rect::from_min_size(
+            Pos2::ZERO,
+            Vec2::new(IDLE_WIDTH_POINTS as f32, IDLE_HEIGHT_POINTS as f32),
+        );
+
+        let _ = context.run_ui(
+            RawInput {
+                screen_rect: Some(compact_viewport),
+                ..Default::default()
+            },
+            |ui| {
+                let _ = render_annotation_toolbar(ui, ToolState::default(), DockSide::Right);
+            },
+        );
+        let compact_state = context
+            .data_mut(|data| data.get_temp::<NormalToolbarState>(state_id))
+            .expect("普通批注工具栏应保存临时布局状态");
+        assert_eq!(compact_state.viewport_size, compact_viewport.size());
+        assert_eq!(
+            compact_state.position,
+            normal_toolbar_position(compact_viewport, normal_toolbar_size(), DockSide::Right,)
+        );
+
+        let expanded_viewport = Rect::from_min_size(Pos2::ZERO, Vec2::new(1920.0, 1080.0));
+        let _ = context.run_ui(
+            RawInput {
+                screen_rect: Some(expanded_viewport),
+                ..Default::default()
+            },
+            |ui| {
+                let _ = render_annotation_toolbar(ui, ToolState::default(), DockSide::Right);
+            },
+        );
+        let expanded_state = context
+            .data_mut(|data| data.get_temp::<NormalToolbarState>(state_id))
+            .expect("扩窗后普通批注工具栏应刷新临时布局状态");
+        assert_eq!(expanded_state.viewport_size, expanded_viewport.size());
+        assert_eq!(
+            expanded_state.position,
+            normal_toolbar_position(expanded_viewport, normal_toolbar_size(), DockSide::Right,)
+        );
+    }
 }

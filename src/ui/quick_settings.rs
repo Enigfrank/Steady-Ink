@@ -1,7 +1,7 @@
 use egui::{Align, CornerRadius, Frame, Layout, Margin, Stroke, Ui};
 
 use super::{
-    design_tokens as tokens,
+    design_tokens as tokens, pixel_snap,
     settings_controls::render_tool_preferences,
     toolbar::{UiCommand, UiViewState, render_opaque_idle_toolbar},
 };
@@ -26,12 +26,14 @@ pub fn render(ui: &mut Ui, view: UiViewState<'_>) -> Option<UiCommand> {
 
 /// 绘制快捷设置中的工具偏好卡片。
 fn render_preferences_panel(ui: &mut Ui, view: UiViewState<'_>) -> Option<UiCommand> {
-    Frame::new()
-        .fill(tokens::OPAQUE_COLOR_BACKGROUND)
-        .stroke(Stroke::new(1.0, tokens::OPAQUE_COLOR_BORDER))
-        .corner_radius(CornerRadius::same(tokens::CARD_RADIUS))
-        .inner_margin(Margin::same(tokens::MARGIN_SPACE_2))
-        .show(ui, |ui| {
+    pixel_snap::show_pixel_aligned_frame(
+        ui,
+        Frame::new()
+            .fill(tokens::OPAQUE_COLOR_BACKGROUND)
+            .stroke(Stroke::new(1.0, tokens::OPAQUE_COLOR_BORDER))
+            .corner_radius(CornerRadius::same(tokens::CARD_RADIUS))
+            .inner_margin(Margin::same(tokens::MARGIN_SPACE_2)),
+        |ui| {
             tokens::apply_opaque_widget_style(ui);
             ui.with_layout(Layout::top_down(Align::Min), |ui| {
                 ui.set_min_width(tokens::QUICK_SETTINGS_CONTENT_WIDTH);
@@ -39,8 +41,9 @@ fn render_preferences_panel(ui: &mut Ui, view: UiViewState<'_>) -> Option<UiComm
                 render_tool_preferences(ui, view.tools)
             })
             .inner
-        })
-        .inner
+        },
+    )
+    .inner
 }
 
 #[cfg(test)]

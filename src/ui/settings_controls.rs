@@ -1,9 +1,7 @@
-use egui::{
-    Align2, Color32, CornerRadius, FontId, Pos2, Response, Sense, Stroke, StrokeKind, Ui, Vec2,
-};
+use egui::{Align2, Color32, CornerRadius, FontId, Pos2, Response, Sense, Stroke, Ui, Vec2};
 
 use super::{
-    design_tokens as tokens,
+    design_tokens as tokens, pixel_snap,
     toolbar::{ToolState, UiCommand, color32},
 };
 use crate::ink::{EraserSize, InkColor, PenWidth};
@@ -166,13 +164,12 @@ fn selection_button(ui: &mut Ui, label: &str, visual: SelectionVisual, selected:
     } else {
         tokens::OPAQUE_COLOR_BORDER
     };
-    ui.painter()
-        .rect_filled(rect, CornerRadius::same(tokens::BUTTON_RADIUS), fill);
-    ui.painter().rect_stroke(
+    pixel_snap::paint_pixel_aligned_rect(
+        ui,
         rect,
         CornerRadius::same(tokens::BUTTON_RADIUS),
+        fill,
         Stroke::new(1.0, border),
-        StrokeKind::Inside,
     );
 
     let center = Pos2::new(
@@ -209,7 +206,8 @@ fn draw_selection_visual(ui: &Ui, center: Pos2, visual: SelectionVisual) {
                 PenWidth::Px16 => 4.0,
                 PenWidth::Px24 => 6.0,
             };
-            ui.painter().line_segment(
+            pixel_snap::paint_pixel_aligned_line(
+                ui.painter(),
                 [
                     center - egui::vec2(tokens::ICON_SIZE / 2.0, 0.0),
                     center + egui::vec2(tokens::ICON_SIZE / 2.0, 0.0),

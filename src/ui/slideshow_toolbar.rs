@@ -1,10 +1,10 @@
 use egui::{
     Align2, Area, Context, CornerRadius, FontId, Frame, Id, Margin, Order, Pos2, Rect, RectAlign,
-    Sense, Stroke, StrokeKind, Ui, Vec2,
+    Sense, Stroke, Ui, Vec2,
 };
 
 use super::{
-    design_tokens as tokens,
+    design_tokens as tokens, pixel_snap,
     settings_controls::SelectorOrientation,
     toolbar::{Icon, UiCommand, UiViewState, icon_button, render_ink_tool_buttons},
 };
@@ -55,12 +55,14 @@ fn render_navigation_group(
         .anchor(anchor, offset)
         .order(Order::Foreground)
         .show(context, |ui| {
-            Frame::new()
-                .fill(tokens::COLOR_BACKGROUND)
-                .stroke(Stroke::new(1.0, tokens::COLOR_BORDER))
-                .corner_radius(CornerRadius::same(tokens::CAPSULE_RADIUS))
-                .inner_margin(Margin::same(tokens::MARGIN_SPACE_2))
-                .show(ui, |ui| {
+            pixel_snap::show_pixel_aligned_frame(
+                ui,
+                Frame::new()
+                    .fill(tokens::COLOR_BACKGROUND)
+                    .stroke(Stroke::new(1.0, tokens::COLOR_BORDER))
+                    .corner_radius(CornerRadius::same(tokens::CAPSULE_RADIUS))
+                    .inner_margin(Margin::same(tokens::MARGIN_SPACE_2)),
+                |ui| {
                     ui.add_enabled_ui(view.slideshow_controls_enabled, |ui| {
                         ui.horizontal(|ui| {
                             let mut command = None;
@@ -78,8 +80,9 @@ fn render_navigation_group(
                         .inner
                     })
                     .inner
-                })
-                .inner
+                },
+            )
+            .inner
         })
         .inner
 }
@@ -108,16 +111,12 @@ fn render_page_number(ui: &mut Ui, current: u32, total: u32) {
         return;
     }
 
-    ui.painter().rect_filled(
+    pixel_snap::paint_pixel_aligned_rect(
+        ui,
         rect,
         CornerRadius::same(tokens::BUTTON_RADIUS),
         tokens::COLOR_SURFACE,
-    );
-    ui.painter().rect_stroke(
-        rect,
-        CornerRadius::same(tokens::BUTTON_RADIUS),
         Stroke::new(1.0, tokens::COLOR_BORDER),
-        StrokeKind::Inside,
     );
     ui.painter().text(
         rect.center(),
@@ -189,12 +188,14 @@ fn render_toolbar_body(
         .interactable(body_interactive)
         .show(context, |ui| {
             ui.set_clip_rect(ui.clip_rect().intersect(clip_rect));
-            Frame::new()
-                .fill(tokens::COLOR_BACKGROUND)
-                .stroke(Stroke::new(1.0, tokens::COLOR_BORDER))
-                .corner_radius(CornerRadius::same(tokens::CAPSULE_RADIUS))
-                .inner_margin(Margin::same(tokens::MARGIN_SPACE_2))
-                .show(ui, |ui| {
+            pixel_snap::show_pixel_aligned_frame(
+                ui,
+                Frame::new()
+                    .fill(tokens::COLOR_BACKGROUND)
+                    .stroke(Stroke::new(1.0, tokens::COLOR_BORDER))
+                    .corner_radius(CornerRadius::same(tokens::CAPSULE_RADIUS))
+                    .inner_margin(Margin::same(tokens::MARGIN_SPACE_2)),
+                |ui| {
                     ui.set_min_width(toolbar_body_content_width());
                     ui.set_max_width(toolbar_body_content_width());
                     ui.horizontal(|ui| {
@@ -233,8 +234,9 @@ fn render_toolbar_body(
                         command
                     })
                     .inner
-                })
-                .inner
+                },
+            )
+            .inner
         })
         .inner
 }
@@ -250,12 +252,14 @@ fn render_toolbar_toggle(
         .fixed_pos(position)
         .order(Order::Foreground)
         .show(context, |ui| {
-            Frame::new()
-                .fill(tokens::COLOR_BACKGROUND)
-                .stroke(Stroke::new(1.0, tokens::COLOR_BORDER))
-                .corner_radius(CornerRadius::same(tokens::CAPSULE_RADIUS))
-                .inner_margin(Margin::same(tokens::MARGIN_SPACE_2))
-                .show(ui, |ui| {
+            pixel_snap::show_pixel_aligned_frame(
+                ui,
+                Frame::new()
+                    .fill(tokens::COLOR_BACKGROUND)
+                    .stroke(Stroke::new(1.0, tokens::COLOR_BORDER))
+                    .corner_radius(CornerRadius::same(tokens::CAPSULE_RADIUS))
+                    .inner_margin(Margin::same(tokens::MARGIN_SPACE_2)),
+                |ui| {
                     ui.add_enabled_ui(view.mode != AppMode::SlideShowConnectionLost, |ui| {
                         let (label, icon) = if expanded {
                             ("收缩", Icon::Collapse)
@@ -266,8 +270,9 @@ fn render_toolbar_toggle(
                     })
                     .inner
                     .then_some(UiCommand::ToggleSlideshowToolbar)
-                })
-                .inner
+                },
+            )
+            .inner
         })
         .inner
 }
@@ -282,21 +287,24 @@ fn render_connection_status(context: &Context) {
         .order(Order::Foreground)
         .interactable(false)
         .show(context, |ui| {
-            Frame::new()
-                .fill(tokens::COLOR_SURFACE)
-                .stroke(Stroke::new(1.0, tokens::COLOR_ERROR_SURFACE))
-                .corner_radius(CornerRadius::same(tokens::CARD_RADIUS))
-                .inner_margin(Margin::symmetric(
-                    tokens::MARGIN_SPACE_4,
-                    tokens::MARGIN_SPACE_2,
-                ))
-                .show(ui, |ui| {
+            pixel_snap::show_pixel_aligned_frame(
+                ui,
+                Frame::new()
+                    .fill(tokens::COLOR_SURFACE)
+                    .stroke(Stroke::new(1.0, tokens::COLOR_ERROR_SURFACE))
+                    .corner_radius(CornerRadius::same(tokens::CARD_RADIUS))
+                    .inner_margin(Margin::symmetric(
+                        tokens::MARGIN_SPACE_4,
+                        tokens::MARGIN_SPACE_2,
+                    )),
+                |ui| {
                     ui.label(
                         egui::RichText::new("演示连接中断")
                             .size(tokens::TEXT_SM)
                             .color(tokens::COLOR_ERROR),
                     );
-                });
+                },
+            );
         });
 }
 
@@ -309,12 +317,14 @@ fn render_dismiss_confirmation(context: &Context) -> Option<UiCommand> {
         )
         .order(Order::Foreground)
         .show(context, |ui| {
-            Frame::new()
-                .fill(tokens::COLOR_SURFACE)
-                .stroke(Stroke::new(1.0, tokens::COLOR_BORDER))
-                .corner_radius(CornerRadius::same(tokens::CARD_RADIUS))
-                .inner_margin(Margin::same(tokens::MARGIN_SPACE_2))
-                .show(ui, |ui| {
+            pixel_snap::show_pixel_aligned_frame(
+                ui,
+                Frame::new()
+                    .fill(tokens::COLOR_SURFACE)
+                    .stroke(Stroke::new(1.0, tokens::COLOR_BORDER))
+                    .corner_radius(CornerRadius::same(tokens::CARD_RADIUS))
+                    .inner_margin(Margin::same(tokens::MARGIN_SPACE_2)),
+                |ui| {
                     ui.vertical_centered(|ui| {
                         ui.label(
                             egui::RichText::new("退出批注并清空本次放映墨迹？")
@@ -333,8 +343,9 @@ fn render_dismiss_confirmation(context: &Context) -> Option<UiCommand> {
                         .inner
                     })
                     .inner
-                })
-                .inner
+                },
+            )
+            .inner
         })
         .inner
 }

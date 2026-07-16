@@ -1,10 +1,10 @@
 use egui::{
     Align2, Color32, CornerRadius, FontId, Frame, Margin, Popup, PopupCloseBehavior, Pos2, Rect,
-    RectAlign, Response, Sense, Shape, Stroke, StrokeKind, Ui, Vec2,
+    RectAlign, Response, Sense, Shape, Stroke, Ui, Vec2,
 };
 
 use super::{
-    design_tokens as tokens,
+    design_tokens as tokens, pixel_snap,
     settings_controls::{
         SelectorOrientation, color_selector_width, pen_width_selector_width, render_color_selector,
         render_pen_width_selector,
@@ -164,12 +164,14 @@ fn render_idle_toolbar_with_surface(ui: &mut Ui, opaque: bool) -> Option<UiComma
     } else {
         (tokens::COLOR_BACKGROUND, tokens::COLOR_BORDER)
     };
-    Frame::new()
-        .fill(background)
-        .stroke(Stroke::new(1.0, border))
-        .corner_radius(CornerRadius::same(tokens::CARD_RADIUS))
-        .inner_margin(Margin::same(tokens::MARGIN_SPACE_2))
-        .show(ui, |ui| {
+    pixel_snap::show_pixel_aligned_frame(
+        ui,
+        Frame::new()
+            .fill(background)
+            .stroke(Stroke::new(1.0, border))
+            .corner_radius(CornerRadius::same(tokens::CARD_RADIUS))
+            .inner_margin(Margin::same(tokens::MARGIN_SPACE_2)),
+        |ui| {
             ui.vertical_centered(|ui| {
                 let annotation =
                     icon_button_with_surface(ui, "批注", Icon::Pen, false, None, opaque);
@@ -193,7 +195,8 @@ fn render_idle_toolbar_with_surface(ui: &mut Ui, opaque: bool) -> Option<UiComma
                     command = Some(UiCommand::ToggleQuickSettings);
                 }
             });
-        });
+        },
+    );
     command
 }
 
@@ -224,12 +227,14 @@ fn render_annotation_toolbar(
         .order(egui::Order::Foreground)
         .show(&context, |ui| {
             let (background, border) = normal_toolbar_surface(picker_open);
-            Frame::new()
-                .fill(background)
-                .stroke(Stroke::new(1.0, border))
-                .corner_radius(CornerRadius::same(tokens::CARD_RADIUS))
-                .inner_margin(Margin::same(tokens::MARGIN_SPACE_2))
-                .show(ui, |ui| {
+            pixel_snap::show_pixel_aligned_frame(
+                ui,
+                Frame::new()
+                    .fill(background)
+                    .stroke(Stroke::new(1.0, border))
+                    .corner_radius(CornerRadius::same(tokens::CARD_RADIUS))
+                    .inner_margin(Margin::same(tokens::MARGIN_SPACE_2)),
+                |ui| {
                     ui.vertical_centered(|ui| {
                         let mut interaction = render_ink_tool_buttons(
                             ui,
@@ -250,8 +255,9 @@ fn render_annotation_toolbar(
                         interaction
                     })
                     .inner
-                })
-                .inner
+                },
+            )
+            .inner
         });
     let interaction = area_response.inner;
     state.position += interaction.drag_delta;
@@ -479,10 +485,11 @@ fn render_color_picker(
 ) -> Option<UiCommand> {
     let selector_width = color_selector_width(orientation);
     let popup_style = trigger.ctx.style_of(egui::Theme::Light);
+    let picker_frame = opaque_picker_frame(&popup_style);
     let popup = Popup::from_toggle_button_response(trigger)
         .align(placement)
         .width(selector_width)
-        .frame(opaque_picker_frame(&popup_style));
+        .frame(Frame::NONE);
     let popup = if orientation == SelectorOrientation::Vertical {
         popup
             .gap(tokens::SPACE_2)
@@ -493,9 +500,12 @@ fn render_color_picker(
     popup
         .close_behavior(PopupCloseBehavior::CloseOnClick)
         .show(|ui| {
-            ui.set_min_width(selector_width);
-            ui.set_max_width(selector_width);
-            render_color_selector(ui, selected, orientation)
+            pixel_snap::show_pixel_aligned_frame(ui, picker_frame, |ui| {
+                ui.set_min_width(selector_width);
+                ui.set_max_width(selector_width);
+                render_color_selector(ui, selected, orientation)
+            })
+            .inner
         })
         .and_then(|response| response.inner)
 }
@@ -509,10 +519,11 @@ fn render_pen_width_picker(
 ) -> Option<UiCommand> {
     let selector_width = pen_width_selector_width(orientation);
     let popup_style = trigger.ctx.style_of(egui::Theme::Light);
+    let picker_frame = opaque_picker_frame(&popup_style);
     let popup = Popup::from_toggle_button_response(trigger)
         .align(placement)
         .width(selector_width)
-        .frame(opaque_picker_frame(&popup_style));
+        .frame(Frame::NONE);
     let popup = if orientation == SelectorOrientation::Vertical {
         popup
             .gap(tokens::SPACE_2)
@@ -523,9 +534,12 @@ fn render_pen_width_picker(
     popup
         .close_behavior(PopupCloseBehavior::CloseOnClick)
         .show(|ui| {
-            ui.set_min_width(selector_width);
-            ui.set_max_width(selector_width);
-            render_pen_width_selector(ui, selected, orientation)
+            pixel_snap::show_pixel_aligned_frame(ui, picker_frame, |ui| {
+                ui.set_min_width(selector_width);
+                ui.set_max_width(selector_width);
+                render_pen_width_selector(ui, selected, orientation)
+            })
+            .inner
         })
         .and_then(|response| response.inner)
 }
@@ -596,13 +610,12 @@ fn icon_button_with_surface(
         } else {
             surface
         };
-        ui.painter()
-            .rect_filled(rect, CornerRadius::same(tokens::BUTTON_RADIUS), fill);
-        ui.painter().rect_stroke(
+        pixel_snap::paint_pixel_aligned_rect(
+            ui,
             rect,
             CornerRadius::same(tokens::BUTTON_RADIUS),
+            fill,
             Stroke::new(1.0, border),
-            StrokeKind::Inside,
         );
 
         let icon_center = Pos2::new(
@@ -647,16 +660,19 @@ fn draw_icon(
     let painter = ui.painter();
     let half = tokens::ICON_SIZE / 2.0;
     let stroke = Stroke::new(tokens::scale_points(2.0), foreground);
+    let paint_line = |points, stroke| {
+        pixel_snap::paint_pixel_aligned_line(painter, points, stroke);
+    };
     match icon {
         Icon::Pen => {
-            painter.line_segment(
+            paint_line(
                 [
                     center + egui::vec2(-half * 0.6, half * 0.6),
                     center + egui::vec2(half * 0.6, -half * 0.6),
                 ],
                 stroke,
             );
-            painter.line_segment(
+            paint_line(
                 [
                     center + egui::vec2(-half * 0.7, half * 0.7),
                     center + egui::vec2(-half * 0.2, half * 0.55),
@@ -673,7 +689,7 @@ fn draw_icon(
                 egui::vec2(0.0, 1.0),
                 egui::vec2(-1.0, 0.0),
             ] {
-                painter.line_segment(
+                paint_line(
                     [
                         center + direction * half * 0.6,
                         center + direction * half * 0.9,
@@ -689,7 +705,7 @@ fn draw_icon(
                 (half * 0.6, -half * 0.1),
             ] {
                 let y = center.y + offset;
-                painter.line_segment(
+                paint_line(
                     [Pos2::new(center.x - half, y), Pos2::new(center.x + half, y)],
                     stroke,
                 );
@@ -706,7 +722,7 @@ fn draw_icon(
                 (0.0, tokens::scale_points(2.0)),
                 (half * 0.5, tokens::scale_points(3.0)),
             ] {
-                painter.line_segment(
+                paint_line(
                     [
                         Pos2::new(center.x - half * 0.75, center.y + offset),
                         Pos2::new(center.x + half * 0.75, center.y + offset),
@@ -749,35 +765,41 @@ fn draw_icon(
                 center,
                 egui::vec2(tokens::scale_points(16.0), tokens::scale_points(13.0)),
             );
-            painter.rect_stroke(rect, tokens::scale_points(2.0), stroke, StrokeKind::Inside);
-            painter.line_segment(
+            pixel_snap::paint_pixel_aligned_rect(
+                ui,
+                rect,
+                tokens::scale_points(2.0),
+                Color32::TRANSPARENT,
+                stroke,
+            );
+            paint_line(
                 [rect.left_top(), rect.right_bottom()],
                 Stroke::new(tokens::scale_points(2.0), accent),
             );
         }
         Icon::Exit => {
-            painter.line_segment(
+            paint_line(
                 [
                     center + egui::vec2(-half * 0.8, -half * 0.7),
                     center + egui::vec2(-half * 0.8, half * 0.7),
                 ],
                 stroke,
             );
-            painter.line_segment(
+            paint_line(
                 [
                     center + egui::vec2(-half * 0.8, -half * 0.7),
                     center + egui::vec2(-half * 0.2, -half * 0.7),
                 ],
                 stroke,
             );
-            painter.line_segment(
+            paint_line(
                 [
                     center + egui::vec2(-half * 0.8, half * 0.7),
                     center + egui::vec2(-half * 0.2, half * 0.7),
                 ],
                 stroke,
             );
-            painter.line_segment(
+            paint_line(
                 [
                     center + egui::vec2(-half * 0.15, 0.0),
                     center + egui::vec2(half * 0.75, 0.0),
@@ -795,14 +817,14 @@ fn draw_icon(
             ));
         }
         Icon::Previous => {
-            painter.line_segment(
+            paint_line(
                 [
                     center + egui::vec2(half * 0.55, -half * 0.7),
                     center + egui::vec2(-half * 0.45, 0.0),
                 ],
                 stroke,
             );
-            painter.line_segment(
+            paint_line(
                 [
                     center + egui::vec2(-half * 0.45, 0.0),
                     center + egui::vec2(half * 0.55, half * 0.7),
@@ -811,14 +833,14 @@ fn draw_icon(
             );
         }
         Icon::Next => {
-            painter.line_segment(
+            paint_line(
                 [
                     center + egui::vec2(-half * 0.55, -half * 0.7),
                     center + egui::vec2(half * 0.45, 0.0),
                 ],
                 stroke,
             );
-            painter.line_segment(
+            paint_line(
                 [
                     center + egui::vec2(half * 0.45, 0.0),
                     center + egui::vec2(-half * 0.55, half * 0.7),
@@ -827,21 +849,21 @@ fn draw_icon(
             );
         }
         Icon::Collapse => {
-            painter.line_segment(
+            paint_line(
                 [
                     center + egui::vec2(-half * 0.65, 0.0),
                     center + egui::vec2(half * 0.2, 0.0),
                 ],
                 stroke,
             );
-            painter.line_segment(
+            paint_line(
                 [
                     center + egui::vec2(-half * 0.2, -half * 0.45),
                     center + egui::vec2(-half * 0.65, 0.0),
                 ],
                 stroke,
             );
-            painter.line_segment(
+            paint_line(
                 [
                     center + egui::vec2(-half * 0.65, 0.0),
                     center + egui::vec2(-half * 0.2, half * 0.45),
@@ -850,21 +872,21 @@ fn draw_icon(
             );
         }
         Icon::Expand => {
-            painter.line_segment(
+            paint_line(
                 [
                     center + egui::vec2(-half * 0.2, 0.0),
                     center + egui::vec2(half * 0.65, 0.0),
                 ],
                 stroke,
             );
-            painter.line_segment(
+            paint_line(
                 [
                     center + egui::vec2(half * 0.2, -half * 0.45),
                     center + egui::vec2(half * 0.65, 0.0),
                 ],
                 stroke,
             );
-            painter.line_segment(
+            paint_line(
                 [
                     center + egui::vec2(half * 0.65, 0.0),
                     center + egui::vec2(half * 0.2, half * 0.45),
@@ -873,14 +895,14 @@ fn draw_icon(
             );
         }
         Icon::Confirm => {
-            painter.line_segment(
+            paint_line(
                 [
                     center + egui::vec2(-half * 0.7, 0.0),
                     center + egui::vec2(-half * 0.2, half * 0.55),
                 ],
                 Stroke::new(tokens::scale_points(2.0), foreground),
             );
-            painter.line_segment(
+            paint_line(
                 [
                     center + egui::vec2(-half * 0.2, half * 0.55),
                     center + egui::vec2(half * 0.75, -half * 0.55),
@@ -889,14 +911,14 @@ fn draw_icon(
             );
         }
         Icon::Cancel => {
-            painter.line_segment(
+            paint_line(
                 [
                     center + egui::vec2(-half * 0.65, -half * 0.65),
                     center + egui::vec2(half * 0.65, half * 0.65),
                 ],
                 Stroke::new(tokens::scale_points(2.0), foreground),
             );
-            painter.line_segment(
+            paint_line(
                 [
                     center + egui::vec2(half * 0.65, -half * 0.65),
                     center + egui::vec2(-half * 0.65, half * 0.65),
@@ -906,7 +928,7 @@ fn draw_icon(
         }
         Icon::Power => {
             painter.circle_stroke(center, half * 0.72, stroke);
-            painter.line_segment(
+            paint_line(
                 [
                     center + egui::vec2(0.0, -half),
                     center + egui::vec2(0.0, -half * 0.15),

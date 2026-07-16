@@ -1,10 +1,9 @@
 use egui::{
-    Align, Color32, CornerRadius, Frame, Layout, Margin, ScrollArea, Sense, Stroke, StrokeKind, Ui,
-    Vec2,
+    Align, Color32, CornerRadius, Frame, Layout, Margin, ScrollArea, Sense, Stroke, Ui, Vec2,
 };
 
 use super::{
-    design_tokens as tokens,
+    design_tokens as tokens, pixel_snap,
     settings_controls::render_tool_preferences,
     toolbar::{Icon, UiCommand, UiViewState, opaque_icon_button},
 };
@@ -13,12 +12,14 @@ use crate::slideshow::{ComCandidateStatus, ComDiagnostics};
 /// 绘制默认工具、联动开关、诊断和版本信息组成的设置界面。
 pub fn render(ui: &mut Ui, view: UiViewState<'_>) -> Option<UiCommand> {
     ui.set_min_size(ui.available_size());
-    Frame::new()
-        .fill(tokens::OPAQUE_COLOR_BACKGROUND)
-        .stroke(Stroke::new(1.0, tokens::OPAQUE_COLOR_BORDER))
-        .corner_radius(CornerRadius::same(tokens::CARD_RADIUS))
-        .inner_margin(Margin::same(tokens::MARGIN_SPACE_4))
-        .show(ui, |ui| {
+    pixel_snap::show_pixel_aligned_frame(
+        ui,
+        Frame::new()
+            .fill(tokens::OPAQUE_COLOR_BACKGROUND)
+            .stroke(Stroke::new(1.0, tokens::OPAQUE_COLOR_BORDER))
+            .corner_radius(CornerRadius::same(tokens::CARD_RADIUS))
+            .inner_margin(Margin::same(tokens::MARGIN_SPACE_4)),
+        |ui| {
             tokens::apply_opaque_widget_style(ui);
             ui.set_min_size(ui.available_size());
             let mut command = render_header(ui);
@@ -81,7 +82,8 @@ pub fn render(ui: &mut Ui, view: UiViewState<'_>) -> Option<UiCommand> {
                 }
             });
             command
-        })
+        },
+    )
         .inner
 }
 
@@ -109,13 +111,12 @@ fn close_button(ui: &mut Ui) -> egui::Response {
         } else {
             tokens::OPAQUE_COLOR_SURFACE
         };
-        ui.painter()
-            .rect_filled(rect, CornerRadius::same(tokens::BUTTON_RADIUS), fill);
-        ui.painter().rect_stroke(
+        pixel_snap::paint_pixel_aligned_rect(
+            ui,
             rect,
             CornerRadius::same(tokens::BUTTON_RADIUS),
+            fill,
             Stroke::new(1.0, tokens::OPAQUE_COLOR_BORDER),
-            StrokeKind::Inside,
         );
         let half = tokens::ICON_SIZE / 2.0;
         ui.painter().line_segment(

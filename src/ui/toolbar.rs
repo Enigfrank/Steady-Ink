@@ -148,27 +148,45 @@ pub fn render(ui: &mut Ui, view: UiViewState<'_>) -> Option<UiCommand> {
 
 /// 绘制右侧中部非批注悬浮卡片工具栏。
 pub(super) fn render_idle_toolbar(ui: &mut Ui) -> Option<UiCommand> {
+    render_idle_toolbar_with_surface(ui, false)
+}
+
+/// 绘制快捷设置窗口中的不透明悬浮工具栏。
+pub(super) fn render_opaque_idle_toolbar(ui: &mut Ui) -> Option<UiCommand> {
+    render_idle_toolbar_with_surface(ui, true)
+}
+
+/// 根据所在界面选择半透明或不透明表面后绘制非批注悬浮工具栏。
+fn render_idle_toolbar_with_surface(ui: &mut Ui, opaque: bool) -> Option<UiCommand> {
     let mut command = None;
+    let (background, border) = if opaque {
+        (tokens::OPAQUE_COLOR_BACKGROUND, tokens::OPAQUE_COLOR_BORDER)
+    } else {
+        (tokens::COLOR_BACKGROUND, tokens::COLOR_BORDER)
+    };
     Frame::new()
-        .fill(tokens::COLOR_BACKGROUND)
-        .stroke(Stroke::new(1.0, tokens::COLOR_BORDER))
+        .fill(background)
+        .stroke(Stroke::new(1.0, border))
         .corner_radius(CornerRadius::same(tokens::CARD_RADIUS))
         .inner_margin(Margin::same(tokens::MARGIN_SPACE_2))
         .show(ui, |ui| {
             ui.vertical_centered(|ui| {
-                let annotation = icon_button(ui, "批注", Icon::Pen, false, None);
+                let annotation =
+                    icon_button_with_surface(ui, "批注", Icon::Pen, false, None, opaque);
                 if annotation.drag_started() {
                     command = Some(UiCommand::BeginIdleToolbarDrag);
                 } else if annotation.clicked() {
                     command = Some(UiCommand::EnterAnnotation);
                 }
-                let settings = icon_button(ui, "设置", Icon::Settings, false, None);
+                let settings =
+                    icon_button_with_surface(ui, "设置", Icon::Settings, false, None, opaque);
                 if settings.drag_started() {
                     command = Some(UiCommand::BeginIdleToolbarDrag);
                 } else if settings.clicked() {
                     command = Some(UiCommand::OpenSettings);
                 }
-                let quick_settings = icon_button(ui, "快捷设置", Icon::Sliders, false, None);
+                let quick_settings =
+                    icon_button_with_surface(ui, "快捷设置", Icon::Sliders, false, None, opaque);
                 if quick_settings.drag_started() {
                     command = Some(UiCommand::BeginIdleToolbarDrag);
                 } else if quick_settings.clicked() {
@@ -190,6 +208,7 @@ fn render_annotation_toolbar(
     let state_id = egui::Id::new("normal_annotation_toolbar_state");
     let screen = context.content_rect();
     let toolbar_size = normal_toolbar_size();
+    let picker_open = Popup::is_any_open(&context);
     let mut state = context.data_mut(|data| {
         data.get_temp::<NormalToolbarState>(state_id)
             .filter(|state| state.dock_side == dock_side && state.viewport_size == screen.size())
@@ -204,9 +223,10 @@ fn render_annotation_toolbar(
         .fixed_pos(state.position)
         .order(egui::Order::Foreground)
         .show(&context, |ui| {
+            let (background, border) = normal_toolbar_surface(picker_open);
             Frame::new()
-                .fill(tokens::COLOR_BACKGROUND)
-                .stroke(Stroke::new(1.0, tokens::COLOR_BORDER))
+                .fill(background)
+                .stroke(Stroke::new(1.0, border))
                 .corner_radius(CornerRadius::same(tokens::CARD_RADIUS))
                 .inner_margin(Margin::same(tokens::MARGIN_SPACE_2))
                 .show(ui, |ui| {
@@ -216,8 +236,16 @@ fn render_annotation_toolbar(
                             tools,
                             normal_picker_placement(dock_side),
                             SelectorOrientation::Vertical,
+                            picker_open,
                         );
-                        let exit = icon_button(ui, "退出批注", Icon::Exit, false, None);
+                        let exit = icon_button_with_surface(
+                            ui,
+                            "退出批注",
+                            Icon::Exit,
+                            false,
+                            None,
+                            picker_open,
+                        );
                         interaction.observe(&exit, UiCommand::ExitAnnotation);
                         interaction
                     })
@@ -265,6 +293,15 @@ struct NormalToolbarState {
     position: Pos2,
     dock_side: DockSide,
     viewport_size: Vec2,
+}
+
+/// 返回普通工具栏在弹层关闭和打开状态下使用的表面颜色。
+const fn normal_toolbar_surface(picker_open: bool) -> (Color32, Color32) {
+    if picker_open {
+        (tokens::OPAQUE_COLOR_BACKGROUND, tokens::OPAQUE_COLOR_BORDER)
+    } else {
+        (tokens::COLOR_BACKGROUND, tokens::COLOR_BORDER)
+    }
 }
 
 /// 返回八个纵向按钮及卡片内边距形成的固定工具栏尺寸。
@@ -321,6 +358,20 @@ const fn normal_picker_placement(dock_side: DockSide) -> RectAlign {
     }
 }
 
+static LEFT_PICKER_ALTERNATIVES: [RectAlign; 1] = [RectAlign::LEFT_END];
+static RIGHT_PICKER_ALTERNATIVES: [RectAlign; 1] = [RectAlign::RIGHT_END];
+
+/// 返回同一屏幕内侧的备用弹层位置，避免 egui 反向翻转后覆盖普通工具栏。
+fn normal_picker_alternatives(placement: RectAlign) -> &'static [RectAlign] {
+    if placement == RectAlign::LEFT_START {
+        &LEFT_PICKER_ALTERNATIVES
+    } else if placement == RectAlign::RIGHT_START {
+        &RIGHT_PICKER_ALTERNATIVES
+    } else {
+        &[]
+    }
+}
+
 /// 将浮动控件约束在单轴可用范围内；空间不足时保持居中并允许对称溢出。
 fn constrain_axis_position(
     position: f32,
@@ -344,22 +395,38 @@ pub(super) fn render_ink_tool_buttons(
     tools: ToolState,
     picker_placement: RectAlign,
     picker_orientation: SelectorOrientation,
+    opaque: bool,
 ) -> ToolbarInteraction {
     let mut interaction = ToolbarInteraction::default();
-    let pen = icon_button(ui, "画笔", Icon::Pen, tools.tool == InkTool::Pen, None);
+    let pen = icon_button_with_surface(
+        ui,
+        "画笔",
+        Icon::Pen,
+        tools.tool == InkTool::Pen,
+        None,
+        opaque,
+    );
     interaction.observe(&pen, UiCommand::SelectPen);
-    let color = icon_button(ui, "颜色", Icon::Color, false, Some(color32(tools.color)));
+    let color = icon_button_with_surface(
+        ui,
+        "颜色",
+        Icon::Color,
+        false,
+        Some(color32(tools.color)),
+        opaque,
+    );
     interaction.observe_drag(&color);
     keep_picker_command(
         &mut interaction,
         render_color_picker(&color, tools.color, picker_placement, picker_orientation),
     );
-    let pen_width = icon_button(
+    let pen_width = icon_button_with_surface(
         ui,
         pen_width_label(tools.pen_width),
         Icon::PenWidth,
         false,
         None,
+        opaque,
     );
     interaction.observe_drag(&pen_width);
     keep_picker_command(
@@ -371,25 +438,27 @@ pub(super) fn render_ink_tool_buttons(
             picker_orientation,
         ),
     );
-    let eraser = icon_button(
+    let eraser = icon_button_with_surface(
         ui,
         "橡皮擦",
         Icon::Eraser,
         tools.tool == InkTool::RegionEraser,
         None,
+        opaque,
     );
     interaction.observe(&eraser, UiCommand::SelectEraser);
-    let eraser_size = icon_button(
+    let eraser_size = icon_button_with_surface(
         ui,
         eraser_size_label(tools.eraser_size),
         Icon::EraserSize,
         false,
         None,
+        opaque,
     );
     interaction.observe(&eraser_size, UiCommand::CycleEraserSize);
-    let undo = icon_button(ui, "撤销", Icon::Undo, false, None);
+    let undo = icon_button_with_surface(ui, "撤销", Icon::Undo, false, None, opaque);
     interaction.observe(&undo, UiCommand::Undo);
-    let clear = icon_button(ui, "清屏", Icon::Clear, false, None);
+    let clear = icon_button_with_surface(ui, "清屏", Icon::Clear, false, None, opaque);
     interaction.observe(&clear, UiCommand::Clear);
     interaction
 }
@@ -409,9 +478,19 @@ fn render_color_picker(
     orientation: SelectorOrientation,
 ) -> Option<UiCommand> {
     let selector_width = color_selector_width(orientation);
-    Popup::from_toggle_button_response(trigger)
+    let popup_style = trigger.ctx.style_of(egui::Theme::Light);
+    let popup = Popup::from_toggle_button_response(trigger)
         .align(placement)
         .width(selector_width)
+        .frame(opaque_picker_frame(&popup_style));
+    let popup = if orientation == SelectorOrientation::Vertical {
+        popup
+            .gap(tokens::SPACE_2)
+            .align_alternatives(normal_picker_alternatives(placement))
+    } else {
+        popup
+    };
+    popup
         .close_behavior(PopupCloseBehavior::CloseOnClick)
         .show(|ui| {
             ui.set_min_width(selector_width);
@@ -429,9 +508,19 @@ fn render_pen_width_picker(
     orientation: SelectorOrientation,
 ) -> Option<UiCommand> {
     let selector_width = pen_width_selector_width(orientation);
-    Popup::from_toggle_button_response(trigger)
+    let popup_style = trigger.ctx.style_of(egui::Theme::Light);
+    let popup = Popup::from_toggle_button_response(trigger)
         .align(placement)
         .width(selector_width)
+        .frame(opaque_picker_frame(&popup_style));
+    let popup = if orientation == SelectorOrientation::Vertical {
+        popup
+            .gap(tokens::SPACE_2)
+            .align_alternatives(normal_picker_alternatives(placement))
+    } else {
+        popup
+    };
+    popup
         .close_behavior(PopupCloseBehavior::CloseOnClick)
         .show(|ui| {
             ui.set_min_width(selector_width);
@@ -439,6 +528,13 @@ fn render_pen_width_picker(
             render_pen_width_selector(ui, selected, orientation)
         })
         .and_then(|response| response.inner)
+}
+
+/// 返回颜色和粗细选择弹层在打开时使用的不透明边框框架。
+fn opaque_picker_frame(style: &egui::Style) -> Frame {
+    Frame::popup(style)
+        .fill(tokens::OPAQUE_COLOR_BACKGROUND)
+        .stroke(Stroke::new(1.0, tokens::OPAQUE_COLOR_BORDER))
 }
 
 /// 绘制固定触摸尺寸、图标在上文字在下的功能按钮。
@@ -449,25 +545,63 @@ pub(super) fn icon_button(
     selected: bool,
     swatch: Option<Color32>,
 ) -> Response {
+    icon_button_with_surface(ui, label, icon, selected, swatch, false)
+}
+
+/// 绘制设置和快捷设置使用的不透明图标加文字按钮。
+pub(super) fn opaque_icon_button(
+    ui: &mut Ui,
+    label: &str,
+    icon: Icon,
+    selected: bool,
+    swatch: Option<Color32>,
+) -> Response {
+    icon_button_with_surface(ui, label, icon, selected, swatch, true)
+}
+
+/// 根据所在界面选择表面透明度后绘制统一的图标加文字按钮。
+fn icon_button_with_surface(
+    ui: &mut Ui,
+    label: &str,
+    icon: Icon,
+    selected: bool,
+    swatch: Option<Color32>,
+    opaque: bool,
+) -> Response {
     let desired_size = Vec2::splat(tokens::TOUCH_TARGET);
     let (rect, response) = ui.allocate_exact_size(desired_size, Sense::click_and_drag());
     if ui.is_rect_visible(rect) {
         let enabled = ui.is_enabled();
-        let fill = if !enabled {
-            tokens::COLOR_HOVER
-        } else if selected {
-            tokens::COLOR_SELECTED
-        } else if response.hovered() {
-            tokens::COLOR_HOVER
+        let (surface, hover, selected_surface, border) = if opaque {
+            (
+                tokens::OPAQUE_COLOR_SURFACE,
+                tokens::OPAQUE_COLOR_HOVER,
+                tokens::OPAQUE_COLOR_SELECTED,
+                tokens::OPAQUE_COLOR_BORDER,
+            )
         } else {
-            tokens::COLOR_SURFACE
+            (
+                tokens::COLOR_SURFACE,
+                tokens::COLOR_HOVER,
+                tokens::COLOR_SELECTED,
+                tokens::COLOR_BORDER,
+            )
+        };
+        let fill = if !enabled {
+            hover
+        } else if selected {
+            selected_surface
+        } else if response.hovered() {
+            hover
+        } else {
+            surface
         };
         ui.painter()
             .rect_filled(rect, CornerRadius::same(tokens::BUTTON_RADIUS), fill);
         ui.painter().rect_stroke(
             rect,
             CornerRadius::same(tokens::BUTTON_RADIUS),
-            Stroke::new(1.0, tokens::COLOR_BORDER),
+            Stroke::new(1.0, border),
             StrokeKind::Inside,
         );
 
@@ -910,13 +1044,38 @@ mod tests {
     /// 验证普通工具栏两侧的纵向选择栏始终向屏幕内部展开。
     #[test]
     fn normal_picker_opens_toward_screen_interior() {
-        assert_eq!(
-            normal_picker_placement(DockSide::Left),
-            RectAlign::RIGHT_START
-        );
-        assert_eq!(
-            normal_picker_placement(DockSide::Right),
-            RectAlign::LEFT_START
-        );
+        let trigger =
+            Rect::from_min_size(Pos2::new(800.0, 300.0), Vec2::splat(tokens::TOUCH_TARGET));
+        let popup_size = Vec2::new(tokens::TOUCH_TARGET, tokens::TOUCH_TARGET * 6.0);
+
+        for (dock_side, expected) in [
+            (DockSide::Left, RectAlign::RIGHT_START),
+            (DockSide::Right, RectAlign::LEFT_START),
+        ] {
+            let placement = normal_picker_placement(dock_side);
+            assert_eq!(placement, expected);
+
+            for alignment in std::iter::once(placement)
+                .chain(normal_picker_alternatives(placement).iter().copied())
+            {
+                let popup = alignment.align_rect(&trigger, popup_size, tokens::SPACE_2);
+                match dock_side {
+                    DockSide::Left => assert!(popup.left() >= trigger.right()),
+                    DockSide::Right => assert!(popup.right() <= trigger.left()),
+                }
+            }
+        }
+    }
+
+    /// 验证普通工具栏仅在颜色或粗细弹层打开时切换为不透明表面。
+    #[test]
+    fn normal_toolbar_surface_tracks_picker_open_state() {
+        let (closed_background, closed_border) = normal_toolbar_surface(false);
+        assert_eq!(closed_background.a(), tokens::INTERFACE_ALPHA);
+        assert_eq!(closed_border.a(), tokens::INTERFACE_ALPHA);
+
+        let (open_background, open_border) = normal_toolbar_surface(true);
+        assert_eq!(open_background.a(), tokens::OPAQUE_INTERFACE_ALPHA);
+        assert_eq!(open_border.a(), tokens::OPAQUE_INTERFACE_ALPHA);
     }
 }

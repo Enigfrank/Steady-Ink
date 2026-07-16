@@ -203,6 +203,7 @@ fn render_toolbar_body(
                             view.tools,
                             RectAlign::TOP_START,
                             SelectorOrientation::Horizontal,
+                            false,
                         );
                         let mut command = interaction.command;
                         let (exit_label, exit_enabled, requested_command) =

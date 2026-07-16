@@ -6,7 +6,7 @@ use egui::{
 use super::{
     design_tokens as tokens,
     settings_controls::render_tool_preferences,
-    toolbar::{Icon, UiCommand, UiViewState, icon_button},
+    toolbar::{Icon, UiCommand, UiViewState, opaque_icon_button},
 };
 use crate::slideshow::{ComCandidateStatus, ComDiagnostics};
 
@@ -14,11 +14,12 @@ use crate::slideshow::{ComCandidateStatus, ComDiagnostics};
 pub fn render(ui: &mut Ui, view: UiViewState<'_>) -> Option<UiCommand> {
     ui.set_min_size(ui.available_size());
     Frame::new()
-        .fill(tokens::COLOR_BACKGROUND)
-        .stroke(Stroke::new(1.0, tokens::COLOR_BORDER))
+        .fill(tokens::OPAQUE_COLOR_BACKGROUND)
+        .stroke(Stroke::new(1.0, tokens::OPAQUE_COLOR_BORDER))
         .corner_radius(CornerRadius::same(tokens::CARD_RADIUS))
         .inner_margin(Margin::same(tokens::MARGIN_SPACE_4))
         .show(ui, |ui| {
+            tokens::apply_opaque_widget_style(ui);
             ui.set_min_size(ui.available_size());
             let mut command = render_header(ui);
             ui.separator();
@@ -73,7 +74,8 @@ pub fn render(ui: &mut Ui, view: UiViewState<'_>) -> Option<UiCommand> {
 
                 ui.separator();
                 section_heading(ui, "应用操作");
-                let exit_clicked = icon_button(ui, "退出软件", Icon::Power, false, None).clicked();
+                let exit_clicked = opaque_icon_button(ui, "退出软件", Icon::Power, false, None)
+                    .clicked();
                 if exit_clicked && command.is_none() {
                     command = Some(UiCommand::ExitApplication);
                 }
@@ -103,16 +105,16 @@ fn close_button(ui: &mut Ui) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
     if ui.is_rect_visible(rect) {
         let fill = if response.hovered() {
-            tokens::COLOR_HOVER
+            tokens::OPAQUE_COLOR_HOVER
         } else {
-            tokens::COLOR_SURFACE
+            tokens::OPAQUE_COLOR_SURFACE
         };
         ui.painter()
             .rect_filled(rect, CornerRadius::same(tokens::BUTTON_RADIUS), fill);
         ui.painter().rect_stroke(
             rect,
             CornerRadius::same(tokens::BUTTON_RADIUS),
-            Stroke::new(1.0, tokens::COLOR_BORDER),
+            Stroke::new(1.0, tokens::OPAQUE_COLOR_BORDER),
             StrokeKind::Inside,
         );
         let half = tokens::ICON_SIZE / 2.0;

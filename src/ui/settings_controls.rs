@@ -155,16 +155,16 @@ fn selection_button(ui: &mut Ui, label: &str, visual: SelectionVisual, selected:
     }
 
     let fill = if selected {
-        tokens::COLOR_SELECTED
+        tokens::OPAQUE_COLOR_SELECTED
     } else if response.hovered() {
-        tokens::COLOR_HOVER
+        tokens::OPAQUE_COLOR_HOVER
     } else {
-        tokens::COLOR_SURFACE
+        tokens::OPAQUE_COLOR_SURFACE
     };
     let border = if selected {
-        tokens::COLOR_PRIMARY_SURFACE
+        tokens::OPAQUE_COLOR_PRIMARY_SURFACE
     } else {
-        tokens::COLOR_BORDER
+        tokens::OPAQUE_COLOR_BORDER
     };
     ui.painter()
         .rect_filled(rect, CornerRadius::same(tokens::BUTTON_RADIUS), fill);
@@ -199,7 +199,7 @@ fn draw_selection_visual(ui: &Ui, center: Pos2, visual: SelectionVisual) {
             ui.painter().circle_stroke(
                 center,
                 tokens::ICON_SIZE / 2.0,
-                Stroke::new(1.0, tokens::COLOR_BORDER),
+                Stroke::new(1.0, tokens::OPAQUE_COLOR_BORDER),
             );
         }
         SelectionVisual::PenWidth(width) => {

@@ -15,6 +15,8 @@
   <a href="./LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0--or--later-DC2626" alt="许可证：GPL-3.0-or-later"></a>
 </p>
 
+[English](./README.en.md)
+
 > [!WARNING]
 > Steady Ink 目前处于早期开发阶段。主要功能已经可以在桌面程序中运行，但仍需在目标 4K 触摸教学设备上完成长期稳定性和性能验证。
 

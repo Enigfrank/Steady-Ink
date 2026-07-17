@@ -271,6 +271,11 @@ impl D3DWindowContext {
         self.swap_chain_size
     }
 
+    /// 返回当前主显示器普通批注模式使用的目标物理尺寸。
+    pub const fn annotation_size(&self) -> PhysicalSize<u32> {
+        self.geometry.annotation_size
+    }
+
     /// 返回指定 DXGI back buffer 的 D3D12 resource。
     pub fn back_buffer(
         &self,

@@ -52,8 +52,9 @@ The repository now contains a runnable Windows prototype. Standard annotation, s
 - In standard annotation mode, color and pen-width pickers use a vertical layout. They expand left when the toolbar is on the right, and right when it is on the left, avoiding overlap.
 - Available colors are red, yellow, blue, green, black, and white. Pen widths are fixed at 4pt, 8pt, 16pt, and 24pt; the default is 4pt.
 - In PowerPoint/WPS presentation mode, the central toolbar touches the bottom edge. Navigation controls are anchored to the lower-left and lower-right corners without extra safe margins.
-- The interface uses 80% of the original design scale. Icon-and-label buttons use 51.2 egui points. Panels, buttons, popups, and borders use 50% opacity, while text, icons, swatches, and ink remain fully opaque.
-- The settings view can change default tools, enable or disable PowerPoint/WPS integration, show graphics and presentation-connection diagnostics, and exit the application normally.
+- Floating toolbars, quick settings, and annotation tools use 80% of the original design scale, with icon-and-label buttons at 51.2 egui points. The full settings view independently uses a `560 × 640` logical viewport and 100% control metrics.
+- Panels, buttons, popups, and borders use 50% opacity, while text, icons, swatches, and ink remain fully opaque.
+- The settings view can change default tools, enable or disable PowerPoint/WPS integration, and show graphics and presentation-connection diagnostics. Its top action bar can open the configuration directory or exit the application normally.
 
 ## Technical Implementation
 
@@ -118,6 +119,20 @@ cargo run --release
 
 Performance metrics are disabled by default. When enabled, they print a report every five seconds without triggering continuous redrawing.
 
+To run the repeatable Intel GPU load baseline, build the release executable and start the self-terminating scenario:
+
+```powershell
+cargo build --release
+$report = Join-Path $env:TEMP "steady-ink-gpu-benchmark.toml"
+$env:STEADY_INK_GPU_BENCHMARK = "1"
+$env:STEADY_INK_GPU_BENCHMARK_REPORT = $report
+$process = Start-Process -FilePath ".\target\release\steady-ink.exe" -Wait -PassThru
+Get-Content -LiteralPath $report
+if ($process.ExitCode -ne 0) { throw "The GPU benchmark did not pass" }
+```
+
+The scenario uses the real DirectComposition/D3D12 path to append 1,000 draw operations and 200 dynamic erase operations one frame at a time. It succeeds only on an Intel hardware adapter without WARP when input-to-display p95 is at most 33ms. On 2026-07-17, an Intel UHD Graphics 630 at `1920 × 1080` measured `8.377ms`; this result does not replace validation on the target 4K touchscreen hardware.
+
 ## Development and Checks
 
 Before submitting changes, run:
@@ -129,7 +144,7 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 ```
 
-The current automated suite contains 42 logic and layout tests. It covers state transitions, clear-and-undo, per-slide ink, palm classification, presentation-connection recovery, picker directions, edge snapping, and presentation-toolbar positioning.
+The current automated suite contains 72 logic, rendering, and layout tests. It covers state transitions, clear-and-undo, per-slide ink, palm candidates and UI suppression, dynamic erase phases, GPU workload generation, presentation-connection recovery, DPI pixel alignment, picker directions, edge snapping, and presentation-toolbar positioning.
 
 The project is organized by feature:
 

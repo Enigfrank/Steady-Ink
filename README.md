@@ -53,8 +53,9 @@ Steady Ink 主要为 Windows 4K 触摸教学设备设计，核心目标包括：
 - 普通批注模式的颜色和画笔粗细选择栏采用纵向布局。工具栏位于右侧时选择栏向左展开，位于左侧时向右展开，避免相互覆盖。
 - 颜色固定为红、黄、蓝、绿、黑、白；画笔粗细固定为 4pt、8pt、16pt、24pt，默认 4pt。
 - PowerPoint/WPS 放映模式的中央工具栏紧贴屏幕底边，左右翻页控件分别紧贴左下角和右下角，不保留额外安全距离。
-- 界面尺寸统一为原设计的 80%，图标加文字按钮统一为 51.2 egui points；面板、按钮、弹层和边框表面使用 50% 不透明度，文字、图标、色样和墨迹保持完整不透明度。
-- 设置页支持修改默认工具、启用或禁用 PowerPoint/WPS 联动、查看图形和放映连接诊断，以及正常退出软件。
+- 悬浮工具栏、快捷设置和批注工具界面使用原设计的 80% 比例，图标加文字按钮统一为 51.2 egui points；完整设置页独立使用 `560 × 640` 逻辑点和 100% 控件尺寸。
+- 面板、按钮、弹层和边框表面使用 50% 不透明度，文字、图标、色样和墨迹保持完整不透明度。
+- 设置页支持修改默认工具、启用或禁用 PowerPoint/WPS 联动、查看图形和放映连接诊断；顶部操作栏可打开配置文件所在目录或正常退出软件。
 
 ## 技术实现
 
@@ -119,6 +120,20 @@ cargo run --release
 
 性能指标默认关闭；启用后每五秒输出一次报告，不会因此启动持续重绘。
 
+需要运行可重复的 Intel GPU 压力基线时，先构建 release 版本，再执行自结束场景：
+
+```powershell
+cargo build --release
+$report = Join-Path $env:TEMP "steady-ink-gpu-benchmark.toml"
+$env:STEADY_INK_GPU_BENCHMARK = "1"
+$env:STEADY_INK_GPU_BENCHMARK_REPORT = $report
+$process = Start-Process -FilePath ".\target\release\steady-ink.exe" -Wait -PassThru
+Get-Content -LiteralPath $report
+if ($process.ExitCode -ne 0) { throw "GPU 压力场景未通过" }
+```
+
+该场景通过真实 DirectComposition/D3D12 路径逐帧追加 1000 条画笔 operation 和 200 条动态擦除 operation，只有 Intel 硬件 adapter、非 WARP 且 input-to-display p95 不超过 33ms 时才成功。2026-07-17 在 Intel UHD Graphics 630、`1920 × 1080` 上测得 p95 为 `8.377ms`；此结果不替代目标 4K 触摸设备验收。
+
 ## 开发与检查
 
 提交变更前请运行：
@@ -130,7 +145,7 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 ```
 
-当前自动化测试包含 42 项逻辑和布局测试，覆盖状态流转、清屏撤销、逐页墨迹、手掌分类、放映连接恢复、选择栏方向、侧边吸附和放映工具栏边缘定位。
+当前自动化测试包含 72 项逻辑、渲染和布局测试，覆盖状态流转、清屏撤销、逐页墨迹、手掌候选与 UI 抑制、动态擦除阶段、GPU 压力数据、放映连接恢复、DPI 像素对齐、选择栏方向、侧边吸附和放映工具栏边缘定位。
 
 项目按功能组织：
 

@@ -48,12 +48,25 @@ pub(super) struct PerformanceTracker {
     redraw_counts: [u64; RedrawReason::COUNT],
 }
 
+/// 一次已完成 Present 对应的帧耗时和可选输入到显示延迟。
+#[derive(Debug, Clone, Copy)]
+pub(super) struct FrameSample {
+    pub frame_duration: Duration,
+    pub input_to_display: Option<Duration>,
+}
+
 impl PerformanceTracker {
     /// 根据环境变量创建默认关闭的性能采样器。
-    pub(super) fn new() -> Self {
-        let enabled = std::env::var(METRICS_ENVIRONMENT_VARIABLE)
-            .ok()
-            .is_some_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true"));
+    pub(super) fn new(force_enabled: bool) -> Self {
+        let enabled = force_enabled
+            || std::env::var(METRICS_ENVIRONMENT_VARIABLE)
+                .ok()
+                .is_some_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true"));
+        Self::with_enabled(enabled)
+    }
+
+    /// 使用已解析的开关创建采样器，供启动路径和纯逻辑测试复用。
+    fn with_enabled(enabled: bool) -> Self {
         if enabled {
             tracing::info!(
                 report_interval_seconds = REPORT_INTERVAL.as_secs(),
@@ -104,21 +117,28 @@ impl PerformanceTracker {
     }
 
     /// 在交换缓冲完成后记录帧耗时和最近输入到显示的近似延迟。
-    pub(super) fn finish_frame(&mut self, frame_started_at: Option<Instant>) {
+    pub(super) fn finish_frame(
+        &mut self,
+        frame_started_at: Option<Instant>,
+    ) -> Option<FrameSample> {
         if !self.enabled {
-            return;
+            return None;
         }
         let now = Instant::now();
-        if let Some(frame_started_at) = frame_started_at {
-            self.frame_durations
-                .push(now.duration_since(frame_started_at));
-        }
-        if let Some(input_at) = self.pending_input_at.take() {
-            self.input_latencies.push(now.duration_since(input_at));
-        }
+        let frame_duration = now.duration_since(frame_started_at?);
+        let input_to_display = self
+            .pending_input_at
+            .take()
+            .map(|input_at| now.duration_since(input_at));
+        self.frame_durations.push(frame_duration);
+        self.input_latencies.extend(input_to_display);
         self.frame_count += 1;
 
         self.report_if_due(now);
+        Some(FrameSample {
+            frame_duration,
+            input_to_display,
+        })
     }
 
     /// 返回统计模式下一次只读汇总需要唤醒事件循环的时间。
@@ -181,7 +201,7 @@ impl Drop for PerformanceTracker {
 }
 
 /// 返回已排序耗时样本的指定百分位毫秒值。
-fn percentile_milliseconds(samples: &mut [Duration], percentile: usize) -> Option<f64> {
+pub(super) fn percentile_milliseconds(samples: &mut [Duration], percentile: usize) -> Option<f64> {
     if samples.is_empty() {
         return None;
     }
@@ -216,5 +236,34 @@ mod tests {
             percentile_milliseconds(&mut short_window, PERCENTILE_95),
             Some(20.0)
         );
+    }
+
+    /// 验证关闭统计时不读取帧时钟也不生成样本。
+    #[test]
+    fn disabled_tracker_returns_no_frame_sample() {
+        let mut tracker = PerformanceTracker::with_enabled(false);
+
+        assert_eq!(tracker.begin_frame(), None);
+        assert!(tracker.finish_frame(None).is_none());
+        assert_eq!(tracker.next_report_deadline(), None);
+    }
+
+    /// 验证启用统计时待处理输入只对应下一次 Present 的一个延迟样本。
+    #[test]
+    fn enabled_tracker_consumes_pending_input_once() {
+        let mut tracker = PerformanceTracker::with_enabled(true);
+        tracker.record_pointer_batch(3);
+
+        let first = tracker
+            .finish_frame(tracker.begin_frame())
+            .expect("启用统计时应生成帧样本");
+        let second = tracker
+            .finish_frame(tracker.begin_frame())
+            .expect("后续 Present 仍应生成帧样本");
+
+        assert!(first.input_to_display.is_some());
+        assert_eq!(second.input_to_display, None);
+        assert_eq!(tracker.pointer_batch_count, 1);
+        assert_eq!(tracker.pointer_sample_count, 3);
     }
 }

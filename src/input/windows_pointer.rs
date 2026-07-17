@@ -322,19 +322,23 @@ impl WindowsPointerTracker {
 
     /// 把当前全部手掌贡献接触合并为一个动态旋转椭圆。
     fn palm_sample(&self) -> Option<EraseSample> {
-        let contacts: Vec<_> = self
+        let mut contacts: Vec<_> = self
             .palm_ids
             .iter()
             .filter_map(|pointer_id| self.touches.get(pointer_id))
             .collect();
+        contacts.sort_by(|left, right| {
+            left.point
+                .x
+                .total_cmp(&right.point.x)
+                .then_with(|| left.point.y.total_cmp(&right.point.y))
+        });
         let geometry = contacts
             .iter()
             .map(|touch| touch.geometry)
             .reduce(ContactGeometry::union)?;
         let rotation_radians = if contacts.len() >= 2 {
-            let first = contacts.first()?.point;
-            let last = contacts.last()?.point;
-            (last.y - first.y).atan2(last.x - first.x)
+            farthest_contact_rotation(&contacts)
         } else {
             contacts.first()?.geometry.rotation_radians
         };
@@ -352,6 +356,26 @@ impl WindowsPointerTracker {
         self.candidate_ids.remove(&pointer_id);
         self.palm_ids.remove(&pointer_id);
     }
+}
+
+/// 返回接触中心最远点对的稳定椭圆方向，范围归一化到 `[0, PI)`。
+fn farthest_contact_rotation(contacts: &[&TouchContact]) -> f32 {
+    let mut farthest_distance_squared = 0.0;
+    let mut rotation_radians = contacts
+        .first()
+        .map_or(0.0, |contact| contact.geometry.rotation_radians);
+    for (index, left) in contacts.iter().enumerate() {
+        for right in &contacts[index + 1..] {
+            let delta_x = right.point.x - left.point.x;
+            let delta_y = right.point.y - left.point.y;
+            let distance_squared = delta_x.mul_add(delta_x, delta_y * delta_y);
+            if distance_squared > farthest_distance_squared {
+                farthest_distance_squared = distance_squared;
+                rotation_radians = delta_y.atan2(delta_x).rem_euclid(std::f32::consts::PI);
+            }
+        }
+    }
+    rotation_radians
 }
 
 /// 原生 Pointer Input 中的一个活动触摸接触。
@@ -544,6 +568,18 @@ mod tests {
 
     /// 创建手掌分类测试使用的接触记录。
     fn contact(left: f32, top: f32, right: f32, bottom: f32, started_at: Instant) -> TouchContact {
+        contact_with_confidence(left, top, right, bottom, started_at, true)
+    }
+
+    /// 创建具有指定系统置信度的手掌分类测试接触记录。
+    fn contact_with_confidence(
+        left: f32,
+        top: f32,
+        right: f32,
+        bottom: f32,
+        started_at: Instant,
+        confident: bool,
+    ) -> TouchContact {
         let geometry = ContactGeometry {
             left,
             top,
@@ -551,7 +587,7 @@ mod tests {
             bottom,
             rotation_radians: 0.0,
         };
-        TouchContact::new(geometry.center(), geometry, true, started_at)
+        TouchContact::new(geometry.center(), geometry, confident, started_at)
     }
 
     /// 验证明显大接触在确认窗口后进入手掌候选。
@@ -588,5 +624,76 @@ mod tests {
         assert_eq!(sample.center, CanvasPoint::new(70.0, 60.0));
         assert_eq!(sample.radius_x, 60.0);
         assert_eq!(sample.radius_y, 40.0);
+    }
+
+    /// 验证系统标记为低置信度的接触无需达到大面积阈值也会成为候选。
+    #[test]
+    fn low_confidence_contact_becomes_palm_candidate() {
+        let now = Instant::now();
+        let mut tracker = WindowsPointerTracker::default();
+        tracker
+            .touches
+            .insert(1, contact_with_confidence(0.0, 0.0, 20.0, 20.0, now, false));
+
+        tracker.refresh_candidates();
+
+        assert!(tracker.candidate_ids.contains(&1));
+    }
+
+    /// 验证相同接触几何以不同顺序插入时仍生成相同的最远点对方向。
+    #[test]
+    fn clustered_contact_rotation_is_independent_of_insertion_order() {
+        let now = Instant::now();
+        let contact_bounds = [
+            (1, 0.0, 0.0, 40.0, 40.0),
+            (2, 80.0, 40.0, 120.0, 80.0),
+            (3, 20.0, 100.0, 60.0, 140.0),
+        ];
+        let mut forward = WindowsPointerTracker::default();
+        for (pointer_id, left, top, right, bottom) in contact_bounds {
+            forward
+                .touches
+                .insert(pointer_id, contact(left, top, right, bottom, now));
+            forward.palm_ids.insert(pointer_id);
+        }
+        let mut reverse = WindowsPointerTracker::default();
+        for (pointer_id, left, top, right, bottom) in contact_bounds.into_iter().rev() {
+            reverse
+                .touches
+                .insert(pointer_id, contact(left, top, right, bottom, now));
+            reverse.palm_ids.insert(pointer_id);
+        }
+
+        let forward_sample = forward.palm_sample().expect("正序接触应生成擦除采样");
+        let reverse_sample = reverse.palm_sample().expect("逆序接触应生成擦除采样");
+
+        assert_eq!(forward_sample.center, reverse_sample.center);
+        assert_eq!(forward_sample.radius_x, reverse_sample.radius_x);
+        assert_eq!(forward_sample.radius_y, reverse_sample.radius_y);
+        assert_eq!(
+            forward_sample.rotation_radians,
+            reverse_sample.rotation_radians
+        );
+    }
+
+    /// 验证未超过确认窗口的候选结束时会回放缓冲轨迹并清理跟踪状态。
+    #[test]
+    fn rejected_candidate_returns_buffered_points() {
+        let now = Instant::now();
+        let mut tracker = WindowsPointerTracker::default();
+        let mut touch = contact(0.0, 0.0, 80.0, 80.0, now);
+        touch.points.push(CanvasPoint::new(44.0, 44.0));
+        tracker.touches.insert(1, touch);
+        tracker.candidate_ids.insert(1);
+
+        let dispatch = tracker.finish_touch(1);
+
+        let Some(WindowsPointerEvent::CandidateRejected { points }) = dispatch.event else {
+            panic!("未确认候选结束时应返回缓冲轨迹");
+        };
+        assert_eq!(points.len(), 2);
+        assert!(dispatch.swallow_winit);
+        assert!(!tracker.touches.contains_key(&1));
+        assert!(!tracker.candidate_ids.contains(&1));
     }
 }

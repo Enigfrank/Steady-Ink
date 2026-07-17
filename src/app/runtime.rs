@@ -17,7 +17,8 @@ use winit::{
 use crate::{
     app::{
         AppMode, AppState,
-        performance::{PerformanceTracker, RedrawReason},
+        gpu_benchmark::{GpuBenchmark, GpuBenchmarkAction},
+        performance::{FrameSample, PerformanceTracker, RedrawReason},
     },
     error::AppError,
     ink::{ActiveInkPreview, CanvasPoint, EraseSample, InkDocument, InkOperation, InkTool},
@@ -151,6 +152,7 @@ struct DesktopRuntime {
     slideshow_control_error: Option<String>,
     dismiss_slideshow_confirmation: bool,
     idle_window_dragging: bool,
+    gpu_benchmark: Option<GpuBenchmark>,
     performance: PerformanceTracker,
 }
 
@@ -177,6 +179,8 @@ impl DesktopRuntime {
         };
         let window_context = D3DWindowContext::new(event_loop)?;
         let compositor = Compositor::new(event_loop, &window_context)?;
+        let gpu_benchmark = GpuBenchmark::from_environment()?;
+        let performance = PerformanceTracker::new(gpu_benchmark.is_some());
         let wake_proxy = event_proxy;
         let slideshow_detector = ComDetector::spawn(move || {
             let _ = wake_proxy.send_event(UserEvent::ExternalEvent);
@@ -201,7 +205,8 @@ impl DesktopRuntime {
             slideshow_control_error: None,
             dismiss_slideshow_confirmation: false,
             idle_window_dragging: false,
-            performance: PerformanceTracker::new(),
+            gpu_benchmark,
+            performance,
         })
     }
 
@@ -338,9 +343,51 @@ impl DesktopRuntime {
         self.compositor
             .paint(&self.window_context, document, preview)?;
         self.window_context.present()?;
-        self.performance.finish_frame(frame_started_at);
+        let frame_sample = self.performance.finish_frame(frame_started_at);
+        if self.advance_gpu_benchmark(frame_sample)? {
+            return Ok(true);
+        }
 
         Ok(ui_command.is_some_and(|command| self.apply_ui_command(command)))
+    }
+
+    /// 在运行时安装后进入压力场景使用的普通全屏批注模式。
+    fn prepare_gpu_benchmark(&mut self) {
+        if self.gpu_benchmark.is_some() && self.state.enter_normal_annotation() {
+            self.idle_panel = IdlePanel::Toolbar;
+            self.window_context.set_annotation_mode(true);
+            self.compositor.invalidate_ink_cache();
+        }
+    }
+
+    /// 在每次 Present 后推进一个压力 operation，并在报告完成后请求退出。
+    fn advance_gpu_benchmark(
+        &mut self,
+        frame_sample: Option<FrameSample>,
+    ) -> Result<bool, AppError> {
+        if self.gpu_benchmark.is_none()
+            || self.window_context.swap_chain_size() != self.window_context.annotation_size()
+        {
+            return Ok(false);
+        }
+        let diagnostics = self.window_context.diagnostics().clone();
+        let surface_size = self.window_context.swap_chain_size();
+        let action = {
+            let benchmark = self.gpu_benchmark.as_mut().expect("已检查压力场景存在");
+            let document = self
+                .state
+                .active_document_mut()
+                .ok_or_else(|| AppError::Graphics("GPU 压力场景没有活动批注文档".to_owned()))?;
+            benchmark.after_present(document, frame_sample, &diagnostics, surface_size)?
+        };
+        match action {
+            GpuBenchmarkAction::RequestNextFrame { sample_count } => {
+                self.performance.record_pointer_batch(sample_count);
+                self.request_redraw(RedrawReason::PointerInput);
+                Ok(false)
+            }
+            GpuBenchmarkAction::Complete => Ok(true),
+        }
     }
 
     /// 执行工具栏命令，并返回该命令是否要求事件循环退出。
@@ -763,6 +810,7 @@ impl ApplicationHandler<UserEvent> for DesktopApplication {
                         event_loop.exit();
                         return;
                     }
+                    runtime.prepare_gpu_benchmark();
                     runtime.request_redraw(RedrawReason::Startup);
                 }
                 self.update_control_flow(event_loop);
@@ -892,4 +940,37 @@ pub fn run() -> Result<(), AppError> {
     let mut application = DesktopApplication::new(proxy, windows_pointer_receiver);
     event_loop.run_app(&mut application)?;
     application.startup_error.map_or(Ok(()), Err)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 验证完整手掌手势只提交一个包含全部动态椭圆的擦除 operation。
+    #[test]
+    fn palm_gesture_commits_one_erase_operation() {
+        let first = EraseSample {
+            center: CanvasPoint::new(20.0, 30.0),
+            radius_x: 40.0,
+            radius_y: 24.0,
+            rotation_radians: 0.2,
+        };
+        let second = EraseSample {
+            center: CanvasPoint::new(50.0, 60.0),
+            radius_x: 48.0,
+            radius_y: 28.0,
+            rotation_radians: 0.3,
+        };
+        let mut gesture = ActiveGesture::new_palm_erase(first, ToolState::default());
+        gesture.push_palm_erase(second);
+        let mut document = InkDocument::new();
+
+        gesture.commit(&mut document);
+
+        assert_eq!(document.operations().len(), 1);
+        let InkOperation::EraseStroke(stroke) = &document.operations()[0] else {
+            panic!("手掌手势应提交为动态擦除 operation");
+        };
+        assert_eq!(stroke.samples, vec![first, second]);
+    }
 }

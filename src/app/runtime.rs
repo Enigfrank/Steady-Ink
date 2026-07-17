@@ -15,11 +15,7 @@ use winit::{
 };
 
 use crate::{
-    app::{
-        AppMode, AppState,
-        gpu_benchmark::{GpuBenchmark, GpuBenchmarkAction},
-        performance::{FrameSample, PerformanceTracker, RedrawReason},
-    },
+    app::{AppMode, AppState},
     error::AppError,
     ink::{ActiveInkPreview, CanvasPoint, EraseSample, InkDocument, InkOperation, InkTool},
     input::{InputRouter, PointerAction, WindowsPointerEvent, WindowsPointerTracker},
@@ -152,8 +148,6 @@ struct DesktopRuntime {
     slideshow_control_error: Option<String>,
     dismiss_slideshow_confirmation: bool,
     idle_window_dragging: bool,
-    gpu_benchmark: Option<GpuBenchmark>,
-    performance: PerformanceTracker,
 }
 
 impl DesktopRuntime {
@@ -179,8 +173,6 @@ impl DesktopRuntime {
         };
         let window_context = D3DWindowContext::new(event_loop)?;
         let compositor = Compositor::new(event_loop, &window_context)?;
-        let gpu_benchmark = GpuBenchmark::from_environment()?;
-        let performance = PerformanceTracker::new(gpu_benchmark.is_some());
         let wake_proxy = event_proxy;
         let slideshow_detector = ComDetector::spawn(move || {
             let _ = wake_proxy.send_event(UserEvent::ExternalEvent);
@@ -205,8 +197,6 @@ impl DesktopRuntime {
             slideshow_control_error: None,
             dismiss_slideshow_confirmation: false,
             idle_window_dragging: false,
-            gpu_benchmark,
-            performance,
         })
     }
 
@@ -220,7 +210,6 @@ impl DesktopRuntime {
         let surface_rebuilt = if let WindowEvent::Resized(size) = event {
             self.compositor
                 .resize(&mut self.window_context, (*size).into())?;
-            self.performance.record_surface_rebuild();
             if self.state.mode() == AppMode::IdleFloatingToolbar {
                 self.window_context
                     .correct_idle_size(self.current_idle_window_view(), *size);
@@ -243,10 +232,8 @@ impl DesktopRuntime {
             event_response.consumed,
             self.state.mode().accepts_ink_input(),
         ) {
-            self.performance
-                .record_pointer_batch(pointer_action_sample_count(&pointer_action));
             self.apply_pointer_action(pointer_action);
-            self.request_redraw(RedrawReason::PointerInput);
+            self.request_redraw();
         }
         Ok(surface_rebuilt || event_response.repaint)
     }
@@ -305,7 +292,6 @@ impl DesktopRuntime {
 
     /// 运行 UI、合成 Skia 与 egui，并返回本帧是否请求退出应用。
     fn render(&mut self) -> Result<bool, AppError> {
-        let frame_started_at = self.performance.begin_frame();
         let mode = self.state.mode();
         let tools = self.tools;
         let slideshow_controls_enabled = self.state.slideshow_controls_enabled();
@@ -343,51 +329,8 @@ impl DesktopRuntime {
         self.compositor
             .paint(&self.window_context, document, preview)?;
         self.window_context.present()?;
-        let frame_sample = self.performance.finish_frame(frame_started_at);
-        if self.advance_gpu_benchmark(frame_sample)? {
-            return Ok(true);
-        }
 
         Ok(ui_command.is_some_and(|command| self.apply_ui_command(command)))
-    }
-
-    /// 在运行时安装后进入压力场景使用的普通全屏批注模式。
-    fn prepare_gpu_benchmark(&mut self) {
-        if self.gpu_benchmark.is_some() && self.state.enter_normal_annotation() {
-            self.idle_panel = IdlePanel::Toolbar;
-            self.window_context.set_annotation_mode(true);
-            self.compositor.invalidate_ink_cache();
-        }
-    }
-
-    /// 在每次 Present 后推进一个压力 operation，并在报告完成后请求退出。
-    fn advance_gpu_benchmark(
-        &mut self,
-        frame_sample: Option<FrameSample>,
-    ) -> Result<bool, AppError> {
-        if self.gpu_benchmark.is_none()
-            || self.window_context.swap_chain_size() != self.window_context.annotation_size()
-        {
-            return Ok(false);
-        }
-        let diagnostics = self.window_context.diagnostics().clone();
-        let surface_size = self.window_context.swap_chain_size();
-        let action = {
-            let benchmark = self.gpu_benchmark.as_mut().expect("已检查压力场景存在");
-            let document = self
-                .state
-                .active_document_mut()
-                .ok_or_else(|| AppError::Graphics("GPU 压力场景没有活动批注文档".to_owned()))?;
-            benchmark.after_present(document, frame_sample, &diagnostics, surface_size)?
-        };
-        match action {
-            GpuBenchmarkAction::RequestNextFrame { sample_count } => {
-                self.performance.record_pointer_batch(sample_count);
-                self.request_redraw(RedrawReason::PointerInput);
-                Ok(false)
-            }
-            GpuBenchmarkAction::Complete => Ok(true),
-        }
     }
 
     /// 执行工具栏命令，并返回该命令是否要求事件循环退出。
@@ -530,7 +473,7 @@ impl DesktopRuntime {
                 self.dismiss_slideshow_confirmation = false;
             }
         }
-        self.request_redraw(RedrawReason::UiCommand);
+        self.request_redraw();
         false
     }
 
@@ -584,7 +527,6 @@ impl DesktopRuntime {
     /// 排空原生 Pointer Input 语义，并用上一帧 egui 区域做 UI 命中判断。
     fn process_windows_pointer_events(&mut self) -> bool {
         let mut changed = false;
-        let mut sample_count = 0;
         while let Ok(event) = self.windows_pointer_receiver.try_recv() {
             if event.cancels_ui_pointer() {
                 self.compositor.cancel_egui_pointer();
@@ -603,12 +545,10 @@ impl DesktopRuntime {
                 ui_hit,
                 self.state.mode().accepts_ink_input(),
             ) {
-                sample_count += pointer_action_sample_count(&action);
                 self.apply_pointer_action(action);
                 changed = true;
             }
         }
-        self.performance.record_pointer_batch(sample_count);
         changed
     }
 
@@ -697,24 +637,9 @@ impl DesktopRuntime {
         self.compositor.invalidate_ink_cache();
     }
 
-    /// 记录原因并向唯一窗口请求一次按需重绘。
-    fn request_redraw(&mut self, reason: RedrawReason) {
-        self.performance.record_redraw(reason);
+    /// 向唯一窗口请求一次按需重绘。
+    fn request_redraw(&self) {
         self.window_context.window().request_redraw();
-    }
-}
-
-/// 返回一个统一指针动作包含的原始可见输入样本数量。
-fn pointer_action_sample_count(action: &PointerAction) -> usize {
-    match action {
-        PointerAction::Begin(_)
-        | PointerAction::Move(_)
-        | PointerAction::End(_)
-        | PointerAction::BeginPalmErase(_)
-        | PointerAction::MovePalmErase(_)
-        | PointerAction::EndPalmErase(_) => 1,
-        PointerAction::CommitBuffered(points) => points.len(),
-        PointerAction::Cancel => 0,
     }
 }
 
@@ -769,18 +694,8 @@ impl DesktopApplication {
 
     /// 根据下一个延迟重绘时间更新 winit 控制流。
     fn update_control_flow(&self, event_loop: &ActiveEventLoop) {
-        let next_metrics_report = self
-            .runtime
-            .as_ref()
-            .and_then(|runtime| runtime.performance.next_report_deadline());
-        let next_wake = match (self.next_repaint, next_metrics_report) {
-            (Some(repaint), Some(metrics)) => Some(repaint.min(metrics)),
-            (Some(repaint), None) => Some(repaint),
-            (None, Some(metrics)) => Some(metrics),
-            (None, None) => None,
-        };
-        if let Some(next_wake) = next_wake {
-            event_loop.set_control_flow(ControlFlow::WaitUntil(next_wake));
+        if let Some(next_repaint) = self.next_repaint {
+            event_loop.set_control_flow(ControlFlow::WaitUntil(next_repaint));
         } else {
             event_loop.set_control_flow(ControlFlow::Wait);
         }
@@ -810,8 +725,7 @@ impl ApplicationHandler<UserEvent> for DesktopApplication {
                         event_loop.exit();
                         return;
                     }
-                    runtime.prepare_gpu_benchmark();
-                    runtime.request_redraw(RedrawReason::Startup);
+                    runtime.request_redraw();
                 }
                 self.update_control_flow(event_loop);
             }
@@ -854,7 +768,7 @@ impl ApplicationHandler<UserEvent> for DesktopApplication {
         }
 
         match runtime.handle_window_event(&event) {
-            Ok(true) => runtime.request_redraw(RedrawReason::WindowEvent),
+            Ok(true) => runtime.request_redraw(),
             Ok(false) => {}
             Err(error) => {
                 self.startup_error = Some(error);
@@ -871,17 +785,17 @@ impl ApplicationHandler<UserEvent> for DesktopApplication {
         match event {
             UserEvent::RequestRepaint(delay) if delay.is_zero() => {
                 self.next_repaint = None;
-                runtime.request_redraw(RedrawReason::Egui);
+                runtime.request_redraw();
             }
             UserEvent::ExternalEvent => {
                 if runtime.process_slideshow_events() {
-                    runtime.request_redraw(RedrawReason::SlideShow);
+                    runtime.request_redraw();
                 }
                 self.update_control_flow(event_loop);
             }
             UserEvent::WindowsPointer => {
                 if runtime.process_windows_pointer_events() {
-                    runtime.request_redraw(RedrawReason::PointerInput);
+                    runtime.request_redraw();
                 }
                 self.update_control_flow(event_loop);
             }
@@ -903,11 +817,8 @@ impl ApplicationHandler<UserEvent> for DesktopApplication {
             let repaint_due = self.next_repaint.is_some_and(|deadline| deadline <= now);
             if repaint_due {
                 self.next_repaint = None;
-            }
-            if let Some(runtime) = self.runtime.as_mut() {
-                runtime.performance.report_if_due(now);
-                if repaint_due {
-                    runtime.request_redraw(RedrawReason::AnimationTimer);
+                if let Some(runtime) = self.runtime.as_ref() {
+                    runtime.request_redraw();
                 }
             }
             self.update_control_flow(event_loop);
@@ -940,37 +851,4 @@ pub fn run() -> Result<(), AppError> {
     let mut application = DesktopApplication::new(proxy, windows_pointer_receiver);
     event_loop.run_app(&mut application)?;
     application.startup_error.map_or(Ok(()), Err)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// 验证完整手掌手势只提交一个包含全部动态椭圆的擦除 operation。
-    #[test]
-    fn palm_gesture_commits_one_erase_operation() {
-        let first = EraseSample {
-            center: CanvasPoint::new(20.0, 30.0),
-            radius_x: 40.0,
-            radius_y: 24.0,
-            rotation_radians: 0.2,
-        };
-        let second = EraseSample {
-            center: CanvasPoint::new(50.0, 60.0),
-            radius_x: 48.0,
-            radius_y: 28.0,
-            rotation_radians: 0.3,
-        };
-        let mut gesture = ActiveGesture::new_palm_erase(first, ToolState::default());
-        gesture.push_palm_erase(second);
-        let mut document = InkDocument::new();
-
-        gesture.commit(&mut document);
-
-        assert_eq!(document.operations().len(), 1);
-        let InkOperation::EraseStroke(stroke) = &document.operations()[0] else {
-            panic!("手掌手势应提交为动态擦除 operation");
-        };
-        assert_eq!(stroke.samples, vec![first, second]);
-    }
 }

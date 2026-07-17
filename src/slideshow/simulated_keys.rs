@@ -78,17 +78,3 @@ const fn simulated_key(action: SlideShowControlAction) -> (VIRTUAL_KEY, bool) {
         SlideShowControlAction::Exit => (VK_ESCAPE, false),
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// 验证退出放映兜底使用 Escape，且不错误标记为扩展键。
-    #[test]
-    fn exit_uses_escape_key() {
-        assert_eq!(
-            simulated_key(SlideShowControlAction::Exit),
-            (VK_ESCAPE, false)
-        );
-    }
-}

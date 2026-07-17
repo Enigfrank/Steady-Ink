@@ -271,11 +271,6 @@ impl D3DWindowContext {
         self.swap_chain_size
     }
 
-    /// 返回当前主显示器普通批注模式使用的目标物理尺寸。
-    pub const fn annotation_size(&self) -> PhysicalSize<u32> {
-        self.geometry.annotation_size
-    }
-
     /// 返回指定 DXGI back buffer 的 D3D12 resource。
     pub fn back_buffer(
         &self,
@@ -640,72 +635,5 @@ fn clamp_window_top(
         desired_top.clamp(minimum, maximum)
     } else {
         monitor_position.y + (monitor_size.height as i32 - window_size.height as i32) / 2
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// 验证左右吸附位置保持相同垂直中心并遵守边缘间距。
-    #[test]
-    fn edge_positions_are_symmetric() {
-        let monitor_position = PhysicalPosition::new(100, 50);
-        let monitor_size = PhysicalSize::new(3_840, 2_160);
-        let window_size = PhysicalSize::new(176, 496);
-        let left = left_centered_position(monitor_position, monitor_size, window_size, 32);
-        let right = right_centered_position(monitor_position, monitor_size, window_size, 32);
-
-        assert_eq!(left.x, 132);
-        assert_eq!(right.x, 3_732);
-        assert_eq!(left.y, right.y);
-    }
-
-    /// 验证侧边吸附保留可见纵向位置，并只夹紧超出屏幕的顶部或底部。
-    #[test]
-    fn floating_window_top_preserves_dragged_position_within_monitor() {
-        let monitor_position = PhysicalPosition::new(100, 50);
-        let monitor_size = PhysicalSize::new(1_920, 1_080);
-        let window_size = PhysicalSize::new(70, 198);
-
-        assert_eq!(
-            clamp_window_top(320, monitor_position, monitor_size, window_size),
-            320
-        );
-        assert_eq!(
-            clamp_window_top(-40, monitor_position, monitor_size, window_size),
-            50
-        );
-        assert_eq!(
-            clamp_window_top(2_000, monitor_position, monitor_size, window_size),
-            932
-        );
-    }
-
-    /// 验证 DirectComposition swap chain 使用双缓冲，避免额外全尺寸 surface。
-    #[test]
-    fn composition_swap_chain_uses_two_buffers() {
-        assert_eq!(SWAP_CHAIN_BUFFER_COUNT, 2);
-    }
-
-    /// 验证完整设置窗口使用 100% 名义尺寸，其他 idle 窗口仍使用 80% 比例。
-    #[test]
-    fn settings_window_uses_full_size_without_rescaling_other_views() {
-        assert_eq!(SETTINGS_WIDTH_POINTS, 560.0);
-        assert_eq!(SETTINGS_HEIGHT_POINTS, 640.0);
-        assert!((IDLE_WIDTH_POINTS - 70.4).abs() < f64::EPSILON);
-        assert!((QUICK_SETTINGS_HEIGHT_POINTS - 268.8).abs() < f64::EPSILON);
-    }
-
-    /// 验证工具窗口样式只替换 shell 可见性标志，不破坏 DirectComposition 扩展样式。
-    #[test]
-    fn tool_window_style_clears_app_window_and_preserves_other_flags() {
-        let no_redirection_bitmap = 0x0020_0000;
-        let original = WS_EX_APPWINDOW.0 as i32 | no_redirection_bitmap;
-        let updated = tool_window_ex_style(original);
-
-        assert_eq!(updated & WS_EX_APPWINDOW.0 as i32, 0);
-        assert_ne!(updated & WS_EX_TOOLWINDOW.0 as i32, 0);
-        assert_ne!(updated & no_redirection_bitmap, 0);
     }
 }

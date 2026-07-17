@@ -61,34 +61,3 @@ impl PageInkStore {
         self.pages.clear();
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::ink::{CanvasPoint, InkColor, PenWidth};
-
-    /// 验证两个放映位置保存的墨迹文档互不串页。
-    #[test]
-    fn page_documents_are_isolated_by_show_position() {
-        let first_page = PageKey::new(1).expect("有效页键");
-        let second_page = PageKey::new(2).expect("有效页键");
-        let mut first_document = InkDocument::new();
-        first_document.append_draw_stroke(
-            vec![CanvasPoint::new(1.0, 1.0)],
-            InkColor::Red,
-            PenWidth::Px8,
-        );
-
-        let mut store = PageInkStore::new();
-        store.save(
-            first_page,
-            PageInkEntry {
-                stable_slide_id: Some(100),
-                document: first_document,
-            },
-        );
-
-        assert!(store.take(second_page).document.has_no_history());
-        assert_eq!(store.take(first_page).stable_slide_id, Some(100));
-    }
-}

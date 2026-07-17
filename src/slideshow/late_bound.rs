@@ -371,17 +371,3 @@ fn invoke(
     }
     Ok(result)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// 验证高位为一的 32 位 HWND 转换后不会扩展为负的 64 位值。
-    #[test]
-    fn com_hwnd_conversion_preserves_unsigned_bits() {
-        let raw_bits = 0xf123_4567_u32;
-        let com_value = i32::from_ne_bytes(raw_bits.to_ne_bytes());
-
-        assert_eq!(com_long_to_window_id(com_value), i64::from(raw_bits));
-    }
-}

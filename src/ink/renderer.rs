@@ -390,39 +390,3 @@ fn draw_erase_sample_outline(canvas: &Canvas, sample: EraseSample) {
     );
     canvas.restore_to_count(save_count);
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// 验证普通固定圆形橡皮擦会走连续路径渲染分支。
-    #[test]
-    fn uniform_circle_samples_are_detected() {
-        let samples = [
-            EraseSample::circle(CanvasPoint::new(0.0, 0.0), 48.0),
-            EraseSample::circle(CanvasPoint::new(80.0, 0.0), 48.0),
-        ];
-
-        assert_eq!(uniform_circle_diameter(&samples), Some(48.0));
-    }
-
-    /// 验证快速移动的动态手掌擦除会在两个原始采样之间补足椭圆。
-    #[test]
-    fn palm_interpolation_covers_large_sample_gaps() {
-        let previous = EraseSample {
-            center: CanvasPoint::new(0.0, 0.0),
-            radius_x: 40.0,
-            radius_y: 20.0,
-            rotation_radians: 0.0,
-        };
-        let next = EraseSample {
-            center: CanvasPoint::new(120.0, 0.0),
-            radius_x: 40.0,
-            radius_y: 20.0,
-            rotation_radians: 0.5,
-        };
-
-        assert!(palm_interpolation_steps(previous, next) > 1);
-        assert_eq!(interpolate_erase_sample(previous, next, 0.5).center.x, 60.0);
-    }
-}

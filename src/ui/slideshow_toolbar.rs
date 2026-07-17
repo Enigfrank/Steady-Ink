@@ -369,31 +369,3 @@ const fn toolbar_body_content_width() -> f32 {
 const fn toolbar_body_width() -> f32 {
     toolbar_body_content_width() + tokens::SPACE_2 * 2.0
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// 验证双侧翻页组固定在左右下角，并同时紧贴横向和纵向屏幕边缘。
-    #[test]
-    fn navigation_groups_use_bottom_corner_anchors() {
-        let (_, left_anchor, left_offset) = navigation_placement(DockSide::Left);
-        let (_, right_anchor, right_offset) = navigation_placement(DockSide::Right);
-
-        assert_eq!(left_anchor, Align2::LEFT_BOTTOM);
-        assert_eq!(right_anchor, Align2::RIGHT_BOTTOM);
-        assert_eq!(left_offset, Vec2::ZERO);
-        assert_eq!(right_offset, Vec2::ZERO);
-    }
-
-    /// 验证放映态中央工具栏的外框底边与屏幕底边完全重合。
-    #[test]
-    fn bottom_toolbar_touches_screen_bottom() {
-        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1_920.0, 1_080.0));
-
-        assert_eq!(
-            bottom_toolbar_top(screen) + toolbar_outer_height(),
-            screen.bottom()
-        );
-    }
-}

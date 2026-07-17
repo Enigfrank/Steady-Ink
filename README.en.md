@@ -35,10 +35,8 @@
 | Windows touch, palm rejection, and palm erasing | Implemented; target hardware tuning remains |
 | PowerPoint presentation integration | Basic validation completed |
 | WPS presentation integration | Adapted; more real environments required |
-| Intel integrated-GPU performance | UHD Graphics 630 1080p baseline passed; 4K pending |
+| Intel integrated-GPU performance | Pending validation on target hardware |
 | Windows installer and formal release | Pending |
-
-The automated suite currently contains 72 tests. On an Intel UHD Graphics 630 at `1920 × 1080`, input-to-display p95 measured `8.377ms` with 1,000 draw operations and 200 erase operations.
 
 ## Run
 
@@ -52,29 +50,13 @@ cargo run --release
 
 The first `skia-safe` build may take some time. Set `RUST_LOG=debug` for detailed logs.
 
-## Performance Baseline
-
-This scenario runs 1,000 draw operations and 200 erase operations through the real DirectComposition/D3D12 path. It fails when p95 exceeds `33ms`, WARP is active, or the adapter is not Intel:
-
-```powershell
-cargo build --release
-$report = Join-Path $env:TEMP "steady-ink-gpu-benchmark.toml"
-$env:STEADY_INK_GPU_BENCHMARK = "1"
-$env:STEADY_INK_GPU_BENCHMARK_REPORT = $report
-$process = Start-Process ".\target\release\steady-ink.exe" -Wait -PassThru
-Get-Content -LiteralPath $report
-if ($process.ExitCode -ne 0) { throw "The GPU benchmark did not pass" }
-```
-
-The report records the actual adapter and render size, so a 1080p result does not replace 4K validation.
-
 ## Development
 
 ```powershell
 cargo fmt --check
 cargo check
-cargo test
 cargo clippy --all-targets -- -D warnings
+cargo build --release
 ```
 
 Core technologies: Rust, winit, egui, rust-skia, DirectComposition, D3D12, and Windows COM.

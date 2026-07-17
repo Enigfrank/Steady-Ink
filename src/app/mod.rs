@@ -1,5 +1,3 @@
-mod gpu_benchmark;
-mod performance;
 mod runtime;
 mod state;
 

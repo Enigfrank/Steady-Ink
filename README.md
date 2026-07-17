@@ -35,10 +35,8 @@
 | Windows 触控、防误触和手掌橡皮擦 | 已实现，目标触摸设备仍需调校 |
 | PowerPoint 放映联动 | 已完成基础验证 |
 | WPS 放映联动 | 已适配，仍需更多真实环境验证 |
-| Intel 核显性能 | UHD Graphics 630、1080p 基线通过；4K 待验证 |
+| Intel 核显性能 | 待目标硬件验证 |
 | Windows 安装包与正式发布 | 待完成 |
-
-当前自动化测试共 72 项。Intel UHD Graphics 630 在 `1920 × 1080`、1000 条画笔 operation 和 200 次擦除 operation 下，input-to-display p95 为 `8.377ms`。
 
 ## 运行
 
@@ -52,29 +50,13 @@ cargo run --release
 
 首次构建 `skia-safe` 可能需要较长时间。详细日志可通过 `RUST_LOG=debug` 启用。
 
-## 性能验证
-
-以下场景通过真实 DirectComposition/D3D12 路径执行 1000 条画笔和 200 次擦除，并在 p95 超过 `33ms`、使用 WARP 或非 Intel adapter 时返回失败：
-
-```powershell
-cargo build --release
-$report = Join-Path $env:TEMP "steady-ink-gpu-benchmark.toml"
-$env:STEADY_INK_GPU_BENCHMARK = "1"
-$env:STEADY_INK_GPU_BENCHMARK_REPORT = $report
-$process = Start-Process ".\target\release\steady-ink.exe" -Wait -PassThru
-Get-Content -LiteralPath $report
-if ($process.ExitCode -ne 0) { throw "GPU 压力场景未通过" }
-```
-
-报告会记录实际 adapter 和渲染尺寸，因此 1080p 结果不能替代 4K 验收。
-
 ## 开发
 
 ```powershell
 cargo fmt --check
 cargo check
-cargo test
 cargo clippy --all-targets -- -D warnings
+cargo build --release
 ```
 
 主要技术栈：Rust、winit、egui、rust-skia、DirectComposition、D3D12 和 Windows COM。

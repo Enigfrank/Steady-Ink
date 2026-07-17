@@ -1,15 +1,13 @@
 <p align="center">
-  <img src="./assets/steady-ink-icon.svg" width="128" height="128" alt="Steady Ink project icon">
+  <img src="./assets/steady-ink-icon.svg" width="128" height="128" alt="Steady Ink icon">
 </p>
 
 <h1 align="center">Steady Ink</h1>
 
-<p align="center">
-  A Windows screen annotation tool for classroom teaching
-</p>
+<p align="center">A Windows screen-annotation tool for classroom teaching</p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/status-early%20development-F59E0B" alt="Project status: early development">
+  <img src="https://img.shields.io/badge/status-early%20development-F59E0B" alt="Status: early development">
   <img src="https://img.shields.io/badge/platform-Windows%2010%2F11-2563EB" alt="Platform: Windows 10/11">
   <img src="https://img.shields.io/badge/Rust-1.92%2B-111827?logo=rust&logoColor=white" alt="Rust 1.92 or later">
   <a href="./LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0--or--later-DC2626" alt="License: GPL-3.0-or-later"></a>
@@ -18,82 +16,33 @@
 [中文](./README.md)
 
 > [!WARNING]
-> Steady Ink is currently in early development. Its main features can already run in a desktop app, but long-term stability and performance still need validation on target 4K touchscreen classroom devices.
+> Steady Ink is still in early development. Its main features are usable, but the target 4K touchscreen hardware and additional Office/WPS environments still require validation.
 
-## Overview
+## Features
 
-Steady Ink is designed primarily for Windows 4K touchscreen teaching devices. Its core goals are:
+- A draggable floating toolbar and transparent annotation layer that snap to either screen edge.
+- Finger and pen drawing, color and width selection, region erasing, clear, and undo.
+- Pen-first palm rejection and dynamic palm erasing when no pen is active.
+- PowerPoint/WPS presentation detection, navigation, reconnection, and per-position ink.
+- Quick settings, full settings, local preferences, and runtime diagnostics.
+- DirectComposition, D3D12, and Skia GPU composition with no continuous redraw while idle.
 
-- A floating toolbar and annotation layer that remain above courseware while minimizing obstruction.
-- Finger and stylus writing, area erasing, clear, and undo.
-- Stylus-priority palm rejection, plus a palm eraser when no stylus is active.
-- Reliable PowerPoint/WPS presentation detection, with ink kept by slide for the current presentation.
-- Low latency on common Intel integrated GPUs, with no continuous redrawing while idle.
-
-## Current Status
-
-The repository now contains a runnable Windows prototype. Standard annotation, settings, Windows touch input, and PowerPoint presentation integration all run through the same application. The complete first release still requires validation on target hardware and in more Office/WPS environments.
+## Status
 
 | Area | Status |
 | --- | --- |
-| Transparent always-on-top window and GPU composition (DirectComposition/D3D12) | Implemented and validated with a basic 1080p run on Intel UHD Graphics 630 |
-| Concurrent ink and UI rendering (Skia/egui) | Implemented; target 4K touchscreen hardware still needs validation |
-| Standard annotation, color/width selection, area eraser, undo, and clear | Implemented |
-| Floating toolbar, quick settings, full settings, and local settings storage | Implemented |
-| Windows touch input, palm rejection, and dynamic palm eraser | Integrated with logic tests; parameters still need adjustment on target touchscreen hardware |
-| PowerPoint presentation detection, control, and connection recovery | Integrated with a basic two-slide presentation validation |
-| WPS presentation integration | Initial integration and diagnostics are complete; validation still needs a supported WPS environment |
-| Presentation toolbar, navigation on both sides, collapse animation, and per-slide ink | Implemented |
-| Low-power waiting, performance metrics, and GPU diagnostics | Implemented |
+| Standard annotation, toolbars, and settings | Implemented |
+| Windows touch, palm rejection, and palm erasing | Implemented; target hardware tuning remains |
+| PowerPoint presentation integration | Basic validation completed |
+| WPS presentation integration | Adapted; more real environments required |
+| Intel integrated-GPU performance | UHD Graphics 630 1080p baseline passed; 4K pending |
+| Windows installer and formal release | Pending |
 
-## Current Interface Behavior
+The automated suite currently contains 72 tests. On an Intel UHD Graphics 630 at `1920 × 1080`, input-to-display p95 measured `8.377ms` with 1,000 draw operations and 200 erase operations.
 
-- The idle floating toolbar and the standard annotation toolbar can both be dragged and snapped to the left or right edge of the screen. Snapping changes only the horizontal coordinate and preserves the constrained vertical coordinate.
-- In standard annotation mode, color and pen-width pickers use a vertical layout. They expand left when the toolbar is on the right, and right when it is on the left, avoiding overlap.
-- Available colors are red, yellow, blue, green, black, and white. Pen widths are fixed at 4pt, 8pt, 16pt, and 24pt; the default is 4pt.
-- In PowerPoint/WPS presentation mode, the central toolbar touches the bottom edge. Navigation controls are anchored to the lower-left and lower-right corners without extra safe margins.
-- Floating toolbars, quick settings, and annotation tools use 80% of the original design scale, with icon-and-label buttons at 51.2 egui points. The full settings view independently uses a `560 × 640` logical viewport and 100% control metrics.
-- Panels, buttons, popups, and borders use 50% opacity, while text, icons, swatches, and ink remain fully opaque.
-- The settings view can change default tools, enable or disable PowerPoint/WPS integration, and show graphics and presentation-connection diagnostics. Its top action bar can open the configuration directory or exit the application normally.
+## Run
 
-## Technical Implementation
-
-Steady Ink is built with Rust. Its code is organized by responsibility, including windows, UI, ink, input, and PowerPoint/WPS integration, to keep the project maintainable.
-
-```text
-winit event loop
-└─ DirectComposition / DXGI / D3D12
-   └─ rust-skia GPU drawing layer
-      ├─ persistent ink layer
-      └─ egui + egui-winit UI rendering
-
-Windows touch input ──> input routing ──> ink document
-PowerPoint / WPS integration ───> slideshow state ──> per-slide ink store
-```
-
-Key technology choices:
-
-- `winit`: window management and an event loop that waits when idle.
-- DirectComposition / DXGI / D3D12: Windows transparent-window and GPU composition support.
-- `rust-skia`: GPU ink rendering, UI mesh rendering, and window composition.
-- `egui` and `egui-winit`: touch-friendly toolbars, layout, and input integration.
-- `windows`: Windows touch input, Office integration through COM, and system capabilities such as `SendInput`.
-
-The transparent rendering path does not depend on a standard WGL default framebuffer, `WS_EX_LAYERED` color keys, or full-screen CPU bitmap uploads. The current backend uses `DXGI_FORMAT_B8G8R8A8_UNORM`, flip sequential, and `DXGI_ALPHA_MODE_PREMULTIPLIED` to avoid a transparent WGL full-screen window being composed as black by DWM on Intel integrated graphics.
-
-## Requirements
-
-- 64-bit Windows 10 or Windows 11.
-- Rust 1.92 or later with the MSVC toolchain.
-- Visual Studio Build Tools 2022 with the "Desktop development with C++" workload installed.
-- A GPU and driver supporting Direct3D 12 and DirectComposition. WARP software rendering is suitable only for functional testing, not performance results.
-- PowerPoint or a WPS Presentation edition that supports automation, only when testing presentation integration.
-
-Windows is currently the only supported platform. macOS and Linux are not supported.
-
-## Run from Source
-
-Run the following in PowerShell 7:
+Steady Ink requires 64-bit Windows 10/11, Rust 1.92+, the MSVC toolchain, and a Direct3D 12-capable GPU.
 
 ```powershell
 git clone https://github.com/Enigfrank/Steady-Ink.git
@@ -101,41 +50,25 @@ Set-Location Steady-Ink
 cargo run --release
 ```
 
-The first build downloads Rust dependencies. Building `skia-safe` usually takes longer than a typical Rust dependency.
+The first `skia-safe` build may take some time. Set `RUST_LOG=debug` for detailed logs.
 
-For more detailed runtime logs:
+## Performance Baseline
 
-```powershell
-$env:RUST_LOG = "debug"
-cargo run
-```
-
-To collect frame time, input-to-display latency, redraw reasons, and full-canvas rebuild counts:
-
-```powershell
-$env:STEADY_INK_METRICS = "1"
-cargo run --release
-```
-
-Performance metrics are disabled by default. When enabled, they print a report every five seconds without triggering continuous redrawing.
-
-To run the repeatable Intel GPU load baseline, build the release executable and start the self-terminating scenario:
+This scenario runs 1,000 draw operations and 200 erase operations through the real DirectComposition/D3D12 path. It fails when p95 exceeds `33ms`, WARP is active, or the adapter is not Intel:
 
 ```powershell
 cargo build --release
 $report = Join-Path $env:TEMP "steady-ink-gpu-benchmark.toml"
 $env:STEADY_INK_GPU_BENCHMARK = "1"
 $env:STEADY_INK_GPU_BENCHMARK_REPORT = $report
-$process = Start-Process -FilePath ".\target\release\steady-ink.exe" -Wait -PassThru
+$process = Start-Process ".\target\release\steady-ink.exe" -Wait -PassThru
 Get-Content -LiteralPath $report
 if ($process.ExitCode -ne 0) { throw "The GPU benchmark did not pass" }
 ```
 
-The scenario uses the real DirectComposition/D3D12 path to append 1,000 draw operations and 200 dynamic erase operations one frame at a time. It succeeds only on an Intel hardware adapter without WARP when input-to-display p95 is at most 33ms. On 2026-07-17, an Intel UHD Graphics 630 at `1920 × 1080` measured `8.377ms`; this result does not replace validation on the target 4K touchscreen hardware.
+The report records the actual adapter and render size, so a 1080p result does not replace 4K validation.
 
-## Development and Checks
-
-Before submitting changes, run:
+## Development
 
 ```powershell
 cargo fmt --check
@@ -144,66 +77,16 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 ```
 
-The current automated suite contains 72 logic, rendering, and layout tests. It covers state transitions, clear-and-undo, per-slide ink, palm candidates and UI suppression, dynamic erase phases, GPU workload generation, presentation-connection recovery, DPI pixel alignment, picker directions, edge snapping, and presentation-toolbar positioning.
+Core technologies: Rust, winit, egui, rust-skia, DirectComposition, D3D12, and Windows COM.
 
-The project is organized by feature:
+The source is organized into `app`, `window`, `render`, `ui`, `ink`, `input`, `slideshow`, and `settings` feature modules.
 
-```text
-src/
-├─ app/         # Application assembly and top-level state management
-├─ window/      # Transparent windows, DirectComposition/D3D12, and screen geometry
-├─ render/      # Skia and egui composition
-├─ ui/          # Design tokens and toolbars
-├─ ink/         # Ink data, undo, per-slide storage, and GPU cache
-├─ input/       # Mouse, touch, Windows touch input, and palm recognition
-├─ slideshow/   # PowerPoint/WPS presentation detection and session management
-└─ settings/    # User settings and local TOML storage
-```
+## Scope and Privacy
 
-## Roadmap
+Steady Ink currently supports Windows and a single monitor. It does not include cloud sync, accounts, collaboration, persistent ink, screenshot saving, or writing ink back to presentation files.
 
-- [x] Rust project skeleton and feature-based modules.
-- [x] DirectComposition transparent swap chain, Skia ink, and egui composition prototype.
-- [x] Standard annotation interaction, tool selection, and an undoable ink model.
-- [x] Settings, quick settings, local settings storage, and normal application exit.
-- [x] Windows touch input, palm rejection, and the dynamic palm-eraser path.
-- [x] PowerPoint/WPS presentation integration, page controls, and the connection-loss interface.
-- [x] Presentation state management, per-slide ink, a bottom toolbar, and navigation controls on both sides.
-- [ ] Validate palm-recognition thresholds and stylus hover on target touchscreen hardware.
-- [ ] Validate real WPS presentation events, control, and reconnection compatibility.
-- [ ] Validate 4K touchscreen performance on Intel integrated graphics.
-- [ ] Windows installer, release process, and upgrade notes.
-
-## Not Included in the First Release
-
-The first release does not include:
-
-- macOS, Linux, mobile platforms, or multi-monitor support.
-- Cloud synchronization, accounts, collaboration, or online services.
-- Screenshot saving, ink-file saving, or writing ink back to PowerPoint/WPS files.
-- Whiteboards, shape recognition, complex gestures, custom color palettes, or a theme system.
-- Guessing presentation state from a window title, process name, or foreground window when the presentation connection is unavailable.
-
-## Data and Privacy
-
-- Ink is kept only while the application is open. It is not written into courseware or local ink files.
-- User settings are stored at `%APPDATA%\Steady-Ink\settings.toml` and contain only default tools and the presentation-integration setting.
-- The project uses no cloud services and includes no telemetry or account system.
-
-## Contributing
-
-Bug reports and code improvement suggestions are welcome. For larger feature or architecture changes, please start a discussion describing the teaching scenario, expected behavior, and validation approach, so the work remains within the first-release scope.
-
-When submitting code:
-
-- Keep changes focused and follow the existing small, feature-based file structure.
-- Add concise function-level comments to new functions.
-- Add pure logic tests for state management, ink behavior, and data boundaries.
-- For changes involving touch, display scaling, GPU rendering, or PowerPoint/WPS integration, document the test environment and anything that still requires hardware validation.
-- Ensure formatting, compilation, tests, and Clippy checks pass.
-
-When reporting a touch, rendering, or presentation-integration issue, include the Windows version, display scaling, device model, GPU model and driver information, PowerPoint/WPS version, and reproduction steps.
+Ink remains in memory for the current run. Preferences are stored in `%APPDATA%\Steady-Ink\settings.toml`. The project contains no telemetry or online services.
 
 ## License
 
-Steady Ink and this project's original icon are released under the [GNU General Public License v3.0 or later](./LICENSE).
+Steady Ink and its original project icon are licensed under [GPL-3.0-or-later](./LICENSE).

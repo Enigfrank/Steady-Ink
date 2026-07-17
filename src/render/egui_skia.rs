@@ -215,11 +215,7 @@ impl EguiSkiaRenderer {
                     .iter()
                     .map(|vertex| Point::new(vertex.uv.x, vertex.uv.y))
                     .collect();
-                let colors: Vec<_> = mesh
-                    .vertices
-                    .iter()
-                    .map(|vertex| unpremultiplied_skia_color(vertex.color))
-                    .collect();
+                let colors = skia_vertex_colors(&mesh);
                 let vertices = Vertices::new_copy(
                     VertexMode::Triangles,
                     &positions,
@@ -294,6 +290,42 @@ fn font_mesh_uses_white_paint(mesh: &Mesh16) -> bool {
 /// 判断一个 egui 顶点是否引用字体纹理的固定白色 texel。
 fn vertex_uses_white_texel(vertex: &Vertex) -> bool {
     vertex.uv == WHITE_UV
+}
+
+/// 转换 egui 顶点色，并为透明抗锯齿顶点延展同三角形的边缘 RGB。
+fn skia_vertex_colors(mesh: &Mesh16) -> Vec<Color> {
+    let mut colors: Vec<_> = mesh
+        .vertices
+        .iter()
+        .map(|vertex| unpremultiplied_skia_color(vertex.color))
+        .collect();
+    if !font_mesh_uses_white_paint(mesh) {
+        return colors;
+    }
+
+    for triangle in mesh.indices.chunks_exact(3) {
+        let edge_color = triangle
+            .iter()
+            .filter_map(|index| mesh.vertices.get(*index as usize))
+            .filter(|vertex| vertex.color.a() > 0)
+            .max_by_key(|vertex| vertex.color.a())
+            .map(|vertex| unpremultiplied_skia_color(vertex.color));
+        let Some(edge_color) = edge_color else {
+            continue;
+        };
+
+        for index in triangle {
+            let index = *index as usize;
+            if mesh
+                .vertices
+                .get(index)
+                .is_some_and(|vertex| vertex.color == egui::Color32::TRANSPARENT)
+            {
+                colors[index] = Color::from_argb(0, edge_color.r(), edge_color.g(), edge_color.b());
+            }
+        }
+    }
+    colors
 }
 
 /// 把 egui ColorImage 或 FontImage 转成 Skia 预乘 alpha raster image。
@@ -377,6 +409,8 @@ fn unpremultiplied_skia_color(color: egui::Color32) -> Color {
 
 #[cfg(test)]
 mod tests {
+    use egui::{CornerRadius, Rect as EguiRect, Shape, Stroke, StrokeKind};
+
     use super::*;
 
     /// 验证透明颜色不会在反预乘时产生除零或伪颜色。
@@ -398,6 +432,107 @@ mod tests {
         assert!((i16::from(result.r()) - 200).abs() <= 1);
         assert!((i16::from(result.g()) - 100).abs() <= 1);
         assert!((i16::from(result.b()) - 50).abs() <= 1);
+    }
+
+    /// 返回设置按钮同款圆角矩形经过 egui tessellation 后的纯矢量 mesh。
+    fn settings_button_mesh() -> Mesh16 {
+        let context = egui::Context::default();
+        context.set_pixels_per_point(1.0);
+        let output = context.run_ui(egui::RawInput::default(), |ui| {
+            ui.painter().add(Shape::Rect(egui::epaint::RectShape::new(
+                EguiRect::from_min_max(egui::pos2(8.0, 8.0), egui::pos2(72.0, 72.0)),
+                CornerRadius::same(6),
+                egui::Color32::WHITE,
+                Stroke::new(1.0, egui::Color32::from_rgb(229, 231, 235)),
+                StrokeKind::Inside,
+            )));
+        });
+        let primitives = context.tessellate(output.shapes, output.pixels_per_point);
+        let mesh = primitives
+            .into_iter()
+            .find_map(|primitive| match primitive.primitive {
+                Primitive::Mesh(mesh) => Some(mesh),
+                Primitive::Callback(_) => None,
+            })
+            .expect("圆角矩形应产生 egui mesh");
+        mesh.split_to_u16()
+            .into_iter()
+            .flat_map(split_font_mesh_by_texture_usage)
+            .find(font_mesh_uses_white_paint)
+            .expect("圆角矩形应产生纯矢量 mesh")
+    }
+
+    /// 验证圆角抗锯齿透明顶点保留零 alpha，同时继承相邻可见边缘 RGB。
+    #[test]
+    fn settings_button_transparent_vertices_do_not_keep_black_rgb() {
+        let mesh = settings_button_mesh();
+        let colors = skia_vertex_colors(&mesh);
+        let transparent_indices: Vec<_> = mesh
+            .vertices
+            .iter()
+            .enumerate()
+            .filter_map(|(index, vertex)| {
+                (vertex.color == egui::Color32::TRANSPARENT).then_some(index)
+            })
+            .collect();
+
+        assert!(!transparent_indices.is_empty());
+        assert!(transparent_indices.iter().all(|index| {
+            let color = colors[*index];
+            color.a() == 0 && (color.r() > 0 || color.g() > 0 || color.b() > 0)
+        }));
+    }
+
+    /// 验证透明抗锯齿顶点保留零 alpha，同时继承同三角形的可见边缘 RGB。
+    #[test]
+    fn transparent_vector_vertices_inherit_edge_rgb() {
+        let transparent = Vertex {
+            pos: egui::Pos2::ZERO,
+            uv: WHITE_UV,
+            color: egui::Color32::TRANSPARENT,
+        };
+        let edge = Vertex {
+            pos: egui::Pos2::ZERO,
+            uv: WHITE_UV,
+            color: egui::Color32::from_rgb(229, 231, 235),
+        };
+        let mesh = Mesh16 {
+            indices: vec![0, 1, 2],
+            vertices: vec![transparent, edge, edge],
+            texture_id: TextureId::default(),
+        };
+
+        let colors = skia_vertex_colors(&mesh);
+
+        assert_eq!(colors[0].a(), 0);
+        assert_eq!(
+            [colors[0].r(), colors[0].g(), colors[0].b()],
+            [229, 231, 235]
+        );
+    }
+
+    /// 验证字形或图片 mesh 不执行透明边缘颜色延展。
+    #[test]
+    fn textured_mesh_keeps_original_transparent_vertex_color() {
+        let transparent = Vertex {
+            pos: egui::Pos2::ZERO,
+            uv: egui::pos2(0.5, 0.5),
+            color: egui::Color32::TRANSPARENT,
+        };
+        let visible = Vertex {
+            pos: egui::Pos2::ZERO,
+            uv: egui::pos2(0.5, 0.5),
+            color: egui::Color32::WHITE,
+        };
+        let mesh = Mesh16 {
+            indices: vec![0, 1, 2],
+            vertices: vec![transparent, visible, visible],
+            texture_id: TextureId::default(),
+        };
+
+        let colors = skia_vertex_colors(&mesh);
+
+        assert_eq!(colors[0], Color::TRANSPARENT);
     }
 
     /// 验证同一字体 mesh 中的纯色图形和字形纹理三角形会被拆分。

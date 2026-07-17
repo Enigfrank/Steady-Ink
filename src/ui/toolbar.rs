@@ -31,6 +31,7 @@ pub enum UiCommand {
     Undo,
     Clear,
     OpenSettings,
+    OpenSettingsDirectory,
     CloseSettings,
     ExitApplication,
     ToggleQuickSettings,
@@ -69,6 +70,7 @@ pub struct UiViewState<'a> {
     pub slideshow_connection_error: Option<&'a str>,
     pub slideshow_control_error: Option<&'a str>,
     pub settings_error: Option<&'a str>,
+    pub settings_directory_error: Option<&'a str>,
     pub settings_path: &'a std::path::Path,
     pub graphics_diagnostics: &'a GraphicsDiagnostics,
 }
@@ -483,7 +485,7 @@ fn render_color_picker(
     placement: RectAlign,
     orientation: SelectorOrientation,
 ) -> Option<UiCommand> {
-    let selector_width = color_selector_width(orientation);
+    let selector_width = color_selector_width(orientation, tokens::TOOL_METRICS);
     let popup_style = trigger.ctx.style_of(egui::Theme::Light);
     let picker_frame = opaque_picker_frame(&popup_style);
     let popup = Popup::from_toggle_button_response(trigger)
@@ -503,7 +505,7 @@ fn render_color_picker(
             pixel_snap::show_pixel_aligned_frame(ui, picker_frame, |ui| {
                 ui.set_min_width(selector_width);
                 ui.set_max_width(selector_width);
-                render_color_selector(ui, selected, orientation)
+                render_color_selector(ui, selected, orientation, tokens::TOOL_METRICS)
             })
             .inner
         })
@@ -517,7 +519,7 @@ fn render_pen_width_picker(
     placement: RectAlign,
     orientation: SelectorOrientation,
 ) -> Option<UiCommand> {
-    let selector_width = pen_width_selector_width(orientation);
+    let selector_width = pen_width_selector_width(orientation, tokens::TOOL_METRICS);
     let popup_style = trigger.ctx.style_of(egui::Theme::Light);
     let picker_frame = opaque_picker_frame(&popup_style);
     let popup = Popup::from_toggle_button_response(trigger)
@@ -537,7 +539,7 @@ fn render_pen_width_picker(
             pixel_snap::show_pixel_aligned_frame(ui, picker_frame, |ui| {
                 ui.set_min_width(selector_width);
                 ui.set_max_width(selector_width);
-                render_pen_width_selector(ui, selected, orientation)
+                render_pen_width_selector(ui, selected, orientation, tokens::TOOL_METRICS)
             })
             .inner
         })
@@ -560,17 +562,6 @@ pub(super) fn icon_button(
     swatch: Option<Color32>,
 ) -> Response {
     icon_button_with_surface(ui, label, icon, selected, swatch, false)
-}
-
-/// 绘制设置和快捷设置使用的不透明图标加文字按钮。
-pub(super) fn opaque_icon_button(
-    ui: &mut Ui,
-    label: &str,
-    icon: Icon,
-    selected: bool,
-    swatch: Option<Color32>,
-) -> Response {
-    icon_button_with_surface(ui, label, icon, selected, swatch, true)
 }
 
 /// 根据所在界面选择表面透明度后绘制统一的图标加文字按钮。
@@ -657,9 +648,30 @@ fn draw_icon(
     foreground: Color32,
     accent: Color32,
 ) {
+    paint_icon(
+        ui,
+        center,
+        icon,
+        swatch,
+        foreground,
+        accent,
+        tokens::TOOL_METRICS,
+    );
+}
+
+/// 按指定页面尺寸 profile 绘制共享线性图标。
+pub(super) fn paint_icon(
+    ui: &Ui,
+    center: Pos2,
+    icon: Icon,
+    swatch: Option<Color32>,
+    foreground: Color32,
+    accent: Color32,
+    metrics: tokens::InterfaceMetrics,
+) {
     let painter = ui.painter();
-    let half = tokens::ICON_SIZE / 2.0;
-    let stroke = Stroke::new(tokens::scale_points(2.0), foreground);
+    let half = metrics.icon_size / 2.0;
+    let stroke = Stroke::new(metrics.points(2.0), foreground);
     let paint_line = |points, stroke| {
         pixel_snap::paint_pixel_aligned_line(painter, points, stroke);
     };
@@ -718,9 +730,9 @@ fn draw_icon(
         }
         Icon::PenWidth => {
             for (offset, width) in [
-                (-half * 0.5, tokens::scale_points(1.0)),
-                (0.0, tokens::scale_points(2.0)),
-                (half * 0.5, tokens::scale_points(3.0)),
+                (-half * 0.5, metrics.points(1.0)),
+                (0.0, metrics.points(2.0)),
+                (half * 0.5, metrics.points(3.0)),
             ] {
                 paint_line(
                     [
@@ -746,13 +758,13 @@ fn draw_icon(
         }
         Icon::Undo => {
             painter.circle_stroke(
-                center + egui::vec2(tokens::scale_points(2.0), tokens::scale_points(1.0)),
+                center + egui::vec2(metrics.points(2.0), metrics.points(1.0)),
                 half * 0.65,
                 stroke,
             );
             painter.add(Shape::convex_polygon(
                 vec![
-                    center + egui::vec2(-half, -tokens::scale_points(2.0)),
+                    center + egui::vec2(-half, -metrics.points(2.0)),
                     center + egui::vec2(-half * 0.35, -half * 0.7),
                     center + egui::vec2(-half * 0.35, half * 0.35),
                 ],
@@ -763,18 +775,18 @@ fn draw_icon(
         Icon::Clear => {
             let rect = Rect::from_center_size(
                 center,
-                egui::vec2(tokens::scale_points(16.0), tokens::scale_points(13.0)),
+                egui::vec2(metrics.points(16.0), metrics.points(13.0)),
             );
             pixel_snap::paint_pixel_aligned_rect(
                 ui,
                 rect,
-                tokens::scale_points(2.0),
+                metrics.points(2.0),
                 Color32::TRANSPARENT,
                 stroke,
             );
             paint_line(
                 [rect.left_top(), rect.right_bottom()],
-                Stroke::new(tokens::scale_points(2.0), accent),
+                Stroke::new(metrics.points(2.0), accent),
             );
         }
         Icon::Exit => {
@@ -804,7 +816,7 @@ fn draw_icon(
                     center + egui::vec2(-half * 0.15, 0.0),
                     center + egui::vec2(half * 0.75, 0.0),
                 ],
-                Stroke::new(tokens::scale_points(2.0), accent),
+                Stroke::new(metrics.points(2.0), accent),
             );
             painter.add(Shape::convex_polygon(
                 vec![
@@ -900,14 +912,14 @@ fn draw_icon(
                     center + egui::vec2(-half * 0.7, 0.0),
                     center + egui::vec2(-half * 0.2, half * 0.55),
                 ],
-                Stroke::new(tokens::scale_points(2.0), foreground),
+                Stroke::new(metrics.points(2.0), foreground),
             );
             paint_line(
                 [
                     center + egui::vec2(-half * 0.2, half * 0.55),
                     center + egui::vec2(half * 0.75, -half * 0.55),
                 ],
-                Stroke::new(tokens::scale_points(2.0), foreground),
+                Stroke::new(metrics.points(2.0), foreground),
             );
         }
         Icon::Cancel => {
@@ -916,15 +928,34 @@ fn draw_icon(
                     center + egui::vec2(-half * 0.65, -half * 0.65),
                     center + egui::vec2(half * 0.65, half * 0.65),
                 ],
-                Stroke::new(tokens::scale_points(2.0), foreground),
+                Stroke::new(metrics.points(2.0), foreground),
             );
             paint_line(
                 [
                     center + egui::vec2(half * 0.65, -half * 0.65),
                     center + egui::vec2(-half * 0.65, half * 0.65),
                 ],
-                Stroke::new(tokens::scale_points(2.0), foreground),
+                Stroke::new(metrics.points(2.0), foreground),
             );
+        }
+        Icon::Folder => {
+            let left = center.x - half * 0.85;
+            let right = center.x + half * 0.85;
+            let tab_right = center.x - half * 0.05;
+            let tab_top = center.y - half * 0.7;
+            let top = center.y - half * 0.35;
+            let bottom = center.y + half * 0.7;
+            for points in [
+                [Pos2::new(left, top), Pos2::new(left, bottom)],
+                [Pos2::new(left, bottom), Pos2::new(right, bottom)],
+                [Pos2::new(right, bottom), Pos2::new(right, top)],
+                [Pos2::new(right, top), Pos2::new(tab_right, top)],
+                [Pos2::new(tab_right, top), Pos2::new(tab_right, tab_top)],
+                [Pos2::new(tab_right, tab_top), Pos2::new(left, tab_top)],
+                [Pos2::new(left, tab_top), Pos2::new(left, top)],
+            ] {
+                paint_line(points, stroke);
+            }
         }
         Icon::Power => {
             painter.circle_stroke(center, half * 0.72, stroke);
@@ -933,7 +964,7 @@ fn draw_icon(
                     center + egui::vec2(0.0, -half),
                     center + egui::vec2(0.0, -half * 0.15),
                 ],
-                Stroke::new(tokens::scale_points(2.0), accent),
+                Stroke::new(metrics.points(2.0), accent),
             );
         }
     }
@@ -982,6 +1013,7 @@ pub(super) enum Icon {
     Expand,
     Confirm,
     Cancel,
+    Folder,
     Power,
 }
 

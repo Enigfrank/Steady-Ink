@@ -43,8 +43,8 @@ pub(crate) const IDLE_HEIGHT_POINTS: f64 = scale_window_points(248.0);
 // 额外保留一个缩放后的基础网格，容纳双卡片边框和 egui 横向布局舍入。
 pub(crate) const QUICK_SETTINGS_WIDTH_POINTS: f64 = scale_window_points(544.0 + 4.0);
 pub(crate) const QUICK_SETTINGS_HEIGHT_POINTS: f64 = scale_window_points(336.0);
-const SETTINGS_WIDTH_POINTS: f64 = scale_window_points(560.0);
-const SETTINGS_HEIGHT_POINTS: f64 = scale_window_points(640.0);
+pub(crate) const SETTINGS_WIDTH_POINTS: f64 = 560.0;
+pub(crate) const SETTINGS_HEIGHT_POINTS: f64 = 640.0;
 const EDGE_MARGIN_POINTS: f64 = scale_window_points(16.0);
 pub(crate) const SWAP_CHAIN_BUFFER_COUNT: usize = 2;
 
@@ -681,6 +681,15 @@ mod tests {
     #[test]
     fn composition_swap_chain_uses_two_buffers() {
         assert_eq!(SWAP_CHAIN_BUFFER_COUNT, 2);
+    }
+
+    /// 验证完整设置窗口使用 100% 名义尺寸，其他 idle 窗口仍使用 80% 比例。
+    #[test]
+    fn settings_window_uses_full_size_without_rescaling_other_views() {
+        assert_eq!(SETTINGS_WIDTH_POINTS, 560.0);
+        assert_eq!(SETTINGS_HEIGHT_POINTS, 640.0);
+        assert!((IDLE_WIDTH_POINTS - 70.4).abs() < f64::EPSILON);
+        assert!((QUICK_SETTINGS_HEIGHT_POINTS - 268.8).abs() < f64::EPSILON);
     }
 
     /// 验证工具窗口样式只替换 shell 可见性标志，不破坏 DirectComposition 扩展样式。

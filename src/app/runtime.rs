@@ -144,6 +144,7 @@ struct DesktopRuntime {
     settings_store: SettingsStore,
     settings: UserSettings,
     settings_error: Option<String>,
+    settings_directory_error: Option<String>,
     idle_panel: IdlePanel,
     com_diagnostics: Option<ComDiagnostics>,
     slideshow_connection_error: Option<String>,
@@ -193,6 +194,7 @@ impl DesktopRuntime {
             settings_store,
             settings,
             settings_error,
+            settings_directory_error: None,
             idle_panel: IdlePanel::Toolbar,
             com_diagnostics: None,
             slideshow_connection_error: None,
@@ -322,6 +324,7 @@ impl DesktopRuntime {
             slideshow_connection_error: self.slideshow_connection_error.as_deref(),
             slideshow_control_error: self.slideshow_control_error.as_deref(),
             settings_error: self.settings_error.as_deref(),
+            settings_directory_error: self.settings_directory_error.as_deref(),
             settings_path: self.settings_store.path(),
             graphics_diagnostics: self.window_context.diagnostics(),
         };
@@ -399,6 +402,13 @@ impl DesktopRuntime {
                         .set_idle_window_view(IdleWindowView::Settings);
                 }
             }
+            UiCommand::OpenSettingsDirectory => match self.settings_store.open_directory() {
+                Ok(()) => self.settings_directory_error = None,
+                Err(error) => {
+                    tracing::warn!(%error, "打开配置目录失败");
+                    self.settings_directory_error = Some(error.to_string());
+                }
+            },
             UiCommand::CloseSettings => {
                 if self.state.mode() == AppMode::IdleFloatingToolbar {
                     self.idle_panel = IdlePanel::Toolbar;

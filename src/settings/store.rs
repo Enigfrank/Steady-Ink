@@ -1,4 +1,8 @@
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 use directories::BaseDirs;
 
@@ -60,6 +64,33 @@ impl SettingsStore {
     pub fn path(&self) -> &std::path::Path {
         &self.path
     }
+
+    /// 创建设置文件父目录并返回其稳定路径。
+    pub fn ensure_directory(&self) -> Result<&Path, AppError> {
+        let directory = self
+            .path
+            .parent()
+            .ok_or_else(|| AppError::Settings("设置文件路径缺少父目录".to_owned()))?;
+        fs::create_dir_all(directory).map_err(|error| {
+            AppError::Settings(format!("创建 {} 失败: {error}", directory.display()))
+        })?;
+        Ok(directory)
+    }
+
+    /// 确保配置目录存在后，通过 Windows 文件资源管理器打开该目录。
+    pub fn open_directory(&self) -> Result<(), AppError> {
+        let directory = self.ensure_directory()?;
+        Command::new("explorer.exe")
+            .arg(directory)
+            .spawn()
+            .map_err(|error| {
+                AppError::Settings(format!(
+                    "打开配置目录 {} 失败: {error}",
+                    directory.display()
+                ))
+            })?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -96,5 +127,28 @@ mod tests {
         assert_eq!(store.load().expect("测试设置应成功读回"), settings);
 
         std::fs::remove_dir_all(directory).expect("测试临时目录应可清理");
+    }
+
+    /// 验证配置文件尚不存在时也会创建其父目录供 Explorer 打开。
+    #[test]
+    fn ensure_directory_creates_missing_settings_parent() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("系统时间应晚于 Unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "steady-ink-settings-directory-test-{}-{unique}",
+            std::process::id()
+        ));
+        let expected = root.join("nested");
+        let store = SettingsStore {
+            path: expected.join(SETTINGS_FILE),
+        };
+
+        let actual = store.ensure_directory().expect("缺失配置目录应可创建");
+
+        assert_eq!(actual, expected);
+        assert!(actual.is_dir());
+        std::fs::remove_dir_all(root).expect("测试临时目录应可清理");
     }
 }

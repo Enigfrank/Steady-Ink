@@ -38,7 +38,7 @@ fn render_preferences_panel(ui: &mut Ui, view: UiViewState<'_>) -> Option<UiComm
             ui.with_layout(Layout::top_down(Align::Min), |ui| {
                 ui.set_min_width(tokens::QUICK_SETTINGS_CONTENT_WIDTH);
                 ui.set_max_width(tokens::QUICK_SETTINGS_CONTENT_WIDTH);
-                render_tool_preferences(ui, view.tools)
+                render_tool_preferences(ui, view.tools, tokens::TOOL_METRICS)
             })
             .inner
         },
@@ -74,6 +74,7 @@ mod tests {
             slideshow_connection_error: None,
             slideshow_control_error: None,
             settings_error: None,
+            settings_directory_error: None,
             settings_path: Path::new("settings.toml"),
             graphics_diagnostics: diagnostics,
         }

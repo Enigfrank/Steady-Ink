@@ -1,7 +1,8 @@
 use egui::{Align2, Color32, CornerRadius, FontId, Pos2, Response, Sense, Stroke, Ui, Vec2};
 
 use super::{
-    design_tokens as tokens, pixel_snap,
+    design_tokens::{self as tokens, InterfaceMetrics},
+    pixel_snap,
     toolbar::{ToolState, UiCommand, color32},
 };
 use crate::ink::{EraserSize, InkColor, PenWidth};
@@ -34,33 +35,48 @@ impl SelectorOrientation {
     }
 
     /// 返回指定选项数量在当前排列方向下需要的弹层内容宽度。
-    const fn popup_width(self, option_count: usize) -> f32 {
+    const fn popup_width(self, option_count: usize, metrics: InterfaceMetrics) -> f32 {
         match self {
             Self::Horizontal => {
-                option_count as f32 * tokens::TOUCH_TARGET
-                    + (option_count - 1) as f32 * tokens::SPACE_2
+                option_count as f32 * metrics.touch_target
+                    + (option_count - 1) as f32 * metrics.space_2
             }
-            Self::Vertical => tokens::TOUCH_TARGET,
+            Self::Vertical => metrics.touch_target,
         }
     }
 }
 
 /// 返回颜色选择器在指定排列方向下需要的内容宽度。
-pub(super) const fn color_selector_width(orientation: SelectorOrientation) -> f32 {
-    orientation.popup_width(COLORS.len())
+pub(super) const fn color_selector_width(
+    orientation: SelectorOrientation,
+    metrics: InterfaceMetrics,
+) -> f32 {
+    orientation.popup_width(COLORS.len(), metrics)
 }
 
 /// 返回画笔粗细选择器在指定排列方向下需要的内容宽度。
-pub(super) const fn pen_width_selector_width(orientation: SelectorOrientation) -> f32 {
-    orientation.popup_width(PEN_WIDTHS.len())
+pub(super) const fn pen_width_selector_width(
+    orientation: SelectorOrientation,
+    metrics: InterfaceMetrics,
+) -> f32 {
+    orientation.popup_width(PEN_WIDTHS.len(), metrics)
 }
 
 /// 绘制颜色、画笔粗细和区域橡皮擦大小三组共用选择控件。
-pub fn render_tool_preferences(ui: &mut Ui, tools: ToolState) -> Option<UiCommand> {
-    let color_command = render_color_selector(ui, tools.color, SelectorOrientation::Horizontal);
-    let pen_width_command =
-        render_pen_width_selector(ui, tools.pen_width, SelectorOrientation::Horizontal);
-    let eraser_size_command = render_eraser_size_selector(ui, tools.eraser_size);
+pub fn render_tool_preferences(
+    ui: &mut Ui,
+    tools: ToolState,
+    metrics: InterfaceMetrics,
+) -> Option<UiCommand> {
+    let color_command =
+        render_color_selector(ui, tools.color, SelectorOrientation::Horizontal, metrics);
+    let pen_width_command = render_pen_width_selector(
+        ui,
+        tools.pen_width,
+        SelectorOrientation::Horizontal,
+        metrics,
+    );
+    let eraser_size_command = render_eraser_size_selector(ui, tools.eraser_size, metrics);
     color_command.or(pen_width_command).or(eraser_size_command)
 }
 
@@ -69,9 +85,10 @@ pub(super) fn render_color_selector(
     ui: &mut Ui,
     selected: InkColor,
     orientation: SelectorOrientation,
+    metrics: InterfaceMetrics,
 ) -> Option<UiCommand> {
     let mut command = None;
-    section_label(ui, "画笔颜色");
+    section_label(ui, "画笔颜色", metrics);
     orientation.show(ui, |ui| {
         for color in COLORS {
             if selection_button(
@@ -79,6 +96,7 @@ pub(super) fn render_color_selector(
                 color_label(color),
                 SelectionVisual::Color(color32(color)),
                 selected == color,
+                metrics,
             )
             .clicked()
             {
@@ -94,9 +112,10 @@ pub(super) fn render_pen_width_selector(
     ui: &mut Ui,
     selected: PenWidth,
     orientation: SelectorOrientation,
+    metrics: InterfaceMetrics,
 ) -> Option<UiCommand> {
     let mut command = None;
-    section_label(ui, "画笔粗细");
+    section_label(ui, "画笔粗细", metrics);
     orientation.show(ui, |ui| {
         for width in PEN_WIDTHS {
             if selection_button(
@@ -104,6 +123,7 @@ pub(super) fn render_pen_width_selector(
                 pen_width_label(width),
                 SelectionVisual::PenWidth(width),
                 selected == width,
+                metrics,
             )
             .clicked()
             {
@@ -115,9 +135,13 @@ pub(super) fn render_pen_width_selector(
 }
 
 /// 绘制固定区域橡皮擦大小选择器。
-fn render_eraser_size_selector(ui: &mut Ui, selected: EraserSize) -> Option<UiCommand> {
+fn render_eraser_size_selector(
+    ui: &mut Ui,
+    selected: EraserSize,
+    metrics: InterfaceMetrics,
+) -> Option<UiCommand> {
     let mut command = None;
-    section_label(ui, "橡皮擦大小");
+    section_label(ui, "橡皮擦大小", metrics);
     ui.horizontal(|ui| {
         for size in ERASER_SIZES {
             if selection_button(
@@ -125,6 +149,7 @@ fn render_eraser_size_selector(ui: &mut Ui, selected: EraserSize) -> Option<UiCo
                 eraser_size_label(size),
                 SelectionVisual::EraserSize(size),
                 selected == size,
+                metrics,
             )
             .clicked()
             {
@@ -136,17 +161,23 @@ fn render_eraser_size_selector(ui: &mut Ui, selected: EraserSize) -> Option<UiCo
 }
 
 /// 绘制设置分组使用的紧凑标题。
-fn section_label(ui: &mut Ui, label: &str) {
+fn section_label(ui: &mut Ui, label: &str, metrics: InterfaceMetrics) {
     ui.label(
         egui::RichText::new(label)
-            .size(tokens::TEXT_SM)
+            .size(metrics.text_sm)
             .color(tokens::COLOR_TEXT_SECONDARY),
     );
 }
 
 /// 绘制固定触摸尺寸的色样或数值选择按钮。
-fn selection_button(ui: &mut Ui, label: &str, visual: SelectionVisual, selected: bool) -> Response {
-    let size = Vec2::splat(tokens::TOUCH_TARGET);
+fn selection_button(
+    ui: &mut Ui,
+    label: &str,
+    visual: SelectionVisual,
+    selected: bool,
+    metrics: InterfaceMetrics,
+) -> Response {
+    let size = Vec2::splat(metrics.touch_target);
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
     if !ui.is_rect_visible(rect) {
         return response;
@@ -167,35 +198,40 @@ fn selection_button(ui: &mut Ui, label: &str, visual: SelectionVisual, selected:
     pixel_snap::paint_pixel_aligned_rect(
         ui,
         rect,
-        CornerRadius::same(tokens::BUTTON_RADIUS),
+        CornerRadius::same(metrics.button_radius),
         fill,
         Stroke::new(1.0, border),
     );
 
     let center = Pos2::new(
         rect.center().x,
-        rect.top() + tokens::SPACE_3 + tokens::ICON_SIZE / 2.0,
+        rect.top() + metrics.space_3 + metrics.icon_size / 2.0,
     );
-    draw_selection_visual(ui, center, visual);
+    draw_selection_visual(ui, center, visual, metrics);
     ui.painter().text(
-        Pos2::new(rect.center().x, rect.bottom() - tokens::SPACE_3),
+        Pos2::new(rect.center().x, rect.bottom() - metrics.space_3),
         Align2::CENTER_BOTTOM,
         label,
-        FontId::proportional(tokens::TEXT_SM),
+        FontId::proportional(metrics.text_sm),
         tokens::COLOR_TEXT_PRIMARY,
     );
     response
 }
 
 /// 绘制色样、画笔线宽或橡皮擦直径的视觉预览。
-fn draw_selection_visual(ui: &Ui, center: Pos2, visual: SelectionVisual) {
+fn draw_selection_visual(
+    ui: &Ui,
+    center: Pos2,
+    visual: SelectionVisual,
+    metrics: InterfaceMetrics,
+) {
     match visual {
         SelectionVisual::Color(color) => {
             ui.painter()
-                .circle_filled(center, tokens::ICON_SIZE / 2.0, color);
+                .circle_filled(center, metrics.icon_size / 2.0, color);
             ui.painter().circle_stroke(
                 center,
-                tokens::ICON_SIZE / 2.0,
+                metrics.icon_size / 2.0,
                 Stroke::new(1.0, tokens::OPAQUE_COLOR_BORDER),
             );
         }
@@ -209,22 +245,22 @@ fn draw_selection_visual(ui: &Ui, center: Pos2, visual: SelectionVisual) {
             pixel_snap::paint_pixel_aligned_line(
                 ui.painter(),
                 [
-                    center - egui::vec2(tokens::ICON_SIZE / 2.0, 0.0),
-                    center + egui::vec2(tokens::ICON_SIZE / 2.0, 0.0),
+                    center - egui::vec2(metrics.icon_size / 2.0, 0.0),
+                    center + egui::vec2(metrics.icon_size / 2.0, 0.0),
                 ],
                 Stroke::new(visual_width, tokens::COLOR_TEXT_SECONDARY),
             );
         }
         SelectionVisual::EraserSize(size) => {
             let radius = match size {
-                EraserSize::Px24 => tokens::SPACE_2,
-                EraserSize::Px48 => tokens::SPACE_3,
-                EraserSize::Px72 => tokens::SPACE_4,
+                EraserSize::Px24 => metrics.space_2,
+                EraserSize::Px48 => metrics.space_3,
+                EraserSize::Px72 => metrics.space_4,
             };
             ui.painter().circle_stroke(
                 center,
                 radius,
-                Stroke::new(tokens::scale_points(2.0), tokens::COLOR_TEXT_SECONDARY),
+                Stroke::new(metrics.points(2.0), tokens::COLOR_TEXT_SECONDARY),
             );
         }
     }
@@ -275,14 +311,17 @@ mod tests {
     use super::*;
 
     /// 收集指定方向下三个固定触摸项的实际布局矩形。
-    fn selector_option_rects(orientation: SelectorOrientation) -> Vec<egui::Rect> {
+    fn selector_option_rects(
+        orientation: SelectorOrientation,
+        metrics: InterfaceMetrics,
+    ) -> Vec<egui::Rect> {
         let context = Context::default();
         let mut rects = Vec::new();
         let _ = context.run_ui(RawInput::default(), |ui| {
             orientation.show(ui, |ui| {
                 for _ in 0..3 {
                     let (rect, _) =
-                        ui.allocate_exact_size(Vec2::splat(tokens::TOUCH_TARGET), Sense::hover());
+                        ui.allocate_exact_size(Vec2::splat(metrics.touch_target), Sense::hover());
                     rects.push(rect);
                 }
             });
@@ -293,18 +332,18 @@ mod tests {
     /// 验证普通批注使用的一列选择项保持同一横坐标并按纵向递增。
     #[test]
     fn vertical_selector_orientation_stacks_options_in_one_column() {
-        let rects = selector_option_rects(SelectorOrientation::Vertical);
+        let rects = selector_option_rects(SelectorOrientation::Vertical, tokens::TOOL_METRICS);
 
         assert!(rects.windows(2).all(|pair| {
             (pair[0].center().x - pair[1].center().x).abs() < f32::EPSILON
                 && pair[1].top() > pair[0].bottom()
         }));
         assert_eq!(
-            color_selector_width(SelectorOrientation::Vertical),
+            color_selector_width(SelectorOrientation::Vertical, tokens::TOOL_METRICS),
             tokens::TOUCH_TARGET
         );
         assert_eq!(
-            pen_width_selector_width(SelectorOrientation::Vertical),
+            pen_width_selector_width(SelectorOrientation::Vertical, tokens::TOOL_METRICS),
             tokens::TOUCH_TARGET
         );
     }
@@ -312,13 +351,37 @@ mod tests {
     /// 验证设置和放映模式保留的一排选择项按横向递增。
     #[test]
     fn horizontal_selector_orientation_keeps_options_in_one_row() {
-        let rects = selector_option_rects(SelectorOrientation::Horizontal);
+        let rects = selector_option_rects(SelectorOrientation::Horizontal, tokens::TOOL_METRICS);
 
         assert!(rects.windows(2).all(|pair| {
             (pair[0].center().y - pair[1].center().y).abs() < f32::EPSILON
                 && pair[1].left() > pair[0].right()
         }));
-        assert!(color_selector_width(SelectorOrientation::Horizontal) > tokens::TOUCH_TARGET);
-        assert!(pen_width_selector_width(SelectorOrientation::Horizontal) > tokens::TOUCH_TARGET);
+        assert!(
+            color_selector_width(SelectorOrientation::Horizontal, tokens::TOOL_METRICS)
+                > tokens::TOUCH_TARGET
+        );
+        assert!(
+            pen_width_selector_width(SelectorOrientation::Horizontal, tokens::TOOL_METRICS)
+                > tokens::TOUCH_TARGET
+        );
+    }
+
+    /// 验证完整设置页选择项使用 100% 尺寸而不改变排列方向。
+    #[test]
+    fn full_size_settings_selectors_use_sixty_four_point_targets() {
+        let rects =
+            selector_option_rects(SelectorOrientation::Horizontal, tokens::SETTINGS_METRICS);
+
+        assert!(
+            rects
+                .iter()
+                .all(|rect| (rect.width() - 64.0).abs() < f32::EPSILON)
+        );
+        assert!(
+            rects
+                .windows(2)
+                .all(|pair| pair[1].left() > pair[0].right())
+        );
     }
 }

@@ -5,7 +5,7 @@ use std::{
         mpsc::{self, Receiver, TryRecvError},
     },
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use windows::Win32::{
@@ -20,8 +20,9 @@ use super::{
     PresentationApplication, SlidePage, SlideShowControlAction, SlideShowControlBackend,
     SlideShowKey,
     late_bound::{
-        ActiveObjectError, ActiveSlideShowSnapshot, ComCandidate, connect_active_object,
-        control_active_slideshow, query_active_slideshow, subscribe_application_events,
+        ActiveObjectError, ActiveSlideShowSnapshot, ComCandidate, application_is_visible,
+        connect_active_object, control_active_slideshow, query_active_slideshow, same_com_identity,
+        subscribe_application_events,
     },
     simulated_keys::send_simulated_control_key,
 };
@@ -256,6 +257,25 @@ fn connect_first_available() -> ConnectedCandidate {
     for candidate in COM_CANDIDATES {
         match connect_active_object(candidate.prog_id) {
             Ok(application) => {
+                match application_is_visible(&application) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        diagnostics.push(candidate_diagnostic(
+                            candidate,
+                            ComCandidateStatus::InstalledNotRunning,
+                            None,
+                        ));
+                        continue;
+                    }
+                    Err(error) => {
+                        diagnostics.push(candidate_diagnostic(
+                            candidate,
+                            ComCandidateStatus::ConnectionFailed,
+                            Some(format!("无法读取 Application.Visible: {error}")),
+                        ));
+                        continue;
+                    }
+                }
                 diagnostics.push(ComCandidateDiagnostic {
                     application: candidate.application,
                     prog_id: candidate.prog_id.to_owned(),
@@ -336,6 +356,7 @@ fn run_connected_session(
         current_snapshot.as_ref(),
     );
     *last_confirmed_snapshot = current_snapshot;
+    let mut next_health_check_at = Instant::now() + RECONNECT_INTERVAL;
 
     while !stop_requested.load(Ordering::Acquire) {
         pump_sta_messages();
@@ -355,31 +376,100 @@ fn run_connected_session(
                     candidate = candidate.prog_id,
                     "收到演示应用 COM 事件"
                 );
-                match query_active_slideshow_with_retry(&application, candidate.application) {
-                    Ok(current_snapshot) => {
-                        emit_snapshot_difference(
-                            emitter,
-                            last_confirmed_snapshot.as_ref(),
-                            current_snapshot.as_ref(),
-                        );
-                        *last_confirmed_snapshot = current_snapshot;
-                    }
-                    Err(error) => {
-                        emitter.emit(ComDetectorEvent::ConnectionLost {
-                            key: last_confirmed_snapshot
-                                .as_ref()
-                                .map(|snapshot| snapshot.key.clone()),
-                            detail: error.to_string(),
-                        });
-                        break;
-                    }
+                if !refresh_connected_snapshot(
+                    emitter,
+                    candidate,
+                    &application,
+                    last_confirmed_snapshot,
+                ) {
+                    break;
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
+
+        if Instant::now() >= next_health_check_at {
+            if let Err(detail) = verify_active_object_identity(candidate, &application) {
+                emitter.emit(ComDetectorEvent::ConnectionLost {
+                    key: last_confirmed_snapshot
+                        .as_ref()
+                        .map(|snapshot| snapshot.key.clone()),
+                    detail,
+                });
+                break;
+            }
+            if !refresh_connected_snapshot(
+                emitter,
+                candidate,
+                &application,
+                last_confirmed_snapshot,
+            ) {
+                break;
+            }
+            next_health_check_at = Instant::now() + RECONNECT_INTERVAL;
+        }
     }
     drop(subscription);
+}
+
+/// 验证 ROT 中当前活动对象仍与已订阅的 COM 对象具有相同身份。
+fn verify_active_object_identity(
+    candidate: ComCandidate,
+    application: &windows::Win32::System::Com::IDispatch,
+) -> Result<(), String> {
+    let active_application =
+        connect_active_object(candidate.prog_id).map_err(|error| match error {
+            ActiveObjectError::ClassNotRegistered => {
+                format!("{} COM 类已不可用", candidate.prog_id)
+            }
+            ActiveObjectError::NotRunning => format!("{} 活动 COM 对象已退出", candidate.prog_id),
+            ActiveObjectError::Other(detail) => {
+                format!("{} 活动 COM 对象查询失败: {detail}", candidate.prog_id)
+            }
+        })?;
+    let is_same = same_com_identity(application, &active_application)
+        .map_err(|error| format!("{} COM 对象身份比较失败: {error}", candidate.prog_id))?;
+    if is_same {
+        let visible = application_is_visible(&active_application)
+            .map_err(|error| format!("{} 可见状态查询失败: {error}", candidate.prog_id))?;
+        if visible {
+            Ok(())
+        } else {
+            Err(format!("{} 应用窗口已经关闭", candidate.prog_id))
+        }
+    } else {
+        Err(format!("{} 活动 COM 对象已经更换", candidate.prog_id))
+    }
+}
+
+/// 查询已连接应用的可靠放映快照，发出差分事件并保留会话连续性。
+fn refresh_connected_snapshot(
+    emitter: &DetectorEventEmitter,
+    candidate: ComCandidate,
+    application: &windows::Win32::System::Com::IDispatch,
+    previous_snapshot: &mut Option<ActiveSlideShowSnapshot>,
+) -> bool {
+    match query_active_slideshow_with_retry(application, candidate.application) {
+        Ok(current_snapshot) => {
+            emit_snapshot_difference(
+                emitter,
+                previous_snapshot.as_ref(),
+                current_snapshot.as_ref(),
+            );
+            *previous_snapshot = current_snapshot;
+            true
+        }
+        Err(error) => {
+            emitter.emit(ComDetectorEvent::ConnectionLost {
+                key: previous_snapshot
+                    .as_ref()
+                    .map(|snapshot| snapshot.key.clone()),
+                detail: error.to_string(),
+            });
+            false
+        }
+    }
 }
 
 /// 在 STA 线程中处理全部待执行控制，并在 COM 断线时请求退出连接循环。

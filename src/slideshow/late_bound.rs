@@ -124,6 +124,25 @@ pub(crate) fn connect_active_object(prog_id: &str) -> Result<IDispatch, ActiveOb
         .map_err(|error| ActiveObjectError::Other(error.to_string()))
 }
 
+/// 通过稳定的 IUnknown 身份判断两个调度接口是否属于同一个 COM 对象。
+pub(crate) fn same_com_identity(
+    left: &IDispatch,
+    right: &IDispatch,
+) -> windows::core::Result<bool> {
+    let left = left.cast::<IUnknown>()?;
+    let right = right.cast::<IUnknown>()?;
+    Ok(left.as_raw() == right.as_raw())
+}
+
+/// 读取 PowerPoint 兼容 Application.Visible，判断用户界面是否仍在运行。
+pub(crate) fn application_is_visible(application: &IDispatch) -> windows::core::Result<bool> {
+    let value = get_property(application, "Visible")?;
+    if let Ok(visible) = bool::try_from(&value) {
+        return Ok(visible);
+    }
+    Ok(i32::try_from(&value)? != 0)
+}
+
 /// 为 PowerPoint 兼容的 EApplication connection point 安装事件 sink。
 pub(crate) fn subscribe_application_events(
     application: &IDispatch,

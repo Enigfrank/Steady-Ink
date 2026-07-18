@@ -1,7 +1,8 @@
-use egui::{Color32, Stroke, Style, Ui};
+use egui::{Color32, Stroke, Ui};
 
 pub const INTERFACE_SCALE: f64 = 0.8;
-pub const SETTINGS_INTERFACE_SCALE: f32 = 1.0;
+pub const TOOLBAR_ZOOM_FACTOR: f32 = INTERFACE_SCALE as f32;
+pub const SETTINGS_ZOOM_FACTOR: f32 = 1.0;
 pub const INTERFACE_ALPHA: u8 = 128;
 pub const OPAQUE_INTERFACE_ALPHA: u8 = u8::MAX;
 
@@ -61,9 +62,8 @@ impl InterfaceMetrics {
     }
 }
 
-pub const TOOL_METRICS: InterfaceMetrics = InterfaceMetrics::from_scale(INTERFACE_SCALE as f32);
-pub const SETTINGS_METRICS: InterfaceMetrics =
-    InterfaceMetrics::from_scale(SETTINGS_INTERFACE_SCALE);
+pub const TOOL_METRICS: InterfaceMetrics = InterfaceMetrics::from_scale(1.0);
+pub const SETTINGS_METRICS: InterfaceMetrics = InterfaceMetrics::from_scale(1.0);
 
 pub const COLOR_BACKGROUND: Color32 =
     Color32::from_rgba_unmultiplied_const(248, 249, 250, INTERFACE_ALPHA);
@@ -104,7 +104,7 @@ pub const SPACE_6: f32 = TOOL_METRICS.space_6;
 pub const MARGIN_SPACE_2: i8 = TOOL_METRICS.margin_space_2;
 pub const MARGIN_SPACE_4: i8 = TOOL_METRICS.margin_space_4;
 pub const CARD_RADIUS: u8 = TOOL_METRICS.card_radius;
-pub const CAPSULE_RADIUS: u8 = scale_integer_points(16);
+pub const CAPSULE_RADIUS: u8 = 16;
 pub const BUTTON_RADIUS: u8 = TOOL_METRICS.button_radius;
 pub const TOUCH_TARGET: f32 = TOOL_METRICS.touch_target;
 pub const ICON_SIZE: f32 = TOOL_METRICS.icon_size;
@@ -124,12 +124,8 @@ pub fn apply_opaque_widget_style(ui: &mut Ui) {
     visuals.widgets.open.bg_fill = OPAQUE_COLOR_SELECTED;
 }
 
-/// 将当前继承的 80% egui 内建样式局部恢复为设置页 100% 尺寸并应用不透明表面。
+/// 应用设置页的未缩放布局间距和不透明控件表面。
 pub fn apply_settings_widget_style(ui: &mut Ui) {
-    scale_builtin_style(
-        ui.style_mut(),
-        SETTINGS_INTERFACE_SCALE / INTERFACE_SCALE as f32,
-    );
     let spacing = &mut ui.style_mut().spacing;
     spacing.window_margin = egui::Margin::same(SETTINGS_METRICS.margin_space_2);
     spacing.menu_margin = egui::Margin::same(SETTINGS_METRICS.margin_space_2);
@@ -138,45 +134,14 @@ pub fn apply_settings_widget_style(ui: &mut Ui) {
     apply_opaque_widget_style(ui);
 }
 
-/// 按给定比例统一调整 egui 内建字体、交互控件、菜单和滚动条尺寸。
-pub fn scale_builtin_style(style: &mut Style, scale: f32) {
-    for font in style.text_styles.values_mut() {
-        font.size *= scale;
-    }
-    style.spacing.indent *= scale;
-    style.spacing.interact_size *= scale;
-    style.spacing.slider_width *= scale;
-    style.spacing.slider_rail_height *= scale;
-    style.spacing.combo_width *= scale;
-    style.spacing.text_edit_width *= scale;
-    style.spacing.icon_width *= scale;
-    style.spacing.icon_width_inner *= scale;
-    style.spacing.icon_spacing *= scale;
-    style.spacing.tooltip_width *= scale;
-    style.spacing.menu_width *= scale;
-    style.spacing.menu_spacing *= scale;
-    style.spacing.combo_height *= scale;
-    style.spacing.scroll.bar_width *= scale;
-    style.spacing.scroll.handle_min_length *= scale;
-    style.spacing.scroll.bar_inner_margin *= scale;
-    style.spacing.scroll.bar_outer_margin *= scale;
-    style.spacing.scroll.floating_width *= scale;
-    style.spacing.scroll.floating_allocated_width *= scale;
-}
-
-/// 按统一界面比例缩放 egui 逻辑点尺寸。
+/// 返回工具界面的原始 egui 逻辑点；显示缩放由 Context zoom 统一处理。
 pub const fn scale_points(value: f32) -> f32 {
-    value * INTERFACE_SCALE as f32
+    value
 }
 
 /// 按统一界面比例缩放 winit 使用的双精度逻辑点尺寸。
 pub const fn scale_window_points(value: f64) -> f64 {
     value * INTERFACE_SCALE
-}
-
-/// 按统一界面比例缩放 egui 整数尺寸，并四舍五入到最近的逻辑点。
-const fn scale_integer_points(value: u8) -> u8 {
-    scaled_integer(value, INTERFACE_SCALE as f32)
 }
 
 /// 把整数 token 按指定比例四舍五入到最近的逻辑点。

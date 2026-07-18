@@ -6,7 +6,7 @@ use egui::{
 use super::{
     design_tokens::{self as tokens, InterfaceMetrics},
     pixel_snap,
-    settings_controls::render_tool_preferences,
+    settings_controls::{render_log_level_selector, render_tool_preferences},
     toolbar::{Icon, UiCommand, UiViewState, paint_icon},
 };
 use crate::slideshow::{ComCandidateStatus, ComDiagnostics};
@@ -71,6 +71,12 @@ pub fn render(ui: &mut Ui, view: UiViewState<'_>) -> Option<UiCommand> {
                         .size(metrics.text_xs)
                         .color(tokens::COLOR_TEXT_SECONDARY),
                     );
+
+                    section_break(ui, metrics);
+                    let log_level_command = render_log_level_selector(ui, view.log_level, metrics);
+                    if command.is_none() {
+                        command = log_level_command;
+                    }
 
                     section_break(ui, metrics);
                     section_heading(ui, "诊断", metrics);

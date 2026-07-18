@@ -15,8 +15,8 @@ pub fn configure_context(context: &egui::Context) {
     install_windows_chinese_font(context);
 
     context.set_theme(egui::Theme::Light);
+    context.set_zoom_factor(design_tokens::TOOLBAR_ZOOM_FACTOR);
     let mut style = (*context.style_of(egui::Theme::Light)).clone();
-    design_tokens::scale_builtin_style(&mut style, design_tokens::INTERFACE_SCALE as f32);
     style.spacing.window_margin = egui::Margin::same(design_tokens::MARGIN_SPACE_2);
     style.spacing.menu_margin = egui::Margin::same(design_tokens::MARGIN_SPACE_2);
     style.spacing.item_spacing = egui::vec2(design_tokens::SPACE_2, design_tokens::SPACE_2);

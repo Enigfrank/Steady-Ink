@@ -4,22 +4,28 @@ use std::{
     io::{self, Write},
     panic,
     path::{Path, PathBuf},
+    sync::OnceLock,
     time::{Duration, SystemTime},
 };
 
 use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
 use tracing_subscriber::{
-    EnvFilter, fmt::MakeWriter, layer::SubscriberExt, util::SubscriberInitExt,
+    EnvFilter, Registry, fmt::MakeWriter, layer::SubscriberExt, reload, util::SubscriberInitExt,
 };
 
-use crate::settings::SettingsStore;
+use crate::settings::{LogLevel, SettingsStore};
 
 const LOG_FILE_STEM: &str = "steady-ink";
 const LOG_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
+type LogFilterReloadHandle = reload::Handle<EnvFilter, Registry>;
+
+static LOG_FILTER_RELOAD_HANDLE: OnceLock<LogFilterReloadHandle> = OnceLock::new();
+
 /// 初始化标准错误与本地日期命名的文件日志，并安装 panic 堆栈捕获。
 pub(crate) fn initialize() {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let (filter, settings_controlled) = initial_filter();
+    let (filter_layer, filter_handle) = reload::Layer::new(filter);
     let local_offset = UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC);
     match prepare_file_logging() {
         Ok(prepared) => {
@@ -39,32 +45,75 @@ pub(crate) fn initialize() {
                 ))
                 .with_writer(prepared.writer);
             if let Err(error) = tracing_subscriber::registry()
-                .with(filter)
+                .with(filter_layer)
                 .with(stderr_layer)
                 .with(file_layer)
                 .try_init()
             {
                 eprintln!("Steady Ink 日志订阅器初始化失败: {error}");
             } else {
+                install_log_filter_reload_handle(settings_controlled, filter_handle);
                 for warning in prepared.cleanup_warnings {
                     tracing::warn!(warning = %warning, "日志清理失败");
                 }
             }
         }
         Err(error) => {
-            let _ = tracing_subscriber::fmt()
-                .with_env_filter(filter)
-                .with_target(false)
-                .with_timer(tracing_subscriber::fmt::time::OffsetTime::new(
-                    local_offset,
-                    Rfc3339,
-                ))
-                .with_writer(std::io::stderr)
-                .try_init();
+            if let Err(subscriber_error) = tracing_subscriber::registry()
+                .with(filter_layer)
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_target(false)
+                        .with_timer(tracing_subscriber::fmt::time::OffsetTime::new(
+                            local_offset,
+                            Rfc3339,
+                        ))
+                        .with_writer(std::io::stderr),
+                )
+                .try_init()
+            {
+                eprintln!("Steady Ink 日志订阅器初始化失败: {subscriber_error}");
+            } else {
+                install_log_filter_reload_handle(settings_controlled, filter_handle);
+            }
             eprintln!("Steady Ink 文件日志初始化失败: {error}");
         }
     }
     install_panic_hook();
+}
+
+/// 立即更新由用户设置控制的日志过滤器；`RUST_LOG` 存在时保持环境变量优先。
+pub(crate) fn set_level(level: LogLevel) {
+    let Some(handle) = LOG_FILTER_RELOAD_HANDLE.get() else {
+        return;
+    };
+    if let Err(error) = handle.reload(EnvFilter::new(level.filter_directive())) {
+        eprintln!("Steady Ink 日志级别更新失败: {error}");
+    }
+}
+
+/// 优先读取有效 `RUST_LOG`，否则从持久化设置构造可热更新的默认过滤器。
+fn initial_filter() -> (EnvFilter, bool) {
+    match EnvFilter::try_from_default_env() {
+        Ok(filter) => (filter, false),
+        Err(error) => {
+            if std::env::var_os("RUST_LOG").is_some() {
+                eprintln!("Steady Ink 忽略无效 RUST_LOG: {error}");
+            }
+            let level = SettingsStore::new()
+                .ok()
+                .and_then(|store| store.load().ok())
+                .map_or_else(LogLevel::default, |settings| settings.log_level);
+            (EnvFilter::new(level.filter_directive()), true)
+        }
+    }
+}
+
+/// 在日志订阅器初始化成功后保存热更新句柄。
+fn install_log_filter_reload_handle(enabled: bool, handle: LogFilterReloadHandle) {
+    if enabled {
+        let _ = LOG_FILTER_RELOAD_HANDLE.set(handle);
+    }
 }
 
 struct PreparedFileLogging {

@@ -19,12 +19,13 @@ use crate::{
     error::AppError,
     ink::{ActiveInkPreview, CanvasPoint, EraseSample, InkDocument, InkOperation, InkTool},
     input::{InputRouter, PointerAction, WindowsPointerEvent, WindowsPointerTracker},
+    logging,
     render::Compositor,
     settings::{SettingsStore, UserSettings},
     slideshow::{
         ComDetector, ComDetectorEvent, ComDiagnostics, SlideShowControlAction, SlideShowSession,
     },
-    ui::{self, IdlePanel, ToolState, UiCommand, UiViewState},
+    ui::{self, IdlePanel, ToolState, UiCommand, UiViewState, design_tokens},
     window::{D3DWindowContext, IdleWindowView},
 };
 
@@ -310,6 +311,7 @@ impl DesktopRuntime {
             dock_side: self.window_context.dock_side(),
             tools,
             slideshow_integration_enabled: self.settings.slideshow_integration_enabled,
+            log_level: self.settings.log_level,
             slideshow_session_generation: self
                 .state
                 .slideshow_session()
@@ -346,6 +348,7 @@ impl DesktopRuntime {
             UiCommand::EnterAnnotation => {
                 if self.state.enter_normal_annotation() {
                     self.idle_panel = IdlePanel::Toolbar;
+                    self.update_interface_zoom();
                     self.window_context.set_annotation_mode(true);
                     self.compositor.invalidate_ink_cache();
                 }
@@ -360,7 +363,11 @@ impl DesktopRuntime {
             }
             UiCommand::SelectPen => self.tools.tool = InkTool::Pen,
             UiCommand::SelectEraser => self.tools.tool = InkTool::RegionEraser,
-            UiCommand::CycleEraserSize => self.tools.cycle_eraser_size(),
+            UiCommand::CycleEraserSize => {
+                self.tools.cycle_eraser_size();
+                self.settings.tools.eraser_size = self.tools.eraser_size;
+                self.save_settings();
+            }
             UiCommand::SetColor(color) => {
                 self.tools.color = color;
                 self.settings.tools.color = color;
@@ -396,6 +403,7 @@ impl DesktopRuntime {
                     self.idle_panel = IdlePanel::Settings;
                     self.window_context
                         .set_idle_window_view(IdleWindowView::Settings);
+                    self.update_interface_zoom();
                 }
             }
             UiCommand::OpenSettingsDirectory => match self.settings_store.open_directory() {
@@ -410,6 +418,7 @@ impl DesktopRuntime {
                     self.idle_panel = IdlePanel::Toolbar;
                     self.window_context
                         .set_idle_window_view(IdleWindowView::Toolbar);
+                    self.update_interface_zoom();
                 }
             }
             UiCommand::ToggleQuickSettings => {
@@ -425,6 +434,7 @@ impl DesktopRuntime {
                         IdleWindowView::Toolbar
                     };
                     self.window_context.set_idle_window_view(window_view);
+                    self.update_interface_zoom();
                 }
             }
             UiCommand::BeginIdleToolbarDrag => {
@@ -443,6 +453,11 @@ impl DesktopRuntime {
                 if enabled {
                     let _ = self.slideshow_detector.request_resync();
                 }
+            }
+            UiCommand::SetLogLevel(level) => {
+                self.settings.log_level = level;
+                logging::set_level(level);
+                self.save_settings();
             }
             UiCommand::ToggleSlideshowToolbar => match self.state.mode() {
                 AppMode::SlideShowAnnotatingExpanded => {
@@ -501,6 +516,16 @@ impl DesktopRuntime {
             IdlePanel::QuickSettings => IdleWindowView::QuickSettings,
             IdlePanel::Settings => IdleWindowView::Settings,
         }
+    }
+
+    /// 在工具界面与完整设置页之间切换 egui 的全局显示缩放。
+    fn update_interface_zoom(&self) {
+        let zoom = if self.idle_panel == IdlePanel::Settings {
+            design_tokens::SETTINGS_ZOOM_FACTOR
+        } else {
+            design_tokens::TOOLBAR_ZOOM_FACTOR
+        };
+        self.compositor.egui_context().set_zoom_factor(zoom);
     }
 
     /// 仅在状态机仍有可控放映会话时向 COM STA 发送带会话标识的动作。
@@ -644,6 +669,7 @@ impl DesktopRuntime {
         self.active_gesture = None;
         self.input_router.cancel();
         self.idle_panel = IdlePanel::Toolbar;
+        self.update_interface_zoom();
         self.window_context.set_annotation_mode(annotation_enabled);
         self.compositor.invalidate_ink_cache();
     }

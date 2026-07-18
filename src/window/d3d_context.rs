@@ -68,7 +68,7 @@ pub enum DockSide {
 pub struct GraphicsDiagnostics {
     pub vendor: String,
     pub renderer: String,
-    pub version: String,
+    pub device_info: String,
     pub software_fallback: bool,
 }
 
@@ -195,7 +195,7 @@ impl D3DWindowContext {
         tracing::info!(
             vendor = diagnostics.vendor,
             renderer = diagnostics.renderer,
-            version = diagnostics.version,
+            device_info = diagnostics.device_info,
             software_fallback = diagnostics.software_fallback,
             alpha_mode = "premultiplied",
             swap_effect = "flip-sequential",
@@ -571,7 +571,7 @@ fn read_graphics_diagnostics(
     Ok(GraphicsDiagnostics {
         vendor: format!("PCI vendor 0x{:04X}", description.VendorId),
         renderer: String::from_utf16_lossy(&description.Description[..name_length]),
-        version: format!(
+        device_info: format!(
             "D3D12 / DirectComposition (device 0x{:04X})",
             description.DeviceId
         ),

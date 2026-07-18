@@ -2,6 +2,48 @@ use serde::{Deserialize, Serialize};
 
 use crate::ink::{EraserSize, InkColor, PenWidth};
 
+/// 可由用户保存并立即应用的 tracing 最大详细程度。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LogLevel {
+    Error,
+    Warn,
+    Info,
+    Debug,
+}
+
+impl LogLevel {
+    /// 返回设置页按稳定顺序展示的全部日志级别。
+    pub const ALL: [Self; 4] = [Self::Error, Self::Warn, Self::Info, Self::Debug];
+
+    /// 返回设置页使用的中文级别名称。
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Error => "错误",
+            Self::Warn => "警告",
+            Self::Info => "信息",
+            Self::Debug => "调试",
+        }
+    }
+
+    /// 返回用于构造 tracing `EnvFilter` 的全局指令。
+    pub const fn filter_directive(self) -> &'static str {
+        match self {
+            Self::Error => "error",
+            Self::Warn => "warn",
+            Self::Info => "info",
+            Self::Debug => "debug",
+        }
+    }
+}
+
+impl Default for LogLevel {
+    /// 返回兼顾常规诊断与文件体积的信息级默认值。
+    fn default() -> Self {
+        Self::Info
+    }
+}
+
 /// 可跨应用重启保存的默认工具偏好。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -28,6 +70,7 @@ impl Default for ToolPreferences {
 pub struct UserSettings {
     pub tools: ToolPreferences,
     pub slideshow_integration_enabled: bool,
+    pub log_level: LogLevel,
 }
 
 impl Default for UserSettings {
@@ -36,6 +79,7 @@ impl Default for UserSettings {
         Self {
             tools: ToolPreferences::default(),
             slideshow_integration_enabled: true,
+            log_level: LogLevel::default(),
         }
     }
 }

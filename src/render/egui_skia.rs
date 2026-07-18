@@ -107,7 +107,7 @@ impl EguiSkiaRenderer {
 
         let shapes = std::mem::take(&mut self.shapes);
         let primitives = self.context.tessellate(shapes, self.pixels_per_point);
-        self.paint_primitives(canvas, &primitives)?;
+        self.paint_primitives(canvas, primitives)?;
 
         for id in textures_delta.free.drain(..) {
             self.textures.remove(&id);
@@ -163,21 +163,25 @@ impl EguiSkiaRenderer {
     fn paint_primitives(
         &self,
         canvas: &Canvas,
-        primitives: &[ClippedPrimitive],
+        primitives: Vec<ClippedPrimitive>,
     ) -> Result<(), AppError> {
         let mut white_paint = Paint::default();
         white_paint.set_color(Color::WHITE);
 
-        for primitive in primitives {
-            let Primitive::Mesh(mesh) = &primitive.primitive else {
+        for ClippedPrimitive {
+            clip_rect: primitive_clip_rect,
+            primitive,
+        } in primitives
+        {
+            let Primitive::Mesh(mesh) = primitive else {
                 tracing::debug!("忽略未注册的 egui paint callback");
                 continue;
             };
             let clip_rect = Rect::new(
-                primitive.clip_rect.min.x,
-                primitive.clip_rect.min.y,
-                primitive.clip_rect.max.x,
-                primitive.clip_rect.max.y,
+                primitive_clip_rect.min.x,
+                primitive_clip_rect.min.y,
+                primitive_clip_rect.max.x,
+                primitive_clip_rect.max.y,
             );
             let clipped_canvas = skia_safe::AutoCanvasRestore::guard(canvas, true);
             clipped_canvas.set_matrix(M44::new_identity().set_scale(
@@ -188,7 +192,6 @@ impl EguiSkiaRenderer {
             clipped_canvas.clip_rect(clip_rect, ClipOp::Intersect, true);
 
             for mesh in mesh
-                .clone()
                 .split_to_u16()
                 .into_iter()
                 .flat_map(split_font_mesh_by_texture_usage)

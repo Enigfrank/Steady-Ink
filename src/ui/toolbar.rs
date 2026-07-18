@@ -13,6 +13,7 @@ use super::{
 use crate::{
     app::AppMode,
     ink::{EraserSize, InkColor, InkTool, PenWidth},
+    settings::LogLevel,
     slideshow::ComDiagnostics,
     window::{DockSide, GraphicsDiagnostics},
 };
@@ -38,6 +39,7 @@ pub enum UiCommand {
     BeginIdleToolbarDrag,
     SetDockSide(DockSide),
     SetSlideshowIntegrationEnabled(bool),
+    SetLogLevel(LogLevel),
     ToggleSlideshowToolbar,
     PreviousSlide,
     NextSlide,
@@ -63,6 +65,7 @@ pub struct UiViewState<'a> {
     pub dock_side: DockSide,
     pub tools: ToolState,
     pub slideshow_integration_enabled: bool,
+    pub log_level: LogLevel,
     pub slideshow_session_generation: Option<u64>,
     pub slide_page_numbers: Option<(u32, u32)>,
     pub slideshow_controls_enabled: bool,

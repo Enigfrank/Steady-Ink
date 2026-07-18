@@ -5,7 +5,10 @@ use super::{
     pixel_snap,
     toolbar::{ToolState, UiCommand, color32},
 };
-use crate::ink::{EraserSize, InkColor, PenWidth};
+use crate::{
+    ink::{EraserSize, InkColor, PenWidth},
+    settings::LogLevel,
+};
 
 const COLORS: [InkColor; 6] = [
     InkColor::Red,
@@ -78,6 +81,30 @@ pub fn render_tool_preferences(
     );
     let eraser_size_command = render_eraser_size_selector(ui, tools.eraser_size, metrics);
     color_command.or(pen_width_command).or(eraser_size_command)
+}
+
+/// 绘制四档日志级别的紧凑选择按钮，并返回当前帧的设置命令。
+pub(super) fn render_log_level_selector(
+    ui: &mut Ui,
+    selected: LogLevel,
+    metrics: InterfaceMetrics,
+) -> Option<UiCommand> {
+    section_label(ui, "日志级别", metrics);
+    let mut command = None;
+    ui.horizontal(|ui| {
+        for level in LogLevel::ALL {
+            if ui
+                .add_sized(
+                    Vec2::splat(metrics.touch_target),
+                    egui::Button::selectable(selected == level, level.label()),
+                )
+                .clicked()
+            {
+                command = Some(UiCommand::SetLogLevel(level));
+            }
+        }
+    });
+    command
 }
 
 /// 绘制固定快速颜色选择器，并返回用户选中的颜色命令。

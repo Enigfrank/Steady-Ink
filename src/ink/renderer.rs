@@ -297,9 +297,21 @@ fn interpolate_erase_sample(
         ),
         radius_x: previous.radius_x + (next.radius_x - previous.radius_x) * progress,
         radius_y: previous.radius_y + (next.radius_y - previous.radius_y) * progress,
-        rotation_radians: previous.rotation_radians
-            + (next.rotation_radians - previous.rotation_radians) * progress,
+        rotation_radians: interpolate_axis_rotation(
+            previous.rotation_radians,
+            next.rotation_radians,
+            progress,
+        ),
     }
+}
+
+/// 在椭圆轴等价的半周范围内沿最短方向插值旋转角度。
+fn interpolate_axis_rotation(previous: f32, next: f32, progress: f32) -> f32 {
+    let half_turn = std::f32::consts::PI;
+    let start = previous.rem_euclid(half_turn);
+    let end = next.rem_euclid(half_turn);
+    let delta = (end - start + half_turn / 2.0).rem_euclid(half_turn) - half_turn / 2.0;
+    (start + delta * progress).rem_euclid(half_turn)
 }
 
 /// 创建用于擦除透明墨迹的 Skia paint。
@@ -389,4 +401,37 @@ fn draw_erase_sample_outline(canvas: &Canvas, sample: EraseSample) {
         &paint,
     );
     canvas.restore_to_count(save_count);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 创建仅旋转角不同的椭圆采样。
+    fn sample(rotation_radians: f32) -> EraseSample {
+        EraseSample {
+            center: CanvasPoint::new(0.0, 0.0),
+            radius_x: 20.0,
+            radius_y: 12.0,
+            rotation_radians,
+        }
+    }
+
+    /// 验证跨过半周边界时沿椭圆轴的短路径插值。
+    #[test]
+    fn interpolated_rotation_crosses_half_turn_boundary_directly() {
+        let interpolated =
+            interpolate_erase_sample(sample(std::f32::consts::PI - 0.02), sample(0.02), 0.5);
+
+        assert!(interpolated.rotation_radians.abs() < 0.001);
+    }
+
+    /// 验证正常方向插值保留中间角度和半周归一化范围。
+    #[test]
+    fn interpolated_rotation_preserves_non_wrapping_midpoint() {
+        let interpolated = interpolate_erase_sample(sample(0.2), sample(0.6), 0.5);
+
+        assert!((interpolated.rotation_radians - 0.4).abs() < 0.001);
+        assert!((0.0..std::f32::consts::PI).contains(&interpolated.rotation_radians));
+    }
 }

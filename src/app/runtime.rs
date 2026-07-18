@@ -562,15 +562,15 @@ impl DesktopRuntime {
             if event.cancels_ui_pointer() {
                 self.compositor.cancel_egui_pointer();
             }
-            let ui_hit = event.position().is_some_and(|position| {
-                let scale_factor = self.window_context.window().scale_factor() as f32;
-                let logical_position =
-                    egui::pos2(position.x / scale_factor, position.y / scale_factor);
-                self.compositor
-                    .egui_context()
-                    .layer_id_at(logical_position)
-                    .is_some()
-            });
+            let ui_hit = {
+                let egui_context = self.compositor.egui_context();
+                event
+                    .position()
+                    .and_then(|position| {
+                        egui_position_from_physical(position, egui_context.pixels_per_point())
+                    })
+                    .is_some_and(|position| egui_context.layer_id_at(position).is_some())
+            };
             if let Some(action) = self.input_router.route_windows_pointer(
                 event,
                 ui_hit,
@@ -692,6 +692,12 @@ fn window_drag_finished(event: &WindowEvent) -> bool {
             ..
         })
     )
+}
+
+/// 把原生物理像素坐标换算为包含 egui zoom 的点坐标。
+fn egui_position_from_physical(position: CanvasPoint, pixels_per_point: f32) -> Option<egui::Pos2> {
+    (pixels_per_point.is_finite() && pixels_per_point > 0.0)
+        .then(|| egui::pos2(position.x / pixels_per_point, position.y / pixels_per_point))
 }
 
 /// winit ApplicationHandler，保证空闲时使用 Wait/WaitUntil 而非持续轮询。
@@ -888,4 +894,25 @@ pub fn run() -> Result<(), AppError> {
     let mut application = DesktopApplication::new(proxy, windows_pointer_receiver);
     event_loop.run_app(&mut application)?;
     application.startup_error.map_or(Ok(()), Err)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 验证原生物理坐标使用 egui 的完整像素比例换算。
+    #[test]
+    fn physical_position_uses_egui_pixels_per_point() {
+        let position = egui_position_from_physical(CanvasPoint::new(1_600.0, 800.0), 1.6)
+            .expect("valid pixels-per-point must convert the position");
+
+        assert_eq!(position, egui::pos2(1_000.0, 500.0));
+    }
+
+    /// 验证无效 egui 像素比例不会产生错误的 UI 命中坐标。
+    #[test]
+    fn invalid_pixels_per_point_has_no_egui_position() {
+        assert!(egui_position_from_physical(CanvasPoint::new(1.0, 1.0), 0.0).is_none());
+        assert!(egui_position_from_physical(CanvasPoint::new(1.0, 1.0), f32::NAN).is_none());
+    }
 }

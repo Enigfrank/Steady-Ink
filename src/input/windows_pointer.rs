@@ -46,6 +46,10 @@ pub enum WindowsPointerEvent {
     },
     CandidateRejected {
         points: Vec<CanvasPoint>,
+        session_ended: bool,
+    },
+    CandidateCancelled {
+        session_ended: bool,
     },
 }
 
@@ -57,7 +61,8 @@ impl WindowsPointerEvent {
             Self::PalmCandidate { point } => Some(*point),
             Self::PalmSupport { point } => *point,
             Self::PalmErase { sample, .. } => Some(sample.center),
-            Self::CandidateRejected { points } => points.last().copied(),
+            Self::CandidateRejected { points, .. } => points.last().copied(),
+            Self::CandidateCancelled { .. } => None,
         }
     }
 
@@ -166,6 +171,10 @@ impl WindowsPointerTracker {
 
     /// 分类触摸接触，并在确认手掌时输出动态椭圆擦除采样。
     fn handle_touch_message(&mut self, pointer_id: u32, message: &MSG) -> WindowsPointerDispatch {
+        if message.message == WM_POINTERLEAVE {
+            return self.leave_touch(pointer_id);
+        }
+
         let now = Instant::now();
         let touch = read_touch_contact(pointer_id, message.hwnd, now);
         if let Some(touch) = touch {
@@ -241,24 +250,7 @@ impl WindowsPointerTracker {
     /// 完成普通、候选或已确认手掌接触。
     fn finish_touch(&mut self, pointer_id: u32) -> WindowsPointerDispatch {
         if self.palm_ids.contains(&pointer_id) {
-            let sample = self.palm_sample();
-            self.remove_touch(pointer_id);
-            let ended = self.palm_ids.is_empty();
-            if ended {
-                self.palm_started = false;
-                self.candidate_ids.clear();
-            }
-            return WindowsPointerDispatch {
-                event: sample.map(|sample| WindowsPointerEvent::PalmErase {
-                    phase: if ended {
-                        PalmErasePhase::End
-                    } else {
-                        PalmErasePhase::Move
-                    },
-                    sample,
-                }),
-                swallow_winit: true,
-            };
+            return self.finish_palm_touch(pointer_id);
         }
 
         if self.candidate_ids.contains(&pointer_id) {
@@ -269,7 +261,10 @@ impl WindowsPointerTracker {
                 .unwrap_or_default();
             self.remove_touch(pointer_id);
             return WindowsPointerDispatch {
-                event: Some(WindowsPointerEvent::CandidateRejected { points }),
+                event: Some(WindowsPointerEvent::CandidateRejected {
+                    points,
+                    session_ended: self.candidate_ids.is_empty(),
+                }),
                 swallow_winit: true,
             };
         }
@@ -278,6 +273,51 @@ impl WindowsPointerTracker {
         WindowsPointerDispatch {
             event: None,
             swallow_winit: false,
+        }
+    }
+
+    /// 在指针离开窗口时终止 tracker 状态，避免把候选或手掌遗留到下一次接触。
+    fn leave_touch(&mut self, pointer_id: u32) -> WindowsPointerDispatch {
+        if self.palm_ids.contains(&pointer_id) {
+            return self.finish_palm_touch(pointer_id);
+        }
+
+        if self.candidate_ids.contains(&pointer_id) {
+            self.remove_touch(pointer_id);
+            return WindowsPointerDispatch {
+                event: Some(WindowsPointerEvent::CandidateCancelled {
+                    session_ended: self.candidate_ids.is_empty(),
+                }),
+                swallow_winit: true,
+            };
+        }
+
+        self.remove_touch(pointer_id);
+        WindowsPointerDispatch {
+            event: None,
+            swallow_winit: false,
+        }
+    }
+
+    /// 从已确认手掌移除一个接触，并在最后一个接触结束时提交擦除会话。
+    fn finish_palm_touch(&mut self, pointer_id: u32) -> WindowsPointerDispatch {
+        let sample = self.palm_sample();
+        self.remove_touch(pointer_id);
+        let ended = self.palm_ids.is_empty();
+        if ended {
+            self.palm_started = false;
+            self.candidate_ids.clear();
+        }
+        WindowsPointerDispatch {
+            event: sample.map(|sample| WindowsPointerEvent::PalmErase {
+                phase: if ended {
+                    PalmErasePhase::End
+                } else {
+                    PalmErasePhase::Move
+                },
+                sample,
+            }),
+            swallow_winit: true,
         }
     }
 
@@ -560,4 +600,100 @@ const fn is_pointer_message(message: u32) -> bool {
             | WM_POINTERLEAVE
             | WM_POINTERCAPTURECHANGED
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Instant;
+
+    use super::*;
+
+    /// 创建不依赖 Windows API 的已跟踪触摸接触。
+    fn touch_contact() -> TouchContact {
+        TouchContact::new(
+            CanvasPoint::new(100.0, 120.0),
+            ContactGeometry {
+                left: 80.0,
+                top: 90.0,
+                right: 120.0,
+                bottom: 150.0,
+                rotation_radians: 0.0,
+            },
+            true,
+            Instant::now(),
+        )
+    }
+
+    /// 验证候选手掌离开窗口时只清理状态，不提交缓冲普通笔画。
+    #[test]
+    fn leaving_candidate_cancels_without_buffered_stroke() {
+        let mut tracker = WindowsPointerTracker::default();
+        tracker.touches.insert(7, touch_contact());
+        tracker.candidate_ids.insert(7);
+
+        let dispatch = tracker.leave_touch(7);
+
+        assert!(matches!(
+            dispatch.event,
+            Some(WindowsPointerEvent::CandidateCancelled {
+                session_ended: true
+            })
+        ));
+        assert!(dispatch.swallow_winit);
+        assert!(tracker.touches.is_empty());
+        assert!(tracker.candidate_ids.is_empty());
+        assert!(tracker.palm_ids.is_empty());
+    }
+
+    /// 验证候选簇仅在最后一个触点离开后才结束路由会话。
+    #[test]
+    fn leaving_one_candidate_preserves_the_remaining_session() {
+        let mut tracker = WindowsPointerTracker::default();
+        tracker.touches.insert(7, touch_contact());
+        tracker.touches.insert(8, touch_contact());
+        tracker.candidate_ids.extend([7, 8]);
+
+        let first_dispatch = tracker.leave_touch(7);
+        let second_dispatch = tracker.leave_touch(8);
+
+        assert!(matches!(
+            first_dispatch.event,
+            Some(WindowsPointerEvent::CandidateCancelled {
+                session_ended: false
+            })
+        ));
+        assert!(matches!(
+            second_dispatch.event,
+            Some(WindowsPointerEvent::CandidateCancelled {
+                session_ended: true
+            })
+        ));
+        assert!(tracker.touches.is_empty());
+        assert!(tracker.candidate_ids.is_empty());
+    }
+
+    /// 验证最后一个已确认手掌离开窗口时发出擦除结束并清理所有集合。
+    #[test]
+    fn leaving_last_palm_ends_erase_session() {
+        let mut tracker = WindowsPointerTracker::default();
+        tracker.touches.insert(7, touch_contact());
+        tracker.candidate_ids.insert(7);
+        tracker.palm_ids.insert(7);
+        tracker.palm_started = true;
+
+        let dispatch = tracker.leave_touch(7);
+
+        assert!(matches!(
+            dispatch.event,
+            Some(WindowsPointerEvent::PalmErase {
+                phase: PalmErasePhase::End,
+                ..
+            })
+        ));
+        assert!(dispatch.swallow_winit);
+        assert!(tracker.touches.is_empty());
+        assert!(tracker.candidate_ids.is_empty());
+        assert!(tracker.palm_ids.is_empty());
+        assert!(!tracker.palm_started);
+    }
 }

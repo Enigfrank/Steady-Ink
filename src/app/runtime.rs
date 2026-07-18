@@ -148,6 +148,7 @@ struct DesktopRuntime {
     slideshow_control_error: Option<String>,
     dismiss_slideshow_confirmation: bool,
     idle_window_dragging: bool,
+    slideshow_session_generation: u64,
 }
 
 impl DesktopRuntime {
@@ -197,6 +198,7 @@ impl DesktopRuntime {
             slideshow_control_error: None,
             dismiss_slideshow_confirmation: false,
             idle_window_dragging: false,
+            slideshow_session_generation: 0,
         })
     }
 
@@ -308,6 +310,10 @@ impl DesktopRuntime {
             dock_side: self.window_context.dock_side(),
             tools,
             slideshow_integration_enabled: self.settings.slideshow_integration_enabled,
+            slideshow_session_generation: self
+                .state
+                .slideshow_session()
+                .map(|_| self.slideshow_session_generation),
             slide_page_numbers,
             slideshow_controls_enabled,
             dismiss_slideshow_confirmation: self.dismiss_slideshow_confirmation,
@@ -573,7 +579,12 @@ impl DesktopRuntime {
                         self.state.change_slide(&key, page)
                     }
                 } else {
-                    self.state.start_slideshow(SlideShowSession::new(key, page))
+                    let changed = self.state.start_slideshow(SlideShowSession::new(key, page));
+                    if changed {
+                        self.slideshow_session_generation =
+                            self.slideshow_session_generation.wrapping_add(1);
+                    }
+                    changed
                 };
                 if changed {
                     self.prepare_annotation_transition(true);

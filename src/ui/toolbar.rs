@@ -63,6 +63,7 @@ pub struct UiViewState<'a> {
     pub dock_side: DockSide,
     pub tools: ToolState,
     pub slideshow_integration_enabled: bool,
+    pub slideshow_session_generation: Option<u64>,
     pub slide_page_numbers: Option<(u32, u32)>,
     pub slideshow_controls_enabled: bool,
     pub dismiss_slideshow_confirmation: bool,

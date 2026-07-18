@@ -12,6 +12,32 @@ use crate::{app::AppMode, window::DockSide};
 
 const BODY_BUTTON_COUNT: f32 = 8.0;
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SlideshowToolbarState {
+    toggle_position: Pos2,
+    session_generation: u64,
+    viewport_size: Vec2,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExpansionDirection {
+    Left,
+    Right,
+}
+
+#[derive(Debug, Default)]
+struct ToggleInteraction {
+    command: Option<UiCommand>,
+    drag_delta: Vec2,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ToolbarPlacement {
+    origin: Pos2,
+    body_width: f32,
+    direction: ExpansionDirection,
+}
+
 /// 绘制放映态双侧翻页组、底部胶囊工具栏和可选退出确认框。
 pub fn render(context: &Context, view: UiViewState<'_>) -> Option<UiCommand> {
     let mut command = None;
@@ -138,9 +164,46 @@ fn render_bottom_toolbar(context: &Context, view: UiViewState<'_>) -> Option<UiC
     let toggle_width = toolbar_outer_height();
     let overlap = tokens::SPACE_2;
     let full_width = toggle_width + body_width - overlap;
-    let toggle_left = screen.center().x - full_width / 2.0;
-    let toolbar_top = bottom_toolbar_top(screen);
-    let body_origin_x = toggle_left + toggle_width - overlap;
+    let session_generation = view.slideshow_session_generation.unwrap_or_default();
+    let state_id = Id::new("slideshow_toolbar_state");
+    let mut state = context.data_mut(|data| {
+        data.get_temp::<SlideshowToolbarState>(state_id)
+            .filter(|state| state.session_generation == session_generation)
+            .unwrap_or_else(|| SlideshowToolbarState {
+                toggle_position: Pos2::new(
+                    screen.center().x - full_width / 2.0,
+                    bottom_toolbar_top(screen),
+                ),
+                session_generation,
+                viewport_size: screen.size(),
+            })
+    });
+    if state.viewport_size != screen.size() {
+        state.toggle_position =
+            constrain_toggle_position(state.toggle_position, screen, Vec2::splat(toggle_width));
+    }
+    state.viewport_size = screen.size();
+    let direction = expansion_direction(
+        screen,
+        state.toggle_position,
+        body_width,
+        toggle_width,
+        overlap,
+    );
+    let placement = ToolbarPlacement {
+        origin: match direction {
+            ExpansionDirection::Right => Pos2::new(
+                state.toggle_position.x + toggle_width - overlap,
+                state.toggle_position.y,
+            ),
+            ExpansionDirection::Left => Pos2::new(
+                state.toggle_position.x - body_width + overlap,
+                state.toggle_position.y,
+            ),
+        },
+        body_width,
+        direction,
+    };
     let expanded = view.mode != AppMode::SlideShowAnnotatingCollapsed;
     let progress = context.animate_bool_with_time(
         Id::new("slideshow_toolbar_expanded_animation"),
@@ -148,17 +211,13 @@ fn render_bottom_toolbar(context: &Context, view: UiViewState<'_>) -> Option<UiC
         tokens::SLIDESHOW_TOOLBAR_ANIMATION_SECONDS,
     );
 
-    let mut command = render_toolbar_body(
-        context,
-        view,
-        Pos2::new(body_origin_x, toolbar_top),
-        body_width,
-        progress,
-    );
-    keep_first(
-        &mut command,
-        render_toolbar_toggle(context, view, Pos2::new(toggle_left, toolbar_top), expanded),
-    );
+    let mut command = render_toolbar_body(context, view, placement, progress);
+    let toggle_interaction = render_toolbar_toggle(context, view, state.toggle_position, expanded);
+    state.toggle_position += toggle_interaction.drag_delta;
+    state.toggle_position =
+        constrain_toggle_position(state.toggle_position, screen, Vec2::splat(toggle_width));
+    keep_first(&mut command, toggle_interaction.command);
+    context.data_mut(|data| data.insert_temp(state_id, state));
     command
 }
 
@@ -166,24 +225,39 @@ fn render_bottom_toolbar(context: &Context, view: UiViewState<'_>) -> Option<UiC
 fn render_toolbar_body(
     context: &Context,
     view: UiViewState<'_>,
-    origin: Pos2,
-    body_width: f32,
+    placement: ToolbarPlacement,
     progress: f32,
 ) -> Option<UiCommand> {
     if progress <= f32::EPSILON {
         return None;
     }
 
-    let animated_left = origin.x - body_width * (1.0 - progress);
-    let animated_right = origin.x + body_width * progress;
-    let clip_rect = Rect::from_min_max(
-        origin,
-        Pos2::new(animated_right, origin.y + toolbar_outer_height()),
-    );
+    let (animated_left, clip_rect) = match placement.direction {
+        ExpansionDirection::Right => (
+            placement.origin.x - placement.body_width * (1.0 - progress),
+            Rect::from_min_max(
+                placement.origin,
+                Pos2::new(
+                    placement.origin.x + placement.body_width * progress,
+                    placement.origin.y + toolbar_outer_height(),
+                ),
+            ),
+        ),
+        ExpansionDirection::Left => (
+            placement.origin.x + placement.body_width * (1.0 - progress),
+            Rect::from_min_max(
+                placement.origin,
+                Pos2::new(
+                    placement.origin.x + placement.body_width,
+                    placement.origin.y + toolbar_outer_height(),
+                ),
+            ),
+        ),
+    };
     let body_interactive = progress >= 1.0 - f32::EPSILON;
 
     Area::new("slideshow_toolbar_body".into())
-        .fixed_pos(Pos2::new(animated_left, origin.y))
+        .fixed_pos(Pos2::new(animated_left, placement.origin.y))
         .order(Order::Middle)
         .interactable(body_interactive)
         .show(context, |ui| {
@@ -247,7 +321,7 @@ fn render_toolbar_toggle(
     view: UiViewState<'_>,
     position: Pos2,
     expanded: bool,
-) -> Option<UiCommand> {
+) -> ToggleInteraction {
     Area::new("slideshow_toolbar_toggle".into())
         .fixed_pos(position)
         .order(Order::Foreground)
@@ -260,21 +334,59 @@ fn render_toolbar_toggle(
                     .corner_radius(CornerRadius::same(tokens::CAPSULE_RADIUS))
                     .inner_margin(Margin::same(tokens::MARGIN_SPACE_2)),
                 |ui| {
-                    ui.add_enabled_ui(view.mode != AppMode::SlideShowConnectionLost, |ui| {
-                        let (label, icon) = if expanded {
-                            ("收缩", Icon::Collapse)
-                        } else {
-                            ("展开", Icon::Expand)
-                        };
-                        icon_button(ui, label, icon, false, None).clicked()
-                    })
-                    .inner
-                    .then_some(UiCommand::ToggleSlideshowToolbar)
+                    let response = ui
+                        .add_enabled_ui(view.mode != AppMode::SlideShowConnectionLost, |ui| {
+                            let (label, icon) = if expanded {
+                                ("收缩", Icon::Collapse)
+                            } else {
+                                ("展开", Icon::Expand)
+                            };
+                            icon_button(ui, label, icon, false, None)
+                        })
+                        .inner;
+                    ToggleInteraction {
+                        command: response
+                            .clicked()
+                            .then_some(UiCommand::ToggleSlideshowToolbar),
+                        drag_delta: response.drag_delta(),
+                    }
                 },
             )
             .inner
         })
         .inner
+}
+
+/// 约束收缩/展开按钮完整留在当前可见视口内。
+fn constrain_toggle_position(position: Pos2, screen: Rect, toggle_size: Vec2) -> Pos2 {
+    Pos2::new(
+        position.x.clamp(
+            screen.left(),
+            (screen.right() - toggle_size.x).max(screen.left()),
+        ),
+        position.y.clamp(
+            screen.top(),
+            (screen.bottom() - toggle_size.y).max(screen.top()),
+        ),
+    )
+}
+
+/// 根据按钮两侧空间选择工具栏主体展开方向，优先保持向右展开。
+fn expansion_direction(
+    screen: Rect,
+    toggle_position: Pos2,
+    body_width: f32,
+    toggle_width: f32,
+    overlap: f32,
+) -> ExpansionDirection {
+    let required_width = body_width - overlap;
+    let right_space = screen.right() - (toggle_position.x + toggle_width - overlap);
+    let left_space = toggle_position.x + overlap - screen.left();
+    if right_space >= required_width || right_space >= left_space {
+        ExpansionDirection::Right
+    } else {
+        ExpansionDirection::Left
+    }
 }
 
 /// 在断线降级态工具栏上方显示简短状态，不占用底部工具按钮宽度。

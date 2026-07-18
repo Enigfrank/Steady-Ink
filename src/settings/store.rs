@@ -12,6 +12,7 @@ use super::UserSettings;
 
 const SETTINGS_DIRECTORY: &str = "Steady-Ink";
 const SETTINGS_FILE: &str = "settings.toml";
+const LOGS_DIRECTORY: &str = "logs";
 
 /// 管理当前 Windows 用户的 TOML 偏好文件，不接触任何墨迹数据。
 pub struct SettingsStore {
@@ -75,6 +76,19 @@ impl SettingsStore {
             AppError::Settings(format!("创建 {} 失败: {error}", directory.display()))
         })?;
         Ok(directory)
+    }
+
+    /// 创建配置目录下的日志目录，并返回其稳定路径。
+    pub fn ensure_logs_directory(&self) -> Result<PathBuf, AppError> {
+        let directory = self.ensure_directory()?.to_owned();
+        let logs_directory = directory.join(LOGS_DIRECTORY);
+        fs::create_dir_all(&logs_directory).map_err(|error| {
+            AppError::Settings(format!(
+                "创建日志目录 {} 失败: {error}",
+                logs_directory.display()
+            ))
+        })?;
+        Ok(logs_directory)
     }
 
     /// 确保配置目录存在后，通过 Windows 文件资源管理器打开该目录。

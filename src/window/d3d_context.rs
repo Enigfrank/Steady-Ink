@@ -42,7 +42,7 @@ pub(crate) const IDLE_WIDTH_POINTS: f64 = scale_window_points(88.0);
 pub(crate) const IDLE_HEIGHT_POINTS: f64 = scale_window_points(248.0);
 // 额外保留一个缩放后的基础网格，容纳双卡片边框和 egui 横向布局舍入。
 pub(crate) const QUICK_SETTINGS_WIDTH_POINTS: f64 = scale_window_points(544.0 + 4.0);
-pub(crate) const QUICK_SETTINGS_HEIGHT_POINTS: f64 = scale_window_points(336.0);
+pub(crate) const QUICK_SETTINGS_HEIGHT_POINTS: f64 = scale_window_points(420.0);
 pub(crate) const SETTINGS_WIDTH_POINTS: f64 = 560.0;
 pub(crate) const SETTINGS_HEIGHT_POINTS: f64 = 640.0;
 const EDGE_MARGIN_POINTS: f64 = scale_window_points(16.0);

@@ -17,18 +17,20 @@ pub fn configure_context(context: &egui::Context) {
     context.set_theme(egui::Theme::Light);
     context.set_zoom_factor(design_tokens::TOOLBAR_ZOOM_FACTOR);
     let mut style = (*context.style_of(egui::Theme::Light)).clone();
+    let floating = design_tokens::material_palette(false, design_tokens::MaterialRole::Floating);
+    let control = design_tokens::material_palette(false, design_tokens::MaterialRole::Control);
     style.spacing.window_margin = egui::Margin::same(design_tokens::MARGIN_SPACE_2);
     style.spacing.menu_margin = egui::Margin::same(design_tokens::MARGIN_SPACE_2);
     style.spacing.item_spacing = egui::vec2(design_tokens::SPACE_2, design_tokens::SPACE_2);
     style.spacing.button_padding = egui::vec2(design_tokens::SPACE_2, design_tokens::SPACE_1);
-    style.visuals.window_fill = design_tokens::COLOR_BACKGROUND;
-    style.visuals.window_stroke = egui::Stroke::new(1.0, design_tokens::COLOR_BORDER);
+    style.visuals.window_fill = floating.fill;
+    style.visuals.window_stroke = egui::Stroke::new(1.0, floating.border);
     style.visuals.panel_fill = egui::Color32::TRANSPARENT;
-    style.visuals.widgets.noninteractive.bg_fill = design_tokens::COLOR_SURFACE;
-    style.visuals.widgets.inactive.bg_fill = design_tokens::COLOR_SURFACE;
-    style.visuals.widgets.hovered.bg_fill = design_tokens::COLOR_HOVER;
-    style.visuals.widgets.active.bg_fill = design_tokens::COLOR_SELECTED;
-    style.visuals.widgets.open.bg_fill = design_tokens::COLOR_SELECTED;
+    style.visuals.widgets.noninteractive.bg_fill = control.fill;
+    style.visuals.widgets.inactive.bg_fill = control.fill;
+    style.visuals.widgets.hovered.bg_fill = control.hover;
+    style.visuals.widgets.active.bg_fill = control.pressed;
+    style.visuals.widgets.open.bg_fill = control.selected;
     style.visuals.override_text_color = Some(design_tokens::COLOR_TEXT_PRIMARY);
     context.set_style_of(egui::Theme::Light, style);
 }

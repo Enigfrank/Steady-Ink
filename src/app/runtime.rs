@@ -312,6 +312,7 @@ impl DesktopRuntime {
             tools,
             slideshow_integration_enabled: self.settings.slideshow_integration_enabled,
             log_level: self.settings.log_level,
+            readable_mode: self.settings.readable_mode,
             slideshow_session_generation: self
                 .state
                 .slideshow_session()
@@ -457,6 +458,10 @@ impl DesktopRuntime {
             UiCommand::SetLogLevel(level) => {
                 self.settings.log_level = level;
                 logging::set_level(level);
+                self.save_settings();
+            }
+            UiCommand::SetReadableMode(enabled) => {
+                self.settings.readable_mode = enabled;
                 self.save_settings();
             }
             UiCommand::ToggleSlideshowToolbar => match self.state.mode() {

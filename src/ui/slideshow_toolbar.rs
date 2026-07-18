@@ -1,6 +1,6 @@
 use egui::{
-    Align2, Area, Context, CornerRadius, FontId, Frame, Id, Margin, Order, Pos2, Rect, RectAlign,
-    Sense, Stroke, Ui, Vec2,
+    Align2, Area, Context, CornerRadius, FontId, Id, Margin, Order, Pos2, Rect, RectAlign, Sense,
+    Stroke, Ui, Vec2,
 };
 
 use super::{
@@ -53,9 +53,12 @@ pub fn render(context: &Context, view: UiViewState<'_>) -> Option<UiCommand> {
 
     if view.mode == AppMode::SlideShowConnectionLost {
         if view.dismiss_slideshow_confirmation {
-            keep_first(&mut command, render_dismiss_confirmation(context));
+            keep_first(
+                &mut command,
+                render_dismiss_confirmation(context, view.readable_mode),
+            );
         } else {
-            render_connection_status(context);
+            render_connection_status(context, view.readable_mode);
         }
     }
 
@@ -83,22 +86,41 @@ fn render_navigation_group(
         .show(context, |ui| {
             pixel_snap::show_pixel_aligned_frame(
                 ui,
-                Frame::new()
-                    .fill(tokens::COLOR_BACKGROUND)
-                    .stroke(Stroke::new(1.0, tokens::COLOR_BORDER))
-                    .corner_radius(CornerRadius::same(tokens::CAPSULE_RADIUS))
-                    .inner_margin(Margin::same(tokens::MARGIN_SPACE_2)),
+                tokens::material_frame(
+                    view.readable_mode,
+                    tokens::MaterialRole::Floating,
+                    CornerRadius::same(tokens::CAPSULE_RADIUS),
+                    Margin::same(tokens::MARGIN_SPACE_2),
+                ),
                 |ui| {
                     ui.add_enabled_ui(view.slideshow_controls_enabled, |ui| {
                         ui.horizontal(|ui| {
                             let mut command = None;
-                            if icon_button(ui, "上一页", Icon::Previous, false, None).clicked() {
+                            if icon_button(
+                                ui,
+                                "上一页",
+                                Icon::Previous,
+                                false,
+                                None,
+                                view.readable_mode,
+                            )
+                            .clicked()
+                            {
                                 command = Some(UiCommand::PreviousSlide);
                             }
                             if let Some((current, total)) = view.slide_page_numbers {
-                                render_page_number(ui, current, total);
+                                render_page_number(ui, current, total, view.readable_mode);
                             }
-                            if icon_button(ui, "下一页", Icon::Next, false, None).clicked() {
+                            if icon_button(
+                                ui,
+                                "下一页",
+                                Icon::Next,
+                                false,
+                                None,
+                                view.readable_mode,
+                            )
+                            .clicked()
+                            {
                                 command = Some(UiCommand::NextSlide);
                             }
                             command
@@ -130,19 +152,20 @@ fn navigation_placement(side: DockSide) -> (Id, Align2, Vec2) {
 }
 
 /// 绘制仅在页码可靠时出现的页码区域，不为未知页码预留空白宽度。
-fn render_page_number(ui: &mut Ui, current: u32, total: u32) {
+fn render_page_number(ui: &mut Ui, current: u32, total: u32, readable_mode: bool) {
     let size = Vec2::new(tokens::PAGE_NUMBER_WIDTH, tokens::TOUCH_TARGET);
     let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
     if !ui.is_rect_visible(rect) {
         return;
     }
 
+    let palette = tokens::material_palette(readable_mode, tokens::MaterialRole::Control);
     pixel_snap::paint_pixel_aligned_rect(
         ui,
         rect,
         CornerRadius::same(tokens::BUTTON_RADIUS),
-        tokens::COLOR_SURFACE,
-        Stroke::new(1.0, tokens::COLOR_BORDER),
+        palette.selected,
+        Stroke::new(1.0, palette.selected_border),
     );
     ui.painter().text(
         rect.center(),
@@ -254,21 +277,20 @@ fn render_toolbar_body(
             ),
         ),
     };
-    let body_interactive = progress >= 1.0 - f32::EPSILON;
-
     Area::new("slideshow_toolbar_body".into())
         .fixed_pos(Pos2::new(animated_left, placement.origin.y))
         .order(Order::Middle)
-        .interactable(body_interactive)
+        .interactable(true)
         .show(context, |ui| {
             ui.set_clip_rect(ui.clip_rect().intersect(clip_rect));
             pixel_snap::show_pixel_aligned_frame(
                 ui,
-                Frame::new()
-                    .fill(tokens::COLOR_BACKGROUND)
-                    .stroke(Stroke::new(1.0, tokens::COLOR_BORDER))
-                    .corner_radius(CornerRadius::same(tokens::CAPSULE_RADIUS))
-                    .inner_margin(Margin::same(tokens::MARGIN_SPACE_2)),
+                tokens::material_frame(
+                    view.readable_mode,
+                    tokens::MaterialRole::Floating,
+                    CornerRadius::same(tokens::CAPSULE_RADIUS),
+                    Margin::same(tokens::MARGIN_SPACE_2),
+                ),
                 |ui| {
                     ui.set_min_width(toolbar_body_content_width());
                     ui.set_max_width(toolbar_body_content_width());
@@ -278,9 +300,10 @@ fn render_toolbar_body(
                             view.tools,
                             RectAlign::TOP_START,
                             SelectorOrientation::Horizontal,
-                            false,
+                            view.readable_mode,
                         );
                         let mut command = interaction.command;
+                        ui.add_space(tokens::SPACE_2);
                         let (exit_label, exit_enabled, requested_command) =
                             if view.mode == AppMode::SlideShowConnectionLost {
                                 ("退出批注", true, UiCommand::RequestDismissSlideshow)
@@ -294,7 +317,15 @@ fn render_toolbar_body(
                         let exit_clicked = ui
                             .push_id("slideshow_exit_action", |ui| {
                                 ui.add_enabled_ui(exit_enabled, |ui| {
-                                    icon_button(ui, exit_label, Icon::Exit, false, None).clicked()
+                                    icon_button(
+                                        ui,
+                                        exit_label,
+                                        Icon::Exit,
+                                        false,
+                                        None,
+                                        view.readable_mode,
+                                    )
+                                    .clicked()
                                 })
                                 .inner
                             })
@@ -328,11 +359,12 @@ fn render_toolbar_toggle(
         .show(context, |ui| {
             pixel_snap::show_pixel_aligned_frame(
                 ui,
-                Frame::new()
-                    .fill(tokens::COLOR_BACKGROUND)
-                    .stroke(Stroke::new(1.0, tokens::COLOR_BORDER))
-                    .corner_radius(CornerRadius::same(tokens::CAPSULE_RADIUS))
-                    .inner_margin(Margin::same(tokens::MARGIN_SPACE_2)),
+                tokens::material_frame(
+                    view.readable_mode,
+                    tokens::MaterialRole::Floating,
+                    CornerRadius::same(tokens::CAPSULE_RADIUS),
+                    Margin::same(tokens::MARGIN_SPACE_2),
+                ),
                 |ui| {
                     let response = ui
                         .add_enabled_ui(view.mode != AppMode::SlideShowConnectionLost, |ui| {
@@ -341,7 +373,7 @@ fn render_toolbar_toggle(
                             } else {
                                 ("展开", Icon::Expand)
                             };
-                            icon_button(ui, label, icon, false, None)
+                            icon_button(ui, label, icon, false, None, view.readable_mode)
                         })
                         .inner;
                     ToggleInteraction {
@@ -390,7 +422,7 @@ fn expansion_direction(
 }
 
 /// 在断线降级态工具栏上方显示简短状态，不占用底部工具按钮宽度。
-fn render_connection_status(context: &Context) {
+fn render_connection_status(context: &Context, readable_mode: bool) {
     Area::new("slideshow_connection_status".into())
         .anchor(
             Align2::CENTER_BOTTOM,
@@ -401,14 +433,13 @@ fn render_connection_status(context: &Context) {
         .show(context, |ui| {
             pixel_snap::show_pixel_aligned_frame(
                 ui,
-                Frame::new()
-                    .fill(tokens::COLOR_SURFACE)
-                    .stroke(Stroke::new(1.0, tokens::COLOR_ERROR_SURFACE))
-                    .corner_radius(CornerRadius::same(tokens::CARD_RADIUS))
-                    .inner_margin(Margin::symmetric(
-                        tokens::MARGIN_SPACE_4,
-                        tokens::MARGIN_SPACE_2,
-                    )),
+                tokens::material_frame(
+                    readable_mode,
+                    tokens::MaterialRole::Popover,
+                    CornerRadius::same(tokens::CARD_RADIUS),
+                    Margin::symmetric(tokens::MARGIN_SPACE_4, tokens::MARGIN_SPACE_2),
+                )
+                .stroke(Stroke::new(1.0, tokens::COLOR_ERROR_SURFACE)),
                 |ui| {
                     ui.label(
                         egui::RichText::new("演示连接中断")
@@ -421,7 +452,7 @@ fn render_connection_status(context: &Context) {
 }
 
 /// 绘制退出本地批注的紧凑确认框，确认不会调用 COM 或发送模拟按键。
-fn render_dismiss_confirmation(context: &Context) -> Option<UiCommand> {
+fn render_dismiss_confirmation(context: &Context, readable_mode: bool) -> Option<UiCommand> {
     Area::new("slideshow_dismiss_confirmation".into())
         .anchor(
             Align2::CENTER_BOTTOM,
@@ -431,11 +462,12 @@ fn render_dismiss_confirmation(context: &Context) -> Option<UiCommand> {
         .show(context, |ui| {
             pixel_snap::show_pixel_aligned_frame(
                 ui,
-                Frame::new()
-                    .fill(tokens::COLOR_SURFACE)
-                    .stroke(Stroke::new(1.0, tokens::COLOR_BORDER))
-                    .corner_radius(CornerRadius::same(tokens::CARD_RADIUS))
-                    .inner_margin(Margin::same(tokens::MARGIN_SPACE_2)),
+                tokens::material_frame(
+                    readable_mode,
+                    tokens::MaterialRole::Popover,
+                    CornerRadius::same(tokens::CARD_RADIUS),
+                    Margin::same(tokens::MARGIN_SPACE_2),
+                ),
                 |ui| {
                     ui.vertical_centered(|ui| {
                         ui.label(
@@ -444,10 +476,14 @@ fn render_dismiss_confirmation(context: &Context) -> Option<UiCommand> {
                                 .color(tokens::COLOR_TEXT_PRIMARY),
                         );
                         ui.horizontal(|ui| {
-                            if icon_button(ui, "取消", Icon::Cancel, false, None).clicked() {
+                            if icon_button(ui, "取消", Icon::Cancel, false, None, readable_mode)
+                                .clicked()
+                            {
                                 return Some(UiCommand::CancelDismissSlideshow);
                             }
-                            if icon_button(ui, "确认", Icon::Confirm, false, None).clicked() {
+                            if icon_button(ui, "确认", Icon::Confirm, false, None, readable_mode)
+                                .clicked()
+                            {
                                 return Some(UiCommand::ConfirmDismissSlideshow);
                             }
                             None
@@ -474,7 +510,9 @@ fn bottom_toolbar_top(screen: Rect) -> f32 {
 
 /// 返回八个功能按钮及间距占用的固定内容宽度。
 const fn toolbar_body_content_width() -> f32 {
-    BODY_BUTTON_COUNT * tokens::TOUCH_TARGET + (BODY_BUTTON_COUNT - 1.0) * tokens::SPACE_2
+    const GROUP_GAP_COUNT: f32 = 3.0;
+    BODY_BUTTON_COUNT * tokens::TOUCH_TARGET
+        + (BODY_BUTTON_COUNT - 1.0 + GROUP_GAP_COUNT) * tokens::SPACE_2
 }
 
 /// 返回包含左右内边距的底部工具栏主体宽度。

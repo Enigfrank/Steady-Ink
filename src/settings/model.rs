@@ -71,6 +71,7 @@ pub struct UserSettings {
     pub tools: ToolPreferences,
     pub slideshow_integration_enabled: bool,
     pub log_level: LogLevel,
+    pub readable_mode: bool,
 }
 
 impl Default for UserSettings {
@@ -80,6 +81,36 @@ impl Default for UserSettings {
             tools: ToolPreferences::default(),
             slideshow_integration_enabled: true,
             log_level: LogLevel::default(),
+            readable_mode: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::UserSettings;
+
+    #[test]
+    fn missing_readable_mode_uses_the_default() {
+        let settings: UserSettings = toml::from_str(
+            r#"
+                slideshow_integration_enabled = true
+            "#,
+        )
+        .expect("旧版设置应能反序列化");
+
+        assert!(!settings.readable_mode);
+    }
+
+    #[test]
+    fn readable_mode_survives_a_toml_round_trip() {
+        let settings = UserSettings {
+            readable_mode: true,
+            ..UserSettings::default()
+        };
+        let serialized = toml::to_string(&settings).expect("设置应能序列化");
+        let reloaded: UserSettings = toml::from_str(&serialized).expect("设置应能反序列化");
+
+        assert!(reloaded.readable_mode);
     }
 }

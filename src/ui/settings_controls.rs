@@ -70,16 +70,24 @@ pub fn render_tool_preferences(
     ui: &mut Ui,
     tools: ToolState,
     metrics: InterfaceMetrics,
+    readable_mode: bool,
 ) -> Option<UiCommand> {
-    let color_command =
-        render_color_selector(ui, tools.color, SelectorOrientation::Horizontal, metrics);
+    let color_command = render_color_selector(
+        ui,
+        tools.color,
+        SelectorOrientation::Horizontal,
+        metrics,
+        readable_mode,
+    );
     let pen_width_command = render_pen_width_selector(
         ui,
         tools.pen_width,
         SelectorOrientation::Horizontal,
         metrics,
+        readable_mode,
     );
-    let eraser_size_command = render_eraser_size_selector(ui, tools.eraser_size, metrics);
+    let eraser_size_command =
+        render_eraser_size_selector(ui, tools.eraser_size, metrics, readable_mode);
     color_command.or(pen_width_command).or(eraser_size_command)
 }
 
@@ -113,6 +121,7 @@ pub(super) fn render_color_selector(
     selected: InkColor,
     orientation: SelectorOrientation,
     metrics: InterfaceMetrics,
+    readable_mode: bool,
 ) -> Option<UiCommand> {
     let mut command = None;
     section_label(ui, "画笔颜色", metrics);
@@ -124,6 +133,7 @@ pub(super) fn render_color_selector(
                 SelectionVisual::Color(color32(color)),
                 selected == color,
                 metrics,
+                readable_mode,
             )
             .clicked()
             {
@@ -140,6 +150,7 @@ pub(super) fn render_pen_width_selector(
     selected: PenWidth,
     orientation: SelectorOrientation,
     metrics: InterfaceMetrics,
+    readable_mode: bool,
 ) -> Option<UiCommand> {
     let mut command = None;
     section_label(ui, "画笔粗细", metrics);
@@ -151,6 +162,7 @@ pub(super) fn render_pen_width_selector(
                 SelectionVisual::PenWidth(width),
                 selected == width,
                 metrics,
+                readable_mode,
             )
             .clicked()
             {
@@ -166,6 +178,7 @@ fn render_eraser_size_selector(
     ui: &mut Ui,
     selected: EraserSize,
     metrics: InterfaceMetrics,
+    readable_mode: bool,
 ) -> Option<UiCommand> {
     let mut command = None;
     section_label(ui, "橡皮擦大小", metrics);
@@ -177,6 +190,7 @@ fn render_eraser_size_selector(
                 SelectionVisual::EraserSize(size),
                 selected == size,
                 metrics,
+                readable_mode,
             )
             .clicked()
             {
@@ -203,6 +217,7 @@ fn selection_button(
     visual: SelectionVisual,
     selected: bool,
     metrics: InterfaceMetrics,
+    readable_mode: bool,
 ) -> Response {
     let size = Vec2::splat(metrics.touch_target);
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
@@ -210,18 +225,7 @@ fn selection_button(
         return response;
     }
 
-    let fill = if selected {
-        tokens::OPAQUE_COLOR_SELECTED
-    } else if response.hovered() {
-        tokens::OPAQUE_COLOR_HOVER
-    } else {
-        tokens::OPAQUE_COLOR_SURFACE
-    };
-    let border = if selected {
-        tokens::OPAQUE_COLOR_PRIMARY_SURFACE
-    } else {
-        tokens::OPAQUE_COLOR_BORDER
-    };
+    let (fill, border) = tokens::button_colors(readable_mode, selected, &response, ui.is_enabled());
     pixel_snap::paint_pixel_aligned_rect(
         ui,
         rect,
@@ -234,7 +238,7 @@ fn selection_button(
         rect.center().x,
         rect.top() + metrics.space_3 + metrics.icon_size / 2.0,
     );
-    draw_selection_visual(ui, center, visual, metrics);
+    draw_selection_visual(ui, center, visual, metrics, readable_mode);
     ui.painter().text(
         Pos2::new(rect.center().x, rect.bottom() - metrics.space_3),
         Align2::CENTER_BOTTOM,
@@ -251,6 +255,7 @@ fn draw_selection_visual(
     center: Pos2,
     visual: SelectionVisual,
     metrics: InterfaceMetrics,
+    readable_mode: bool,
 ) {
     match visual {
         SelectionVisual::Color(color) => {
@@ -259,7 +264,10 @@ fn draw_selection_visual(
             ui.painter().circle_stroke(
                 center,
                 metrics.icon_size / 2.0,
-                Stroke::new(1.0, tokens::OPAQUE_COLOR_BORDER),
+                Stroke::new(
+                    1.0,
+                    tokens::material_palette(readable_mode, tokens::MaterialRole::Control).border,
+                ),
             );
         }
         SelectionVisual::PenWidth(width) => {

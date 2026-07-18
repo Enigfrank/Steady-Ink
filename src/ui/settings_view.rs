@@ -1,5 +1,5 @@
 use egui::{
-    Align, Align2, Color32, CornerRadius, FontId, Frame, Label, Layout, Margin, Pos2, Response,
+    Align, Align2, Color32, CornerRadius, FontId, Label, Layout, Margin, Pos2, Response,
     ScrollArea, Sense, Stroke, Ui, Vec2,
 };
 
@@ -17,21 +17,17 @@ pub fn render(ui: &mut Ui, view: UiViewState<'_>) -> Option<UiCommand> {
     ui.set_min_size(ui.available_size());
     pixel_snap::show_pixel_aligned_frame(
         ui,
-        Frame::new()
-            .fill(tokens::OPAQUE_COLOR_BACKGROUND)
-            .stroke(Stroke::new(1.0, tokens::OPAQUE_COLOR_BORDER))
-            .corner_radius(CornerRadius::same(metrics.card_radius))
-            .inner_margin(Margin::same(metrics.margin_space_4)),
+        tokens::material_frame(
+            view.readable_mode,
+            tokens::MaterialRole::Page,
+            CornerRadius::same(metrics.card_radius),
+            Margin::same(metrics.margin_space_4),
+        ),
         |ui| {
-            tokens::apply_settings_widget_style(ui);
+            tokens::apply_settings_widget_style(ui, view.readable_mode);
             ui.set_min_size(ui.available_size());
 
-            let mut command = render_header(ui, metrics);
-            ui.add_space(metrics.space_2);
-            let action_command = render_action_bar(ui, metrics);
-            if command.is_none() {
-                command = action_command;
-            }
+            let mut command = render_header(ui, metrics, view.readable_mode);
             ui.add_space(metrics.space_3);
             ui.separator();
             ui.add_space(metrics.space_2);
@@ -41,9 +37,28 @@ pub fn render(ui: &mut Ui, view: UiViewState<'_>) -> Option<UiCommand> {
                 .show(ui, |ui| {
                     section_heading(ui, "默认批注工具", metrics);
                     let preferences_command =
-                        render_tool_preferences(ui, view.tools, tokens::SETTINGS_METRICS);
+                        render_tool_preferences(
+                            ui,
+                            view.tools,
+                            tokens::SETTINGS_METRICS,
+                            view.readable_mode,
+                        );
                     if command.is_none() {
                         command = preferences_command;
+                    }
+
+                    section_break(ui, metrics);
+                    section_heading(ui, "显示", metrics);
+                    let mut readable_mode = view.readable_mode;
+                    if ui
+                        .add_sized(
+                            [ui.available_width(), metrics.touch_target],
+                            egui::Checkbox::new(&mut readable_mode, "易读模式"),
+                        )
+                        .changed()
+                        && command.is_none()
+                    {
+                        command = Some(UiCommand::SetReadableMode(readable_mode));
                     }
 
                     section_break(ui, metrics);
@@ -73,31 +88,39 @@ pub fn render(ui: &mut Ui, view: UiViewState<'_>) -> Option<UiCommand> {
                     );
 
                     section_break(ui, metrics);
-                    let log_level_command = render_log_level_selector(ui, view.log_level, metrics);
+                    egui::CollapsingHeader::new("诊断与日志")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            let log_level_command =
+                                render_log_level_selector(ui, view.log_level, metrics);
+                            if command.is_none() {
+                                command = log_level_command;
+                            }
+                            ui.add_space(metrics.space_4);
+                            render_diagnostics(ui, view, metrics);
+                            ui.add_space(metrics.space_4);
+                            diagnostic_row(
+                                ui,
+                                "版本",
+                                env!("CARGO_PKG_VERSION"),
+                                tokens::COLOR_TEXT_PRIMARY,
+                                metrics,
+                            );
+                            diagnostic_row(
+                                ui,
+                                "应用",
+                                "Steady Ink",
+                                tokens::COLOR_TEXT_PRIMARY,
+                                metrics,
+                            );
+                        });
+
+                    section_break(ui, metrics);
+                    section_heading(ui, "应用操作", metrics);
+                    let action_command = render_action_bar(ui, metrics, view.readable_mode);
                     if command.is_none() {
-                        command = log_level_command;
+                        command = action_command;
                     }
-
-                    section_break(ui, metrics);
-                    section_heading(ui, "诊断", metrics);
-                    render_diagnostics(ui, view, metrics);
-
-                    section_break(ui, metrics);
-                    section_heading(ui, "关于", metrics);
-                    diagnostic_row(
-                        ui,
-                        "版本",
-                        env!("CARGO_PKG_VERSION"),
-                        tokens::COLOR_TEXT_PRIMARY,
-                        metrics,
-                    );
-                    diagnostic_row(
-                        ui,
-                        "应用",
-                        "Steady Ink",
-                        tokens::COLOR_TEXT_PRIMARY,
-                        metrics,
-                    );
                     ui.add_space(metrics.space_2);
                 });
             command
@@ -107,7 +130,7 @@ pub fn render(ui: &mut Ui, view: UiViewState<'_>) -> Option<UiCommand> {
 }
 
 /// 绘制设置标题和右上角关闭按钮。
-fn render_header(ui: &mut Ui, metrics: InterfaceMetrics) -> Option<UiCommand> {
+fn render_header(ui: &mut Ui, metrics: InterfaceMetrics, readable_mode: bool) -> Option<UiCommand> {
     let mut command = None;
     ui.horizontal(|ui| {
         ui.label(
@@ -117,7 +140,7 @@ fn render_header(ui: &mut Ui, metrics: InterfaceMetrics) -> Option<UiCommand> {
                 .color(tokens::COLOR_TEXT_PRIMARY),
         );
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if close_button(ui, metrics).clicked() {
+            if close_button(ui, metrics, readable_mode).clicked() {
                 command = Some(UiCommand::CloseSettings);
             }
         });
@@ -126,7 +149,11 @@ fn render_header(ui: &mut Ui, metrics: InterfaceMetrics) -> Option<UiCommand> {
 }
 
 /// 绘制配置目录和退出软件组成的顶部等宽操作栏。
-fn render_action_bar(ui: &mut Ui, metrics: InterfaceMetrics) -> Option<UiCommand> {
+fn render_action_bar(
+    ui: &mut Ui,
+    metrics: InterfaceMetrics,
+    readable_mode: bool,
+) -> Option<UiCommand> {
     let mut command = None;
     ui.horizontal(|ui| {
         let button_width = equal_action_button_width(ui.available_width(), metrics);
@@ -137,6 +164,7 @@ fn render_action_bar(ui: &mut Ui, metrics: InterfaceMetrics) -> Option<UiCommand
             SettingsActionStyle::Neutral,
             button_width,
             metrics,
+            readable_mode,
         )
         .clicked()
         {
@@ -149,6 +177,7 @@ fn render_action_bar(ui: &mut Ui, metrics: InterfaceMetrics) -> Option<UiCommand
             SettingsActionStyle::Danger,
             button_width,
             metrics,
+            readable_mode,
         )
         .clicked()
             && command.is_none()
@@ -172,6 +201,7 @@ fn settings_action_button(
     style: SettingsActionStyle,
     width: f32,
     metrics: InterfaceMetrics,
+    readable_mode: bool,
 ) -> Response {
     let (rect, response) = ui.allocate_exact_size(
         Vec2::new(width, metrics.action_button_height),
@@ -181,13 +211,10 @@ fn settings_action_button(
         return response;
     }
 
-    let fill = if response.hovered() {
-        tokens::OPAQUE_COLOR_HOVER
-    } else {
-        tokens::OPAQUE_COLOR_SURFACE
-    };
+    let (fill, default_border) =
+        tokens::button_colors(readable_mode, false, &response, ui.is_enabled());
     let (foreground, border) = match style {
-        SettingsActionStyle::Neutral => (tokens::COLOR_TEXT_PRIMARY, tokens::OPAQUE_COLOR_BORDER),
+        SettingsActionStyle::Neutral => (tokens::COLOR_TEXT_PRIMARY, default_border),
         SettingsActionStyle::Danger => (tokens::COLOR_ERROR, tokens::COLOR_ERROR),
     };
     pixel_snap::paint_pixel_aligned_rect(
@@ -217,21 +244,18 @@ fn settings_action_button(
 }
 
 /// 绘制设置标题行右侧的关闭图标按钮。
-fn close_button(ui: &mut Ui, metrics: InterfaceMetrics) -> Response {
+fn close_button(ui: &mut Ui, metrics: InterfaceMetrics, readable_mode: bool) -> Response {
     let size = Vec2::splat(metrics.action_button_height);
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
     if ui.is_rect_visible(rect) {
-        let fill = if response.hovered() {
-            tokens::OPAQUE_COLOR_HOVER
-        } else {
-            tokens::OPAQUE_COLOR_SURFACE
-        };
+        let (fill, border) =
+            tokens::button_colors(readable_mode, false, &response, ui.is_enabled());
         pixel_snap::paint_pixel_aligned_rect(
             ui,
             rect,
             CornerRadius::same(metrics.button_radius),
             fill,
-            Stroke::new(1.0, tokens::OPAQUE_COLOR_BORDER),
+            Stroke::new(1.0, border),
         );
         let half = metrics.icon_size / 2.0;
         for points in [

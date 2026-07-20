@@ -1,6 +1,7 @@
 use std::{
     sync::{
         Arc, OnceLock,
+        atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver},
     },
     time::{Duration, Instant},
@@ -61,6 +62,15 @@ impl ActiveGesture {
         }
     }
 
+    /// 使用当前工具选择从第一个非空物理像素批次开始手势。
+    fn from_points(points: Vec<CanvasPoint>, tools: ToolState) -> Option<Self> {
+        let mut points = points.into_iter();
+        let first = points.next()?;
+        let mut gesture = Self::new(first, tools);
+        gesture.extend(points);
+        Some(gesture)
+    }
+
     /// 使用动态接触椭圆开始一次临时手掌擦除会话。
     fn new_palm_erase(sample: EraseSample, tools: ToolState) -> Self {
         Self {
@@ -70,8 +80,15 @@ impl ActiveGesture {
         }
     }
 
+    /// 追加一批去重后的物理像素采样。
+    fn extend(&mut self, points: impl IntoIterator<Item = CanvasPoint>) {
+        for point in points {
+            self.push_point(point);
+        }
+    }
+
     /// 追加一个与上一个点有实际距离的采样，避免驱动重复点膨胀历史。
-    fn push(&mut self, point: CanvasPoint) {
+    fn push_point(&mut self, point: CanvasPoint) {
         let ActiveGestureSamples::Tool(points) = &mut self.samples else {
             return;
         };
@@ -138,6 +155,7 @@ struct DesktopRuntime {
     input_router: InputRouter,
     active_gesture: Option<ActiveGesture>,
     windows_pointer_receiver: Receiver<WindowsPointerEvent>,
+    pen_contact_active: Arc<AtomicBool>,
     slideshow_detector: ComDetector,
     settings_store: SettingsStore,
     settings: UserSettings,
@@ -158,6 +176,7 @@ impl DesktopRuntime {
         event_loop: &ActiveEventLoop,
         event_proxy: EventLoopProxy<UserEvent>,
         windows_pointer_receiver: Receiver<WindowsPointerEvent>,
+        pen_contact_active: Arc<AtomicBool>,
     ) -> Result<Self, AppError> {
         let settings_store = SettingsStore::new()?;
         let (settings, settings_error) = match settings_store.load() {
@@ -188,6 +207,7 @@ impl DesktopRuntime {
             input_router: InputRouter::default(),
             active_gesture: None,
             windows_pointer_receiver,
+            pen_contact_active,
             slideshow_detector,
             settings_store,
             settings,
@@ -234,6 +254,7 @@ impl DesktopRuntime {
             event,
             event_response.consumed,
             self.state.mode().accepts_ink_input(),
+            self.pen_contact_active.load(Ordering::Acquire),
         ) {
             self.apply_pointer_action(pointer_action);
             self.request_redraw();
@@ -244,17 +265,33 @@ impl DesktopRuntime {
     /// 将统一指针动作应用到当前活动手势或普通批注文档。
     fn apply_pointer_action(&mut self, action: PointerAction) {
         match action {
-            PointerAction::Begin(point) if self.active_gesture.is_none() => {
+            PointerAction::Begin(point) => {
                 self.active_gesture = Some(ActiveGesture::new(point, self.tools));
             }
             PointerAction::Move(point) => {
                 if let Some(gesture) = self.active_gesture.as_mut() {
-                    gesture.push(point);
+                    gesture.push_point(point);
                 }
             }
             PointerAction::End(point) => {
                 if let Some(mut gesture) = self.active_gesture.take() {
-                    gesture.push(point);
+                    gesture.push_point(point);
+                    if let Some(document) = self.state.active_document_mut() {
+                        gesture.commit(document);
+                    }
+                }
+            }
+            PointerAction::BeginBatch(points) => {
+                self.active_gesture = ActiveGesture::from_points(points, self.tools);
+            }
+            PointerAction::MoveBatch(points) => {
+                if let Some(gesture) = self.active_gesture.as_mut() {
+                    gesture.extend(points);
+                }
+            }
+            PointerAction::EndBatch(points) => {
+                if let Some(mut gesture) = self.active_gesture.take() {
+                    gesture.extend(points);
                     if let Some(document) = self.state.active_document_mut() {
                         gesture.commit(document);
                     }
@@ -277,19 +314,15 @@ impl DesktopRuntime {
                 }
             }
             PointerAction::CommitBuffered(points) => {
-                let gesture = ActiveGesture {
-                    samples: ActiveGestureSamples::Tool(points),
-                    tool: self.tools.tool,
-                    tools: self.tools,
-                };
-                if let Some(document) = self.state.active_document_mut() {
+                if let Some(gesture) = ActiveGesture::from_points(points, self.tools)
+                    && let Some(document) = self.state.active_document_mut()
+                {
                     gesture.commit(document);
                 }
             }
             PointerAction::Cancel => {
                 self.active_gesture = None;
             }
-            PointerAction::Begin(_) => {}
         }
     }
 
@@ -709,6 +742,7 @@ fn egui_position_from_physical(position: CanvasPoint, pixels_per_point: f32) -> 
 struct DesktopApplication {
     proxy: EventLoopProxy<UserEvent>,
     windows_pointer_receiver: Option<Receiver<WindowsPointerEvent>>,
+    pen_contact_active: Arc<AtomicBool>,
     runtime: Option<DesktopRuntime>,
     startup_error: Option<AppError>,
     next_repaint: Option<Instant>,
@@ -719,10 +753,12 @@ impl DesktopApplication {
     fn new(
         proxy: EventLoopProxy<UserEvent>,
         windows_pointer_receiver: Receiver<WindowsPointerEvent>,
+        pen_contact_active: Arc<AtomicBool>,
     ) -> Self {
         Self {
             proxy,
             windows_pointer_receiver: Some(windows_pointer_receiver),
+            pen_contact_active,
             runtime: None,
             startup_error: None,
             next_repaint: None,
@@ -763,7 +799,12 @@ impl ApplicationHandler<UserEvent> for DesktopApplication {
             event_loop.exit();
             return;
         };
-        match DesktopRuntime::new(event_loop, self.proxy.clone(), windows_pointer_receiver) {
+        match DesktopRuntime::new(
+            event_loop,
+            self.proxy.clone(),
+            windows_pointer_receiver,
+            Arc::clone(&self.pen_contact_active),
+        ) {
             Ok(runtime) => {
                 self.install_repaint_callback(&runtime);
                 self.runtime = Some(runtime);
@@ -877,6 +918,8 @@ impl ApplicationHandler<UserEvent> for DesktopApplication {
 /// 创建 Windows 用户事件循环并运行单窗口应用。
 pub fn run() -> Result<(), AppError> {
     let (windows_pointer_sender, windows_pointer_receiver) = mpsc::channel();
+    let pen_contact_active = Arc::new(AtomicBool::new(false));
+    let hook_pen_contact_active = Arc::clone(&pen_contact_active);
     let proxy_slot = Arc::new(OnceLock::<EventLoopProxy<UserEvent>>::new());
     let hook_proxy_slot = Arc::clone(&proxy_slot);
     let mut pointer_tracker = WindowsPointerTracker::default();
@@ -885,6 +928,7 @@ pub fn run() -> Result<(), AppError> {
         let Some(dispatch) = pointer_tracker.capture_message(raw_message) else {
             return false;
         };
+        hook_pen_contact_active.store(pointer_tracker.pen_contact_active(), Ordering::Release);
         if let Some(event) = dispatch.event
             && windows_pointer_sender.send(event).is_ok()
             && let Some(proxy) = hook_proxy_slot.get()
@@ -896,7 +940,8 @@ pub fn run() -> Result<(), AppError> {
     let event_loop = event_loop_builder.build()?;
     let proxy = event_loop.create_proxy();
     let _ = proxy_slot.set(proxy.clone());
-    let mut application = DesktopApplication::new(proxy, windows_pointer_receiver);
+    let mut application =
+        DesktopApplication::new(proxy, windows_pointer_receiver, pen_contact_active);
     event_loop.run_app(&mut application)?;
     application.startup_error.map_or(Ok(()), Err)
 }
@@ -919,5 +964,27 @@ mod tests {
     fn invalid_pixels_per_point_has_no_egui_position() {
         assert!(egui_position_from_physical(CanvasPoint::new(1.0, 1.0), 0.0).is_none());
         assert!(egui_position_from_physical(CanvasPoint::new(1.0, 1.0), f32::NAN).is_none());
+    }
+
+    /// 验证批量追加复用最小距离去重，不保留驱动重叠点。
+    #[test]
+    fn active_gesture_deduplicates_batched_points() {
+        let gesture = ActiveGesture::from_points(
+            vec![
+                CanvasPoint::new(0.0, 0.0),
+                CanvasPoint::new(0.25, 0.25),
+                CanvasPoint::new(1.0, 0.0),
+            ],
+            ToolState::default(),
+        )
+        .expect("non-empty batch must start a gesture");
+        let ActiveGestureSamples::Tool(points) = gesture.samples else {
+            panic!("tool gesture must retain point samples");
+        };
+
+        assert_eq!(
+            points,
+            vec![CanvasPoint::new(0.0, 0.0), CanvasPoint::new(1.0, 0.0)]
+        );
     }
 }

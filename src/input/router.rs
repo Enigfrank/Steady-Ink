@@ -2,7 +2,7 @@ use winit::event::{ElementState, MouseButton, TouchPhase, WindowEvent};
 
 use crate::ink::{CanvasPoint, EraseSample};
 
-use super::{PalmErasePhase, WindowsPointerEvent};
+use super::{PalmErasePhase, PenPhase, WindowsPointerEvent};
 
 /// 画布输入路由向墨迹会话发送的统一指针动作。
 #[derive(Debug, Clone, PartialEq)]
@@ -10,6 +10,9 @@ pub enum PointerAction {
     Begin(CanvasPoint),
     Move(CanvasPoint),
     End(CanvasPoint),
+    BeginBatch(Vec<CanvasPoint>),
+    MoveBatch(Vec<CanvasPoint>),
+    EndBatch(Vec<CanvasPoint>),
     BeginPalmErase(EraseSample),
     MovePalmErase(EraseSample),
     EndPalmErase(EraseSample),
@@ -26,6 +29,8 @@ pub struct InputRouter {
     palm_candidate_over_ui: Option<bool>,
     palm_erase_blocked: bool,
     palm_erasing: bool,
+    native_pen_blocked: bool,
+    native_pen_drawing: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,9 +46,22 @@ impl InputRouter {
         event: &WindowEvent,
         ui_consumed: bool,
         canvas_enabled: bool,
+        promoted_pen_contact: bool,
     ) -> Option<PointerAction> {
         if !canvas_enabled {
             return self.cancel_all_input();
+        }
+        if promoted_pen_contact
+            && matches!(
+                event,
+                WindowEvent::CursorMoved { .. }
+                    | WindowEvent::MouseInput {
+                        button: MouseButton::Left,
+                        ..
+                    }
+            )
+        {
+            return None;
         }
 
         match event {
@@ -71,6 +89,7 @@ impl InputRouter {
     pub fn cancel(&mut self) {
         self.active_pointer = None;
         self.clear_palm_session();
+        self.clear_pen_session();
     }
 
     /// 应用原生 Pointer Input 的笔活动和手掌分类结果。
@@ -88,6 +107,11 @@ impl InputRouter {
                 } else {
                     None
                 }
+            }
+            WindowsPointerEvent::Pen { phase, points } => {
+                self.pen_active = true;
+                self.clear_palm_session();
+                self.route_pen(phase, points, ui_hit, canvas_enabled)
             }
             WindowsPointerEvent::PalmCandidate { .. } => {
                 if self.palm_candidate_over_ui.is_none() {
@@ -153,6 +177,46 @@ impl InputRouter {
         }
     }
 
+    /// 将原生触控笔批量采样转换为单次画布手势动作。
+    fn route_pen(
+        &mut self,
+        phase: PenPhase,
+        points: Vec<CanvasPoint>,
+        ui_hit: bool,
+        canvas_enabled: bool,
+    ) -> Option<PointerAction> {
+        if !canvas_enabled {
+            return self.cancel_all_input();
+        }
+        match phase {
+            PenPhase::Begin => {
+                let cancelled_other = self.active_pointer.take().is_some() || self.palm_erasing;
+                self.palm_erasing = false;
+                self.native_pen_blocked = ui_hit || points.is_empty();
+                self.native_pen_drawing = !self.native_pen_blocked;
+                if self.native_pen_drawing {
+                    Some(PointerAction::BeginBatch(points))
+                } else {
+                    cancelled_other.then_some(PointerAction::Cancel)
+                }
+            }
+            PenPhase::Move if self.native_pen_drawing && !points.is_empty() => {
+                Some(PointerAction::MoveBatch(points))
+            }
+            PenPhase::Move => None,
+            PenPhase::End => {
+                let was_drawing = self.native_pen_drawing;
+                self.clear_pen_session();
+                was_drawing.then_some(PointerAction::EndBatch(points))
+            }
+            PenPhase::Cancel => {
+                let was_drawing = self.native_pen_drawing;
+                self.clear_pen_session();
+                was_drawing.then_some(PointerAction::Cancel)
+            }
+        }
+    }
+
     /// 将鼠标左键状态转换为画布手势动作。
     fn route_mouse_button(
         &mut self,
@@ -209,15 +273,19 @@ impl InputRouter {
 
     /// 在存在活动指针时生成一次取消动作。
     fn cancel_active_pointer(&mut self) -> Option<PointerAction> {
-        let had_active_input = self.active_pointer.take().is_some() || self.palm_erasing;
+        let had_active_input =
+            self.active_pointer.take().is_some() || self.palm_erasing || self.native_pen_drawing;
         self.palm_erasing = false;
+        self.clear_pen_session();
         had_active_input.then_some(PointerAction::Cancel)
     }
 
     /// 清理当前指针和所有手掌会话状态，并在需要时取消运行时手势。
     fn cancel_all_input(&mut self) -> Option<PointerAction> {
-        let had_active_input = self.active_pointer.take().is_some() || self.palm_erasing;
+        let had_active_input =
+            self.active_pointer.take().is_some() || self.palm_erasing || self.native_pen_drawing;
         self.clear_palm_session();
+        self.clear_pen_session();
         had_active_input.then_some(PointerAction::Cancel)
     }
 
@@ -227,15 +295,156 @@ impl InputRouter {
         self.palm_erase_blocked = false;
         self.palm_erasing = false;
     }
+
+    /// 清理原生触控笔接触的阻止和绘制标记。
+    fn clear_pen_session(&mut self) {
+        self.native_pen_blocked = false;
+        self.native_pen_drawing = false;
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use winit::{dpi::PhysicalPosition, event::DeviceId};
+
     use super::*;
 
     /// 创建用于路由状态测试的稳定手掌采样。
     fn palm_sample() -> EraseSample {
         EraseSample::circle(CanvasPoint::new(32.0, 48.0), 48.0)
+    }
+
+    /// 创建用于原生触控笔路由测试的批量位置。
+    fn pen_points() -> Vec<CanvasPoint> {
+        vec![CanvasPoint::new(12.0, 16.0), CanvasPoint::new(20.0, 24.0)]
+    }
+
+    /// 验证原生笔接触期间提升的左键和移动事件不会生成重复画布动作。
+    #[test]
+    fn promoted_pen_mouse_events_are_suppressed() {
+        let device_id = DeviceId::dummy();
+        let mut router = InputRouter::default();
+        let pressed = WindowEvent::MouseInput {
+            device_id,
+            state: ElementState::Pressed,
+            button: MouseButton::Left,
+        };
+        let moved = WindowEvent::CursorMoved {
+            device_id,
+            position: PhysicalPosition::new(24.0, 32.0),
+        };
+
+        assert_eq!(router.route(&pressed, false, true, true), None);
+        assert_eq!(router.route(&moved, false, true, true), None);
+        assert_eq!(router.active_pointer, None);
+        assert_eq!(router.last_cursor_position, None);
+    }
+
+    /// 验证画布起始的原生笔批次持续绘制，并允许抬起批次为空。
+    #[test]
+    fn native_pen_routes_batches_until_end() {
+        let mut router = InputRouter::default();
+
+        assert_eq!(
+            router.route_windows_pointer(
+                WindowsPointerEvent::Pen {
+                    phase: PenPhase::Begin,
+                    points: pen_points(),
+                },
+                false,
+                true,
+            ),
+            Some(PointerAction::BeginBatch(pen_points()))
+        );
+        assert_eq!(
+            router.route_windows_pointer(
+                WindowsPointerEvent::Pen {
+                    phase: PenPhase::Move,
+                    points: pen_points(),
+                },
+                true,
+                true,
+            ),
+            Some(PointerAction::MoveBatch(pen_points()))
+        );
+        assert_eq!(
+            router.route_windows_pointer(
+                WindowsPointerEvent::Pen {
+                    phase: PenPhase::End,
+                    points: Vec::new(),
+                },
+                true,
+                true,
+            ),
+            Some(PointerAction::EndBatch(Vec::new()))
+        );
+    }
+
+    /// 验证画布在原生笔接触期间禁用时取消活动笔迹而不是继续追加。
+    #[test]
+    fn disabled_canvas_cancels_native_pen_session() {
+        let mut router = InputRouter::default();
+        router.route_windows_pointer(
+            WindowsPointerEvent::Pen {
+                phase: PenPhase::Begin,
+                points: pen_points(),
+            },
+            false,
+            true,
+        );
+
+        assert_eq!(
+            router.route_windows_pointer(
+                WindowsPointerEvent::Pen {
+                    phase: PenPhase::Move,
+                    points: pen_points(),
+                },
+                false,
+                false,
+            ),
+            Some(PointerAction::Cancel)
+        );
+        assert!(!router.native_pen_drawing);
+    }
+
+    /// 验证从 UI 起始的原生笔接触整段不会生成画布动作。
+    #[test]
+    fn native_pen_started_over_ui_stays_blocked() {
+        let mut router = InputRouter::default();
+
+        assert_eq!(
+            router.route_windows_pointer(
+                WindowsPointerEvent::Pen {
+                    phase: PenPhase::Begin,
+                    points: pen_points(),
+                },
+                true,
+                true,
+            ),
+            None
+        );
+        assert_eq!(
+            router.route_windows_pointer(
+                WindowsPointerEvent::Pen {
+                    phase: PenPhase::Move,
+                    points: pen_points(),
+                },
+                false,
+                true,
+            ),
+            None
+        );
+        assert_eq!(
+            router.route_windows_pointer(
+                WindowsPointerEvent::Pen {
+                    phase: PenPhase::End,
+                    points: pen_points(),
+                },
+                false,
+                true,
+            ),
+            None
+        );
     }
 
     /// 验证从 UI 起始的手掌在移动到画布后仍不会启动擦除。

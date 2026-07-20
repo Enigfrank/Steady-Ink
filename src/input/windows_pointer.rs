@@ -9,8 +9,9 @@ use windows::Win32::{
     Graphics::Gdi::ScreenToClient,
     UI::{
         Input::Pointer::{
-            GetPointerInfo, GetPointerTouchInfo, GetPointerType, POINTER_FLAG_CONFIDENCE,
-            POINTER_FLAG_INRANGE, POINTER_INFO, POINTER_TOUCH_INFO,
+            GetPointerInfo, GetPointerInfoHistory, GetPointerTouchInfo, GetPointerType,
+            POINTER_FLAG_CONFIDENCE, POINTER_FLAG_INCONTACT, POINTER_FLAG_INRANGE, POINTER_INFO,
+            POINTER_TOUCH_INFO,
         },
         WindowsAndMessaging::{
             MSG, POINTER_INPUT_TYPE, PT_PEN, PT_TOUCH, TOUCH_MASK_CONTACTAREA,
@@ -34,6 +35,10 @@ const MIN_CONTACT_RADIUS: f32 = 8.0;
 #[derive(Debug)]
 pub enum WindowsPointerEvent {
     PenActivityChanged(bool),
+    Pen {
+        phase: PenPhase,
+        points: Vec<CanvasPoint>,
+    },
     PalmCandidate {
         point: CanvasPoint,
     },
@@ -58,6 +63,7 @@ impl WindowsPointerEvent {
     pub fn position(&self) -> Option<CanvasPoint> {
         match self {
             Self::PenActivityChanged(_) => None,
+            Self::Pen { points, .. } => points.last().copied(),
             Self::PalmCandidate { point } => Some(*point),
             Self::PalmSupport { point } => *point,
             Self::PalmErase { sample, .. } => Some(sample.center),
@@ -80,6 +86,15 @@ impl WindowsPointerEvent {
     }
 }
 
+/// 一次原生触控笔接触中的阶段。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PenPhase {
+    Begin,
+    Move,
+    End,
+    Cancel,
+}
+
 /// 一次动态手掌擦除会话中的阶段。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PalmErasePhase {
@@ -98,6 +113,8 @@ pub struct WindowsPointerDispatch {
 #[derive(Default)]
 pub struct WindowsPointerTracker {
     pen_ids: HashSet<u32>,
+    pen_contact_ids: HashSet<u32>,
+    pointer_history: Vec<POINTER_INFO>,
     touches: HashMap<u32, TouchContact>,
     candidate_ids: HashSet<u32>,
     palm_ids: HashSet<u32>,
@@ -105,6 +122,11 @@ pub struct WindowsPointerTracker {
 }
 
 impl WindowsPointerTracker {
+    /// 返回 hook 当前是否观察到正在接触屏幕的原生触控笔。
+    pub fn pen_contact_active(&self) -> bool {
+        !self.pen_contact_ids.is_empty()
+    }
+
     /// 读取一条 WM_POINTER 消息并返回是否需要拦截 winit 及其手掌语义。
     pub fn capture_message(
         &mut self,
@@ -146,11 +168,12 @@ impl WindowsPointerTracker {
         }
     }
 
-    /// 更新触控笔靠近状态；触控笔消息仍交给 winit 处理实际书写。
+    /// 更新触控笔靠近和接触状态，并输出原生批量书写采样。
     fn handle_pen_message(&mut self, pointer_id: u32, message: &MSG) -> WindowsPointerDispatch {
         let was_active = !self.pen_ids.is_empty();
-        let in_range = pointer_info(pointer_id)
-            .is_some_and(|info| has_pointer_flag(info, POINTER_FLAG_INRANGE));
+        let pointer_info = pointer_info(pointer_id);
+        let in_range =
+            pointer_info.is_some_and(|info| has_pointer_flag(info, POINTER_FLAG_INRANGE));
         if matches!(message.message, WM_POINTERLEAVE | WM_POINTERCAPTURECHANGED) || !in_range {
             self.pen_ids.remove(&pointer_id);
         } else {
@@ -162,11 +185,70 @@ impl WindowsPointerTracker {
             self.palm_ids.clear();
             self.palm_started = false;
         }
+        let was_in_contact = self.pen_contact_ids.contains(&pointer_id);
+        let is_in_contact =
+            pointer_info.is_some_and(|info| has_pointer_flag(info, POINTER_FLAG_INCONTACT));
+        let phase = pen_phase_for_message(message.message, was_in_contact, is_in_contact);
+        match phase {
+            Some(PenPhase::Begin | PenPhase::Move) => {
+                self.pen_contact_ids.insert(pointer_id);
+            }
+            Some(PenPhase::End | PenPhase::Cancel) => {
+                self.pen_contact_ids.remove(&pointer_id);
+            }
+            None => {}
+        }
+        let event = phase.map(|phase| WindowsPointerEvent::Pen {
+            phase,
+            points: if phase == PenPhase::Cancel {
+                Vec::new()
+            } else {
+                self.read_pen_points(pointer_id, message.hwnd, pointer_info)
+            },
+        });
         WindowsPointerDispatch {
-            event: (was_active != is_active)
-                .then_some(WindowsPointerEvent::PenActivityChanged(is_active)),
+            event: event.or_else(|| {
+                (was_active != is_active)
+                    .then_some(WindowsPointerEvent::PenActivityChanged(is_active))
+            }),
             swallow_winit: false,
         }
+    }
+
+    /// 读取当前触控笔消息的时间正序位置历史，并在失败时退化为当前点。
+    fn read_pen_points(
+        &mut self,
+        pointer_id: u32,
+        window: HWND,
+        current: Option<POINTER_INFO>,
+    ) -> Vec<CanvasPoint> {
+        let Some(current) = current else {
+            return Vec::new();
+        };
+        let history_count = current.historyCount.max(1);
+        self.pointer_history
+            .resize(history_count as usize, POINTER_INFO::default());
+        let mut entries_count = history_count;
+        let history_read = unsafe {
+            GetPointerInfoHistory(
+                pointer_id,
+                &mut entries_count,
+                Some(self.pointer_history.as_mut_ptr()),
+            )
+        }
+        .is_ok();
+        if history_read {
+            let count = (entries_count as usize).min(self.pointer_history.len());
+            let points: Vec<_> = chronological_pointer_history(&self.pointer_history, count)
+                .filter_map(|info| screen_to_client(window, info.ptPixelLocation))
+                .collect();
+            if !points.is_empty() {
+                return points;
+            }
+        }
+        screen_to_client(window, current.ptPixelLocation)
+            .into_iter()
+            .collect()
     }
 
     /// 分类触摸接触，并在确认手掌时输出动态椭圆擦除采样。
@@ -398,6 +480,30 @@ impl WindowsPointerTracker {
     }
 }
 
+/// 将 Win32 笔消息和接触标记归一化为单次接触阶段。
+const fn pen_phase_for_message(
+    message: u32,
+    was_in_contact: bool,
+    is_in_contact: bool,
+) -> Option<PenPhase> {
+    match message {
+        WM_POINTERDOWN => Some(PenPhase::Begin),
+        WM_POINTERUPDATE if is_in_contact => Some(PenPhase::Move),
+        WM_POINTERUPDATE if was_in_contact => Some(PenPhase::Cancel),
+        WM_POINTERUP => Some(PenPhase::End),
+        WM_POINTERLEAVE | WM_POINTERCAPTURECHANGED if was_in_contact => Some(PenPhase::Cancel),
+        _ => None,
+    }
+}
+
+/// 按时间正序访问 Windows 以新到旧顺序返回的已初始化历史条目。
+fn chronological_pointer_history(
+    history: &[POINTER_INFO],
+    count: usize,
+) -> impl Iterator<Item = &POINTER_INFO> {
+    history[..count.min(history.len())].iter().rev()
+}
+
 /// 返回接触中心最远点对的稳定椭圆方向，范围归一化到 `[0, PI)`。
 fn farthest_contact_rotation(contacts: &[&TouchContact]) -> f32 {
     let mut farthest_distance_squared = 0.0;
@@ -622,6 +728,41 @@ mod tests {
             true,
             Instant::now(),
         )
+    }
+
+    /// 验证接触标记在更新消息中消失时立即取消旧笔会话。
+    #[test]
+    fn pen_update_without_contact_cancels_active_session() {
+        assert_eq!(
+            pen_phase_for_message(WM_POINTERUPDATE, true, false),
+            Some(PenPhase::Cancel)
+        );
+        assert_eq!(pen_phase_for_message(WM_POINTERUPDATE, false, false), None);
+    }
+
+    /// 验证历史条目转为时间正序，并把系统返回数量限制在已初始化缓冲区内。
+    #[test]
+    fn pointer_history_is_chronological_and_bounded() {
+        let history = [
+            POINTER_INFO {
+                frameId: 3,
+                ..POINTER_INFO::default()
+            },
+            POINTER_INFO {
+                frameId: 2,
+                ..POINTER_INFO::default()
+            },
+            POINTER_INFO {
+                frameId: 1,
+                ..POINTER_INFO::default()
+            },
+        ];
+
+        let frame_ids: Vec<_> = chronological_pointer_history(&history, usize::MAX)
+            .map(|info| info.frameId)
+            .collect();
+
+        assert_eq!(frame_ids, vec![1, 2, 3]);
     }
 
     /// 验证候选手掌离开窗口时只清理状态，不提交缓冲普通笔画。

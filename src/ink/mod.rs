@@ -2,6 +2,7 @@ mod document;
 mod model;
 mod page_store;
 pub(crate) mod renderer;
+mod stroke_geometry;
 
 pub use document::InkDocument;
 pub use model::{

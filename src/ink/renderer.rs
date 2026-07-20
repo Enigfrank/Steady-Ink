@@ -7,6 +7,7 @@ use skia_safe::{
 use super::{
     CanvasPoint, EraseSample, EraserSize, InkBounds, InkColor, InkDocument, InkOperation, InkTool,
     OperationId, PenWidth,
+    stroke_geometry::{StrokeSegment, visit_smoothed_segments},
 };
 use crate::error::AppError;
 
@@ -361,9 +362,14 @@ fn draw_pen_path(canvas: &Canvas, points: &[CanvasPoint], color: InkColor, width
 
     let mut path_builder = PathBuilder::new();
     path_builder.move_to((first.x, first.y));
-    for point in &points[1..] {
-        path_builder.line_to((point.x, point.y));
-    }
+    visit_smoothed_segments(points, |segment| match segment {
+        StrokeSegment::LineTo(point) => {
+            path_builder.line_to((point.x, point.y));
+        }
+        StrokeSegment::QuadTo { control, end } => {
+            path_builder.quad_to((control.x, control.y), (end.x, end.y));
+        }
+    });
     let path = path_builder.detach();
     canvas.draw_path(&path, &paint);
 }

@@ -1,6 +1,6 @@
 #define MyAppName "Steady Ink"
 #ifndef MyAppVersion
-#define MyAppVersion "0.0.0"
+#error MyAppVersion must be defined by scripts/release/package.ps1
 #endif
 #ifndef SourceDir
 #define SourceDir "..\.."

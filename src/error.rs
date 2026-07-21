@@ -14,4 +14,7 @@ pub enum AppError {
 
     #[error("设置读写错误: {0}")]
     Settings(String),
+
+    #[error("系统级开机启动操作失败: {0}")]
+    Autostart(String),
 }

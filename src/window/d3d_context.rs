@@ -33,7 +33,7 @@ use winit::{
     event_loop::ActiveEventLoop,
     monitor::MonitorHandle,
     platform::windows::{WindowAttributesExtWindows, WindowExtWindows},
-    window::{Window, WindowAttributes, WindowLevel},
+    window::{Icon, Window, WindowAttributes, WindowLevel},
 };
 
 use crate::{error::AppError, ui::design_tokens::scale_window_points};
@@ -159,6 +159,12 @@ impl D3DWindowContext {
             .or_else(|| event_loop.available_monitors().next())
             .ok_or_else(|| AppError::Graphics("没有检测到可用显示器".to_owned()))?;
         let geometry = WindowGeometry::from_monitor(&monitor);
+        let window_icon = Icon::from_rgba(
+            include_bytes!(concat!(env!("OUT_DIR"), "/steady-ink-window.rgba")).to_vec(),
+            256,
+            256,
+        )
+        .map_err(|error| AppError::Graphics(format!("窗口图标资源无效: {error}")))?;
         let attributes = WindowAttributes::default()
             .with_title("Steady Ink")
             .with_inner_size(geometry.idle_size)
@@ -168,7 +174,9 @@ impl D3DWindowContext {
             .with_decorations(false)
             .with_window_level(WindowLevel::AlwaysOnTop)
             .with_visible(false)
+            .with_window_icon(Some(window_icon.clone()))
             .with_skip_taskbar(true)
+            .with_taskbar_icon(Some(window_icon))
             .with_no_redirection_bitmap(true);
         let window = event_loop
             .create_window(attributes)

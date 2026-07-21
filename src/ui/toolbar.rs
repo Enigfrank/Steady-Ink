@@ -12,6 +12,7 @@ use super::{
 };
 use crate::{
     app::AppMode,
+    autostart::MachineAutostartState,
     ink::{EraserSize, InkColor, InkTool, PenWidth},
     settings::{InkAntialiasingMode, LogLevel},
     slideshow::ComDiagnostics,
@@ -43,6 +44,7 @@ pub enum UiCommand {
     SetSlideshowIntegrationEnabled(bool),
     SetLogLevel(LogLevel),
     SetReadableMode(bool),
+    SetMachineAutostart(bool),
     ToggleSlideshowToolbar,
     PreviousSlide,
     NextSlide,
@@ -81,6 +83,8 @@ pub struct UiViewState<'a> {
     pub slideshow_control_error: Option<&'a str>,
     pub settings_error: Option<&'a str>,
     pub settings_directory_error: Option<&'a str>,
+    pub machine_autostart_state: Option<MachineAutostartState>,
+    pub machine_autostart_error: Option<&'a str>,
     pub settings_path: &'a std::path::Path,
     pub graphics_diagnostics: &'a GraphicsDiagnostics,
 }

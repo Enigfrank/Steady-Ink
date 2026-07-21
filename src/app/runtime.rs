@@ -17,6 +17,7 @@ use winit::{
 
 use crate::{
     app::{AppMode, AppState},
+    autostart::{self, MachineAutostartState},
     error::AppError,
     ink::{
         ActiveInkPreview, CanvasPoint, EraseSample, InkDocument, InkOperation, InkTool,
@@ -219,6 +220,8 @@ struct DesktopRuntime {
     settings: UserSettings,
     settings_error: Option<String>,
     settings_directory_error: Option<String>,
+    machine_autostart_state: Option<MachineAutostartState>,
+    machine_autostart_error: Option<String>,
     ink_rendering_error: Option<String>,
     idle_panel: IdlePanel,
     com_diagnostics: Option<ComDiagnostics>,
@@ -245,6 +248,7 @@ impl DesktopRuntime {
                 (UserSettings::default(), Some(error.to_string()))
             }
         };
+        let (machine_autostart_state, machine_autostart_error) = load_machine_autostart_state();
         let tools = ToolState {
             tool: InkTool::Pen,
             color: settings.tools.color,
@@ -281,6 +285,8 @@ impl DesktopRuntime {
             settings,
             settings_error,
             settings_directory_error: None,
+            machine_autostart_state,
+            machine_autostart_error,
             ink_rendering_error,
             idle_panel: IdlePanel::Toolbar,
             com_diagnostics: None,
@@ -431,6 +437,8 @@ impl DesktopRuntime {
             slideshow_control_error: self.slideshow_control_error.as_deref(),
             settings_error: self.settings_error.as_deref(),
             settings_directory_error: self.settings_directory_error.as_deref(),
+            machine_autostart_state: self.machine_autostart_state,
+            machine_autostart_error: self.machine_autostart_error.as_deref(),
             settings_path: self.settings_store.path(),
             graphics_diagnostics: self.window_context.diagnostics(),
         };
@@ -525,6 +533,7 @@ impl DesktopRuntime {
             }
             UiCommand::OpenSettings => {
                 if self.state.mode() == AppMode::IdleFloatingToolbar {
+                    self.refresh_machine_autostart();
                     self.idle_panel = IdlePanel::Settings;
                     self.window_context
                         .set_idle_window_view(IdleWindowView::Settings);
@@ -538,6 +547,9 @@ impl DesktopRuntime {
                     self.settings_directory_error = Some(error.to_string());
                 }
             },
+            UiCommand::SetMachineAutostart(enabled) => {
+                self.set_machine_autostart(enabled);
+            }
             UiCommand::CloseSettings => {
                 if self.state.mode() == AppMode::IdleFloatingToolbar {
                     self.idle_panel = IdlePanel::Toolbar;
@@ -634,6 +646,36 @@ impl DesktopRuntime {
             Err(error) => {
                 tracing::warn!(%error, "保存设置失败");
                 self.settings_error = Some(error.to_string());
+            }
+        }
+    }
+
+    /// 查询 HKLM Run 中的实际自启动状态，并把路径异常转换为非阻塞诊断。
+    fn refresh_machine_autostart(&mut self) {
+        match autostart::query_machine_autostart() {
+            Ok(state) => {
+                self.machine_autostart_state = Some(state);
+                self.machine_autostart_error =
+                    matches!(state, MachineAutostartState::EnabledPathMismatch).then(|| {
+                        "系统级自启动已存在，但路径不是当前程序；重新启用可修复。".to_owned()
+                    });
+            }
+            Err(error) => {
+                tracing::warn!(%error, "查询系统级自启动失败");
+                self.machine_autostart_error = Some(error.to_string());
+            }
+        }
+    }
+
+    /// 请求一次 UAC 提权变更，并只在复查成功后更新设置页状态。
+    fn set_machine_autostart(&mut self, enabled: bool) {
+        let previous_state = self.machine_autostart_state;
+        match autostart::request_machine_autostart_change(enabled) {
+            Ok(()) => self.refresh_machine_autostart(),
+            Err(error) => {
+                tracing::warn!(%error, enabled, "修改系统级自启动失败");
+                self.machine_autostart_state = previous_state;
+                self.machine_autostart_error = Some(error.to_string());
             }
         }
     }
@@ -838,6 +880,21 @@ fn window_drag_finished(event: &WindowEvent) -> bool {
 fn egui_position_from_physical(position: CanvasPoint, pixels_per_point: f32) -> Option<egui::Pos2> {
     (pixels_per_point.is_finite() && pixels_per_point > 0.0)
         .then(|| egui::pos2(position.x / pixels_per_point, position.y / pixels_per_point))
+}
+
+/// 启动时读取一次系统级自启动状态，不让注册表访问进入每帧渲染路径。
+fn load_machine_autostart_state() -> (Option<MachineAutostartState>, Option<String>) {
+    match autostart::query_machine_autostart() {
+        Ok(state) => {
+            let error = matches!(state, MachineAutostartState::EnabledPathMismatch)
+                .then(|| "系统级自启动已存在，但路径不是当前程序；重新启用可修复。".to_owned());
+            (Some(state), error)
+        }
+        Err(error) => {
+            tracing::warn!(%error, "启动时查询系统级自启动失败");
+            (None, Some(error.to_string()))
+        }
+    }
 }
 
 /// winit ApplicationHandler，保证空闲时使用 Wait/WaitUntil 而非持续轮询。

@@ -11,6 +11,7 @@ use super::{
     },
     toolbar::{Icon, UiCommand, UiViewState, paint_icon},
 };
+use crate::autostart::MachineAutostartState;
 use crate::slideshow::{ComCandidateStatus, ComDiagnostics};
 
 /// 绘制完整尺寸的默认工具、联动开关、诊断和版本设置界面。
@@ -77,6 +78,13 @@ pub fn render(ui: &mut Ui, view: UiViewState<'_>) -> Option<UiCommand> {
                                 .size(metrics.text_xs)
                                 .color(tokens::COLOR_ERROR),
                         );
+                    }
+
+                    section_break(ui, metrics);
+                    let autostart_command =
+                        render_machine_autostart_setting(ui, view, metrics);
+                    if command.is_none() {
+                        command = autostart_command;
                     }
 
                     section_break(ui, metrics);
@@ -293,7 +301,64 @@ fn close_button(ui: &mut Ui, metrics: InterfaceMetrics, readable_mode: bool) -> 
             );
         }
     }
+
     response.on_hover_text("关闭设置")
+}
+
+/// 绘制只存在于完整设置页的所有用户自启动开关和诊断。
+fn render_machine_autostart_setting(
+    ui: &mut Ui,
+    view: UiViewState<'_>,
+    metrics: InterfaceMetrics,
+) -> Option<UiCommand> {
+    section_heading(ui, "启动", metrics);
+    let Some(state) = view.machine_autostart_state else {
+        let mut disabled = false;
+        ui.add_enabled(
+            false,
+            egui::Checkbox::new(&mut disabled, "为所有用户开机启动"),
+        );
+        ui.label(
+            egui::RichText::new("无法读取系统级启动状态，请重新打开设置后重试。")
+                .size(metrics.text_xs)
+                .color(tokens::COLOR_ERROR),
+        );
+        if let Some(error) = view.machine_autostart_error {
+            ui.label(
+                egui::RichText::new(error)
+                    .size(metrics.text_xs)
+                    .color(tokens::COLOR_ERROR),
+            );
+        }
+        return None;
+    };
+
+    let mut enabled = state.enabled();
+    let changed = ui
+        .add_sized(
+            [ui.available_width(), metrics.touch_target],
+            egui::Checkbox::new(&mut enabled, "为所有用户开机启动"),
+        )
+        .changed();
+    ui.label(
+        egui::RichText::new(state.label())
+            .size(metrics.text_xs)
+            .color(
+                if matches!(state, MachineAutostartState::EnabledPathMismatch) {
+                    tokens::COLOR_ERROR
+                } else {
+                    tokens::COLOR_TEXT_SECONDARY
+                },
+            ),
+    );
+    if let Some(error) = view.machine_autostart_error {
+        ui.label(
+            egui::RichText::new(error)
+                .size(metrics.text_xs)
+                .color(tokens::COLOR_ERROR),
+        );
+    }
+    changed.then_some(UiCommand::SetMachineAutostart(enabled))
 }
 
 /// 绘制设置页各部分的层级标题并保留舒适的标题后间距。
@@ -386,6 +451,29 @@ fn render_diagnostics(ui: &mut Ui, view: UiViewState<'_>, metrics: InterfaceMetr
         "目录操作",
         view.settings_directory_error.unwrap_or("正常"),
         if view.settings_directory_error.is_some() {
+            tokens::COLOR_ERROR
+        } else {
+            tokens::COLOR_TEXT_PRIMARY
+        },
+        metrics,
+    );
+    let (autostart_status, autostart_color) = match view.machine_autostart_state {
+        Some(state) => (
+            state.label(),
+            if matches!(state, MachineAutostartState::EnabledPathMismatch) {
+                tokens::COLOR_ERROR
+            } else {
+                tokens::COLOR_TEXT_PRIMARY
+            },
+        ),
+        None => ("无法读取", tokens::COLOR_ERROR),
+    };
+    diagnostic_row(ui, "系统自启动", autostart_status, autostart_color, metrics);
+    diagnostic_row(
+        ui,
+        "自启动诊断",
+        view.machine_autostart_error.unwrap_or("正常"),
+        if view.machine_autostart_error.is_some() {
             tokens::COLOR_ERROR
         } else {
             tokens::COLOR_TEXT_PRIMARY

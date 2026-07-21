@@ -1,6 +1,6 @@
 use super::{
     CanvasPoint, ClearOperation, EraseSample, EraseStroke, InkBounds, InkColor, InkOperation,
-    OperationId, PenWidth,
+    OperationId, PenWidth, VariableStrokePoint,
 };
 use crate::ink::DrawStroke;
 
@@ -33,6 +33,22 @@ impl InkDocument {
 
         let id = self.allocate_operation_id();
         let stroke = DrawStroke::new(id, points, color, width)?;
+        self.operations.push(InkOperation::DrawStroke(stroke));
+        Some(id)
+    }
+
+    /// 追加一条已经固化逐点宽度的速度笔锋笔画。
+    pub fn append_variable_draw_stroke(
+        &mut self,
+        points: Vec<VariableStrokePoint>,
+        color: InkColor,
+    ) -> Option<OperationId> {
+        if points.is_empty() {
+            return None;
+        }
+
+        let id = self.allocate_operation_id();
+        let stroke = DrawStroke::new_variable(id, points, color)?;
         self.operations.push(InkOperation::DrawStroke(stroke));
         Some(id)
     }

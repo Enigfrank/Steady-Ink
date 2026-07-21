@@ -7,6 +7,7 @@ use std::{
 use windows::Win32::{
     Foundation::{HWND, POINT},
     Graphics::Gdi::ScreenToClient,
+    System::Performance::QueryPerformanceFrequency,
     UI::{
         Input::Pointer::{
             GetPointerInfo, GetPointerInfoHistory, GetPointerTouchInfo, GetPointerType,
@@ -23,6 +24,8 @@ use windows::Win32::{
 
 use crate::ink::{CanvasPoint, EraseSample};
 
+use super::router::PointerSample;
+
 const PALM_CONFIRMATION_DELAY: Duration = Duration::from_millis(40);
 const SINGLE_PALM_MIN_AREA: f32 = 4_096.0;
 const SINGLE_PALM_MIN_MAJOR_AXIS: f32 = 72.0;
@@ -37,7 +40,7 @@ pub enum WindowsPointerEvent {
     PenActivityChanged(bool),
     Pen {
         phase: PenPhase,
-        points: Vec<CanvasPoint>,
+        points: Vec<PointerSample>,
     },
     PalmCandidate {
         point: CanvasPoint,
@@ -50,7 +53,7 @@ pub enum WindowsPointerEvent {
         sample: EraseSample,
     },
     CandidateRejected {
-        points: Vec<CanvasPoint>,
+        points: Vec<PointerSample>,
         session_ended: bool,
     },
     CandidateCancelled {
@@ -63,11 +66,11 @@ impl WindowsPointerEvent {
     pub fn position(&self) -> Option<CanvasPoint> {
         match self {
             Self::PenActivityChanged(_) => None,
-            Self::Pen { points, .. } => points.last().copied(),
+            Self::Pen { points, .. } => points.last().map(|sample| sample.point),
             Self::PalmCandidate { point } => Some(*point),
             Self::PalmSupport { point } => *point,
             Self::PalmErase { sample, .. } => Some(sample.center),
-            Self::CandidateRejected { points, .. } => points.last().copied(),
+            Self::CandidateRejected { points, .. } => points.last().map(|sample| sample.point),
             Self::CandidateCancelled { .. } => None,
         }
     }
@@ -110,15 +113,72 @@ pub struct WindowsPointerDispatch {
 }
 
 /// 保存在消息 hook 内的轻量 Pointer Input 分类器。
-#[derive(Default)]
 pub struct WindowsPointerTracker {
     pen_ids: HashSet<u32>,
     pen_contact_ids: HashSet<u32>,
     pointer_history: Vec<POINTER_INFO>,
+    clock_start: Instant,
+    qpc_frequency: Option<f64>,
+    pen_time_sources: HashMap<u32, PenTimeState>,
     touches: HashMap<u32, TouchContact>,
     candidate_ids: HashSet<u32>,
     palm_ids: HashSet<u32>,
     palm_started: bool,
+}
+
+impl Default for WindowsPointerTracker {
+    /// 初始化原生 Pointer 跟踪器和可用的 QPC 频率缓存。
+    fn default() -> Self {
+        Self {
+            pen_ids: HashSet::new(),
+            pen_contact_ids: HashSet::new(),
+            pointer_history: Vec::new(),
+            clock_start: Instant::now(),
+            qpc_frequency: query_qpc_frequency(),
+            pen_time_sources: HashMap::new(),
+            touches: HashMap::new(),
+            candidate_ids: HashSet::new(),
+            palm_ids: HashSet::new(),
+            palm_started: false,
+        }
+    }
+}
+
+/// 记录一条原生笔接触固定使用的时间源及其单调结果。
+struct PenTimeState {
+    source: PenTimeSource,
+    last_micros: u64,
+}
+
+/// 原生笔时间源优先级：QPC、dwTime，最后退化到到达时钟。
+enum PenTimeSource {
+    Qpc {
+        frequency: f64,
+    },
+    DwTime {
+        last_raw: Option<u32>,
+        unwrapped_millis: u64,
+    },
+    Arrival,
+}
+
+/// 查询当前系统可用的 QPC 频率，并在失败时交给后续时间源退化处理。
+fn query_qpc_frequency() -> Option<f64> {
+    let mut frequency = 0_i64;
+    // SAFETY: Windows API 只写入调用者提供的有效频率输出位置。
+    unsafe {
+        QueryPerformanceFrequency(&mut frequency).ok()?;
+    }
+    (frequency > 0).then_some(frequency as f64)
+}
+
+/// 将 QPC 计数换算为不会因整数乘法溢出的微秒值。
+fn qpc_timestamp_micros(counter: u64, frequency: f64) -> Option<u64> {
+    if !frequency.is_finite() || frequency <= 0.0 || counter == 0 {
+        return None;
+    }
+    let micros = counter as f64 * 1_000_000.0 / frequency;
+    micros.is_finite().then_some(micros.max(0.0) as u64)
 }
 
 impl WindowsPointerTracker {
@@ -198,6 +258,9 @@ impl WindowsPointerTracker {
             }
             None => {}
         }
+        if phase == Some(PenPhase::Begin) {
+            self.begin_pen_time_source(pointer_id, pointer_info);
+        }
         let event = phase.map(|phase| WindowsPointerEvent::Pen {
             phase,
             points: if phase == PenPhase::Cancel {
@@ -206,6 +269,9 @@ impl WindowsPointerTracker {
                 self.read_pen_points(pointer_id, message.hwnd, pointer_info)
             },
         });
+        if matches!(phase, Some(PenPhase::End | PenPhase::Cancel)) {
+            self.pen_time_sources.remove(&pointer_id);
+        }
         WindowsPointerDispatch {
             event: event.or_else(|| {
                 (was_active != is_active)
@@ -221,7 +287,7 @@ impl WindowsPointerTracker {
         pointer_id: u32,
         window: HWND,
         current: Option<POINTER_INFO>,
-    ) -> Vec<CanvasPoint> {
+    ) -> Vec<PointerSample> {
         let Some(current) = current else {
             return Vec::new();
         };
@@ -239,16 +305,92 @@ impl WindowsPointerTracker {
         .is_ok();
         if history_read {
             let count = (entries_count as usize).min(self.pointer_history.len());
-            let points: Vec<_> = chronological_pointer_history(&self.pointer_history, count)
-                .filter_map(|info| screen_to_client(window, info.ptPixelLocation))
+            let history_entries: Vec<_> =
+                chronological_pointer_history(&self.pointer_history, count)
+                    .copied()
+                    .collect();
+            let points: Vec<_> = history_entries
+                .iter()
+                .filter_map(|info| {
+                    let point = screen_to_client(window, info.ptPixelLocation)?;
+                    Some(PointerSample::new(
+                        point,
+                        self.pen_timestamp(pointer_id, info),
+                    ))
+                })
                 .collect();
             if !points.is_empty() {
                 return points;
             }
         }
         screen_to_client(window, current.ptPixelLocation)
+            .map(|point| PointerSample::new(point, self.pen_timestamp(pointer_id, &current)))
             .into_iter()
             .collect()
+    }
+
+    /// 为一条新原生笔接触固定其可用的时间源。
+    fn begin_pen_time_source(&mut self, pointer_id: u32, current: Option<POINTER_INFO>) {
+        let source = current
+            .filter(|info| info.PerformanceCount > 0)
+            .and(self.qpc_frequency)
+            .map(|frequency| PenTimeSource::Qpc { frequency })
+            .or_else(|| {
+                current
+                    .filter(|info| info.dwTime > 0)
+                    .map(|_| PenTimeSource::DwTime {
+                        last_raw: None,
+                        unwrapped_millis: 0,
+                    })
+            })
+            .unwrap_or(PenTimeSource::Arrival);
+        self.pen_time_sources.insert(
+            pointer_id,
+            PenTimeState {
+                source,
+                last_micros: 0,
+            },
+        );
+    }
+
+    /// 把一条原生笔 Pointer 信息转换为固定时间源下的单调微秒。
+    fn pen_timestamp(&mut self, pointer_id: u32, info: &POINTER_INFO) -> u64 {
+        if !self.pen_time_sources.contains_key(&pointer_id) {
+            self.begin_pen_time_source(pointer_id, Some(*info));
+        }
+        let arrival_micros = self.arrival_timestamp_micros();
+        let Some(state) = self.pen_time_sources.get_mut(&pointer_id) else {
+            return arrival_micros;
+        };
+        let timestamp = match &mut state.source {
+            PenTimeSource::Qpc { frequency } if info.PerformanceCount > 0 => {
+                qpc_timestamp_micros(info.PerformanceCount, *frequency).unwrap_or(arrival_micros)
+            }
+            PenTimeSource::DwTime {
+                last_raw,
+                unwrapped_millis,
+            } if info.dwTime > 0 => {
+                let raw = info.dwTime;
+                if let Some(previous) = *last_raw {
+                    let delta = raw.wrapping_sub(previous);
+                    if delta <= u32::MAX / 2 {
+                        *unwrapped_millis = unwrapped_millis.saturating_add(delta as u64);
+                    }
+                } else {
+                    *unwrapped_millis = raw as u64;
+                }
+                *last_raw = Some(raw);
+                unwrapped_millis.saturating_mul(1_000)
+            }
+            _ => arrival_micros,
+        };
+        state.last_micros = timestamp.max(state.last_micros);
+        state.last_micros
+    }
+
+    /// 返回 tracker 初始化后的单调到达时间，作为原生时间源的最后退化路径。
+    fn arrival_timestamp_micros(&self) -> u64 {
+        self.clock_start.elapsed().as_micros() as u64
     }
 
     /// 分类触摸接触，并在确认手掌时输出动态椭圆擦除采样。
@@ -258,7 +400,12 @@ impl WindowsPointerTracker {
         }
 
         let now = Instant::now();
-        let touch = read_touch_contact(pointer_id, message.hwnd, now);
+        let touch = read_touch_contact(
+            pointer_id,
+            message.hwnd,
+            now,
+            self.arrival_timestamp_micros(),
+        );
         if let Some(touch) = touch {
             match self.touches.entry(pointer_id) {
                 std::collections::hash_map::Entry::Occupied(mut entry) => {
@@ -530,7 +677,7 @@ struct TouchContact {
     geometry: ContactGeometry,
     confident: bool,
     started_at: Instant,
-    points: Vec<CanvasPoint>,
+    points: Vec<PointerSample>,
 }
 
 impl TouchContact {
@@ -540,13 +687,14 @@ impl TouchContact {
         geometry: ContactGeometry,
         confident: bool,
         started_at: Instant,
+        timestamp_micros: u64,
     ) -> Self {
         Self {
             point,
             geometry,
             confident,
             started_at,
-            points: vec![point],
+            points: vec![PointerSample::new(point, timestamp_micros)],
         }
     }
 
@@ -556,11 +704,14 @@ impl TouchContact {
         self.geometry = next.geometry;
         self.confident = next.confident;
         if self.points.last().is_none_or(|last| {
-            let delta_x = last.x - next.point.x;
-            let delta_y = last.y - next.point.y;
+            let delta_x = last.point.x - next.point.x;
+            let delta_y = last.point.y - next.point.y;
             delta_x.mul_add(delta_x, delta_y * delta_y) >= 0.25
         }) {
-            self.points.push(next.point);
+            self.points.push(PointerSample::new(
+                next.point,
+                next.points[0].timestamp_micros,
+            ));
         }
     }
 }
@@ -617,7 +768,12 @@ impl ContactGeometry {
 }
 
 /// 从 Windows Pointer API 读取触摸位置、接触区域和置信度。
-fn read_touch_contact(pointer_id: u32, window: HWND, now: Instant) -> Option<TouchContact> {
+fn read_touch_contact(
+    pointer_id: u32,
+    window: HWND,
+    now: Instant,
+    timestamp_micros: u64,
+) -> Option<TouchContact> {
     let mut touch_info = POINTER_TOUCH_INFO::default();
     // SAFETY: 输出结构在调用期间有效，pointer_id 来自当前 WM_POINTER 消息。
     unsafe { GetPointerTouchInfo(pointer_id, &mut touch_info) }.ok()?;
@@ -658,6 +814,7 @@ fn read_touch_contact(pointer_id: u32, window: HWND, now: Instant) -> Option<Tou
         geometry,
         has_pointer_flag(touch_info.pointerInfo, POINTER_FLAG_CONFIDENCE),
         now,
+        timestamp_micros,
     ))
 }
 
@@ -727,6 +884,7 @@ mod tests {
             },
             true,
             Instant::now(),
+            100,
         )
     }
 

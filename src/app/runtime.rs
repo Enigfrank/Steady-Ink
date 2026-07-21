@@ -18,8 +18,13 @@ use winit::{
 use crate::{
     app::{AppMode, AppState},
     error::AppError,
-    ink::{ActiveInkPreview, CanvasPoint, EraseSample, InkDocument, InkOperation, InkTool},
-    input::{InputRouter, PointerAction, WindowsPointerEvent, WindowsPointerTracker},
+    ink::{
+        ActiveInkPreview, CanvasPoint, EraseSample, InkDocument, InkOperation, InkTool,
+        SpeedStrokeBuilder, VariableStrokePoint,
+    },
+    input::{
+        InputRouter, PointerAction, PointerSample, WindowsPointerEvent, WindowsPointerTracker,
+    },
     logging,
     render::Compositor,
     settings::{SettingsStore, UserSettings},
@@ -44,29 +49,51 @@ struct ActiveGesture {
     samples: ActiveGestureSamples,
     tool: InkTool,
     tools: ToolState,
+    speed_builder: Option<SpeedStrokeBuilder>,
+    variable_preview: Vec<VariableStrokePoint>,
 }
 
 #[derive(Debug)]
 enum ActiveGestureSamples {
-    Tool(Vec<CanvasPoint>),
+    Tool {
+        points: Vec<CanvasPoint>,
+        timestamps_micros: Option<Vec<u64>>,
+    },
     PalmErase(Vec<EraseSample>),
 }
 
 impl ActiveGesture {
     /// 使用当前工具选择从第一个物理像素点开始手势。
-    fn new(point: CanvasPoint, tools: ToolState) -> Self {
+    fn new(sample: PointerSample, tools: ToolState, dpi_scale: f32) -> Self {
+        let speed_builder = (tools.tool == InkTool::Pen && tools.speed_taper_enabled)
+            .then(|| {
+                SpeedStrokeBuilder::new(
+                    sample.point,
+                    sample.timestamp_micros,
+                    tools.pen_width.pixels(),
+                    dpi_scale,
+                )
+            })
+            .flatten();
         Self {
-            samples: ActiveGestureSamples::Tool(vec![point]),
+            samples: ActiveGestureSamples::Tool {
+                points: vec![sample.point],
+                timestamps_micros: speed_builder
+                    .as_ref()
+                    .map(|_| vec![sample.timestamp_micros]),
+            },
             tool: tools.tool,
             tools,
+            speed_builder,
+            variable_preview: Vec::new(),
         }
     }
 
     /// 使用当前工具选择从第一个非空物理像素批次开始手势。
-    fn from_points(points: Vec<CanvasPoint>, tools: ToolState) -> Option<Self> {
+    fn from_points(points: Vec<PointerSample>, tools: ToolState, dpi_scale: f32) -> Option<Self> {
         let mut points = points.into_iter();
         let first = points.next()?;
-        let mut gesture = Self::new(first, tools);
+        let mut gesture = Self::new(first, tools, dpi_scale);
         gesture.extend(points);
         Some(gesture)
     }
@@ -77,28 +104,40 @@ impl ActiveGesture {
             samples: ActiveGestureSamples::PalmErase(vec![sample]),
             tool: tools.tool,
             tools,
+            speed_builder: None,
+            variable_preview: Vec::new(),
         }
     }
 
     /// 追加一批去重后的物理像素采样。
-    fn extend(&mut self, points: impl IntoIterator<Item = CanvasPoint>) {
-        for point in points {
-            self.push_point(point);
+    fn extend(&mut self, samples: impl IntoIterator<Item = PointerSample>) {
+        for sample in samples {
+            self.push_point(sample);
         }
     }
 
     /// 追加一个与上一个点有实际距离的采样，避免驱动重复点膨胀历史。
-    fn push_point(&mut self, point: CanvasPoint) {
-        let ActiveGestureSamples::Tool(points) = &mut self.samples else {
+    fn push_point(&mut self, sample: PointerSample) {
+        let ActiveGestureSamples::Tool {
+            points,
+            timestamps_micros,
+        } = &mut self.samples
+        else {
             return;
         };
         let should_push = points.last().is_none_or(|last| {
-            let delta_x = last.x - point.x;
-            let delta_y = last.y - point.y;
+            let delta_x = last.x - sample.point.x;
+            let delta_y = last.y - sample.point.y;
             delta_x.mul_add(delta_x, delta_y * delta_y) >= 0.25
         });
         if should_push {
-            points.push(point);
+            points.push(sample.point);
+            if let Some(timestamps_micros) = timestamps_micros.as_mut() {
+                timestamps_micros.push(sample.timestamp_micros);
+            }
+            if let Some(builder) = self.speed_builder.as_mut() {
+                builder.push(sample.point, sample.timestamp_micros);
+            }
         }
     }
 
@@ -110,25 +149,44 @@ impl ActiveGesture {
     }
 
     /// 将活动手势转换为实时 Skia 预览描述。
-    fn preview(&self) -> ActiveInkPreview<'_> {
+    fn preview(&mut self) -> ActiveInkPreview<'_> {
         match &self.samples {
-            ActiveGestureSamples::Tool(points) => ActiveInkPreview::Tool {
-                points,
-                tool: self.tool,
-                color: self.tools.color,
-                pen_width: self.tools.pen_width,
-                eraser_size: self.tools.eraser_size,
-            },
+            ActiveGestureSamples::Tool { points, .. } => {
+                if let Some(builder) = self.speed_builder.as_ref() {
+                    builder.finalize_into(&mut self.variable_preview);
+                    ActiveInkPreview::VariableTool {
+                        points: &self.variable_preview,
+                        color: self.tools.color,
+                        eraser_size: self.tools.eraser_size,
+                    }
+                } else {
+                    ActiveInkPreview::Tool {
+                        points,
+                        tool: self.tool,
+                        color: self.tools.color,
+                        pen_width: self.tools.pen_width,
+                        eraser_size: self.tools.eraser_size,
+                    }
+                }
+            }
             ActiveGestureSamples::PalmErase(samples) => ActiveInkPreview::PalmErase { samples },
         }
     }
 
     /// 把完整手势提交为一次画笔或区域擦除 operation。
     fn commit(self, document: &mut InkDocument) {
+        let speed_builder = self.speed_builder;
         match self.samples {
-            ActiveGestureSamples::Tool(points) => match self.tool {
+            ActiveGestureSamples::Tool { points, .. } => match self.tool {
                 InkTool::Pen => {
-                    document.append_draw_stroke(points, self.tools.color, self.tools.pen_width);
+                    if let Some(builder) = speed_builder {
+                        document.append_variable_draw_stroke(
+                            builder.finalized_points(),
+                            self.tools.color,
+                        );
+                    } else {
+                        document.append_draw_stroke(points, self.tools.color, self.tools.pen_width);
+                    }
                 }
                 InkTool::RegionEraser => {
                     let samples = points
@@ -161,6 +219,7 @@ struct DesktopRuntime {
     settings: UserSettings,
     settings_error: Option<String>,
     settings_directory_error: Option<String>,
+    ink_rendering_error: Option<String>,
     idle_panel: IdlePanel,
     com_diagnostics: Option<ComDiagnostics>,
     slideshow_connection_error: Option<String>,
@@ -179,7 +238,7 @@ impl DesktopRuntime {
         pen_contact_active: Arc<AtomicBool>,
     ) -> Result<Self, AppError> {
         let settings_store = SettingsStore::new()?;
-        let (settings, settings_error) = match settings_store.load() {
+        let (mut settings, mut settings_error) = match settings_store.load() {
             Ok(settings) => (settings, None),
             Err(error) => {
                 tracing::warn!(%error, "读取设置失败，使用默认值");
@@ -191,9 +250,18 @@ impl DesktopRuntime {
             color: settings.tools.color,
             pen_width: settings.tools.pen_width,
             eraser_size: settings.tools.eraser_size,
+            speed_taper_enabled: settings.tools.speed_taper_enabled,
         };
         let window_context = D3DWindowContext::new(event_loop)?;
-        let compositor = Compositor::new(event_loop, &window_context)?;
+        let (compositor, applied_ink_mode, ink_rendering_error) =
+            Compositor::new(event_loop, &window_context, settings.ink_antialiasing)?;
+        if applied_ink_mode != settings.ink_antialiasing {
+            settings.ink_antialiasing = applied_ink_mode;
+            if let Err(error) = settings_store.save(&settings) {
+                tracing::warn!(%error, "保存抗锯齿回退设置失败");
+                settings_error = Some(error.to_string());
+            }
+        }
         let wake_proxy = event_proxy;
         let slideshow_detector = ComDetector::spawn(move || {
             let _ = wake_proxy.send_event(UserEvent::ExternalEvent);
@@ -213,6 +281,7 @@ impl DesktopRuntime {
             settings,
             settings_error,
             settings_directory_error: None,
+            ink_rendering_error,
             idle_panel: IdlePanel::Toolbar,
             com_diagnostics: None,
             slideshow_connection_error: None,
@@ -233,6 +302,7 @@ impl DesktopRuntime {
         let surface_rebuilt = if let WindowEvent::Resized(size) = event {
             self.compositor
                 .resize(&mut self.window_context, (*size).into())?;
+            self.sync_ink_rendering_state();
             if self.state.mode() == AppMode::IdleFloatingToolbar {
                 self.window_context
                     .correct_idle_size(self.current_idle_window_view(), *size);
@@ -264,9 +334,10 @@ impl DesktopRuntime {
 
     /// 将统一指针动作应用到当前活动手势或普通批注文档。
     fn apply_pointer_action(&mut self, action: PointerAction) {
+        let dpi_scale = self.window_context.window().scale_factor() as f32;
         match action {
             PointerAction::Begin(point) => {
-                self.active_gesture = Some(ActiveGesture::new(point, self.tools));
+                self.active_gesture = Some(ActiveGesture::new(point, self.tools, dpi_scale));
             }
             PointerAction::Move(point) => {
                 if let Some(gesture) = self.active_gesture.as_mut() {
@@ -282,7 +353,7 @@ impl DesktopRuntime {
                 }
             }
             PointerAction::BeginBatch(points) => {
-                self.active_gesture = ActiveGesture::from_points(points, self.tools);
+                self.active_gesture = ActiveGesture::from_points(points, self.tools, dpi_scale);
             }
             PointerAction::MoveBatch(points) => {
                 if let Some(gesture) = self.active_gesture.as_mut() {
@@ -314,7 +385,7 @@ impl DesktopRuntime {
                 }
             }
             PointerAction::CommitBuffered(points) => {
-                if let Some(gesture) = ActiveGesture::from_points(points, self.tools)
+                if let Some(gesture) = ActiveGesture::from_points(points, self.tools, dpi_scale)
                     && let Some(document) = self.state.active_document_mut()
                 {
                     gesture.commit(document);
@@ -346,6 +417,8 @@ impl DesktopRuntime {
             slideshow_integration_enabled: self.settings.slideshow_integration_enabled,
             log_level: self.settings.log_level,
             readable_mode: self.settings.readable_mode,
+            ink_antialiasing: self.settings.ink_antialiasing,
+            ink_rendering_error: self.ink_rendering_error.as_deref(),
             slideshow_session_generation: self
                 .state
                 .slideshow_session()
@@ -367,9 +440,10 @@ impl DesktopRuntime {
         });
 
         let document = self.state.active_document().unwrap_or(&self.empty_document);
-        let preview = self.active_gesture.as_ref().map(ActiveGesture::preview);
+        let preview = self.active_gesture.as_mut().map(ActiveGesture::preview);
         self.compositor
             .paint(&self.window_context, document, preview)?;
+        self.sync_ink_rendering_state();
         self.window_context.present()?;
 
         Ok(ui_command.is_some_and(|command| self.apply_ui_command(command)))
@@ -416,6 +490,23 @@ impl DesktopRuntime {
                 self.tools.eraser_size = size;
                 self.settings.tools.eraser_size = size;
                 self.save_settings();
+            }
+            UiCommand::SetSpeedTaperEnabled(enabled) => {
+                self.tools.speed_taper_enabled = enabled;
+                self.settings.tools.speed_taper_enabled = enabled;
+                self.save_settings();
+            }
+            UiCommand::SetInkAntialiasing(mode) => {
+                match self
+                    .compositor
+                    .set_ink_antialiasing(&self.window_context, mode)
+                {
+                    Ok(()) => self.sync_ink_rendering_state(),
+                    Err(error) => {
+                        tracing::warn!(%error, "切换墨迹抗锯齿失败");
+                        self.ink_rendering_error = Some(error.to_string());
+                    }
+                }
             }
             UiCommand::Undo => {
                 let undone = self.state.active_document_mut().and_then(InkDocument::undo);
@@ -544,6 +635,17 @@ impl DesktopRuntime {
                 tracing::warn!(%error, "保存设置失败");
                 self.settings_error = Some(error.to_string());
             }
+        }
+    }
+
+    /// 同步渲染器实际生效模式、错误诊断和持久化设置。
+    fn sync_ink_rendering_state(&mut self) {
+        let applied_mode = self.compositor.ink_antialiasing_mode();
+        let mode_changed = self.settings.ink_antialiasing != applied_mode;
+        self.ink_rendering_error = self.compositor.ink_rendering_error().map(str::to_owned);
+        if mode_changed {
+            self.settings.ink_antialiasing = applied_mode;
+            self.save_settings();
         }
     }
 
@@ -971,14 +1073,19 @@ mod tests {
     fn active_gesture_deduplicates_batched_points() {
         let gesture = ActiveGesture::from_points(
             vec![
-                CanvasPoint::new(0.0, 0.0),
-                CanvasPoint::new(0.25, 0.25),
-                CanvasPoint::new(1.0, 0.0),
+                PointerSample::new(CanvasPoint::new(0.0, 0.0), 100),
+                PointerSample::new(CanvasPoint::new(0.25, 0.25), 200),
+                PointerSample::new(CanvasPoint::new(1.0, 0.0), 300),
             ],
             ToolState::default(),
+            1.0,
         )
         .expect("non-empty batch must start a gesture");
-        let ActiveGestureSamples::Tool(points) = gesture.samples else {
+        let ActiveGestureSamples::Tool {
+            points,
+            timestamps_micros,
+        } = gesture.samples
+        else {
             panic!("tool gesture must retain point samples");
         };
 
@@ -986,5 +1093,6 @@ mod tests {
             points,
             vec![CanvasPoint::new(0.0, 0.0), CanvasPoint::new(1.0, 0.0)]
         );
+        assert!(timestamps_micros.is_none());
     }
 }

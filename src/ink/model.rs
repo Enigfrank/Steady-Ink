@@ -192,13 +192,31 @@ impl OperationId {
     }
 }
 
-/// 一条固定颜色和固定宽度的画笔笔画。
+/// 一条速度笔锋笔画中的确定位置和物理像素宽度。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VariableStrokePoint {
+    pub point: CanvasPoint,
+    pub width: f32,
+}
+
+/// 画笔笔画的固定宽度或逐点宽度几何形状。
+#[derive(Debug, Clone, PartialEq)]
+pub enum DrawStrokeShape {
+    Fixed {
+        points: Vec<CanvasPoint>,
+        width: PenWidth,
+    },
+    Variable {
+        points: Vec<VariableStrokePoint>,
+    },
+}
+
+/// 一条固定颜色并保存确定几何形状的画笔笔画。
 #[derive(Debug, Clone, PartialEq)]
 pub struct DrawStroke {
     pub id: OperationId,
-    pub points: Vec<CanvasPoint>,
     pub color: InkColor,
-    pub width: PenWidth,
+    pub shape: DrawStrokeShape,
     pub bounds: InkBounds,
 }
 
@@ -213,9 +231,39 @@ impl DrawStroke {
         let bounds = InkBounds::from_points(&points, width.pixels() / 2.0)?;
         Some(Self {
             id,
-            points,
             color,
-            width,
+            shape: DrawStrokeShape::Fixed { points, width },
+            bounds,
+        })
+    }
+
+    /// 创建逐点宽度画笔笔画，并按最大宽度计算保守脏区范围。
+    pub(crate) fn new_variable(
+        id: OperationId,
+        points: Vec<VariableStrokePoint>,
+        color: InkColor,
+    ) -> Option<Self> {
+        if points.is_empty()
+            || points.iter().any(|sample| {
+                !sample.point.x.is_finite()
+                    || !sample.point.y.is_finite()
+                    || !sample.width.is_finite()
+                    || sample.width < 0.0
+            })
+        {
+            return None;
+        }
+        let centers: Vec<_> = points.iter().map(|sample| sample.point).collect();
+        let max_width = points
+            .iter()
+            .map(|sample| sample.width)
+            .filter(|width| width.is_finite() && *width >= 0.0)
+            .fold(0.0_f32, f32::max);
+        let bounds = InkBounds::from_points(&centers, max_width / 2.0)?;
+        Some(Self {
+            id,
+            color,
+            shape: DrawStrokeShape::Variable { points },
             bounds,
         })
     }

@@ -62,6 +62,7 @@ fn render_preferences_panel(ui: &mut Ui, view: UiViewState<'_>) -> Option<UiComm
                     view.tools,
                     tokens::TOOL_METRICS,
                     view.readable_mode,
+                    false,
                 );
                 if readable_changed {
                     Some(UiCommand::SetReadableMode(readable_mode))

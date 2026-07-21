@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use winit::event::{ElementState, MouseButton, TouchPhase, WindowEvent};
 
 use crate::ink::{CanvasPoint, EraseSample};
@@ -7,23 +9,41 @@ use super::{PalmErasePhase, PenPhase, WindowsPointerEvent};
 /// 画布输入路由向墨迹会话发送的统一指针动作。
 #[derive(Debug, Clone, PartialEq)]
 pub enum PointerAction {
-    Begin(CanvasPoint),
-    Move(CanvasPoint),
-    End(CanvasPoint),
-    BeginBatch(Vec<CanvasPoint>),
-    MoveBatch(Vec<CanvasPoint>),
-    EndBatch(Vec<CanvasPoint>),
+    Begin(PointerSample),
+    Move(PointerSample),
+    End(PointerSample),
+    BeginBatch(Vec<PointerSample>),
+    MoveBatch(Vec<PointerSample>),
+    EndBatch(Vec<PointerSample>),
     BeginPalmErase(EraseSample),
     MovePalmErase(EraseSample),
     EndPalmErase(EraseSample),
-    CommitBuffered(Vec<CanvasPoint>),
+    CommitBuffered(Vec<PointerSample>),
     Cancel,
 }
 
+/// 一个供速度笔锋和普通笔画共用的带单调时间采样。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PointerSample {
+    pub point: CanvasPoint,
+    pub timestamp_micros: u64,
+}
+
+impl PointerSample {
+    /// 创建一个包含相对单调微秒时间的指针采样。
+    pub const fn new(point: CanvasPoint, timestamp_micros: u64) -> Self {
+        Self {
+            point,
+            timestamp_micros,
+        }
+    }
+}
+
 /// 当前由通用 winit 事件驱动的基础鼠标/触摸路由器。
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct InputRouter {
     last_cursor_position: Option<CanvasPoint>,
+    clock_start: Instant,
     active_pointer: Option<ActivePointer>,
     pen_active: bool,
     palm_candidate_over_ui: Option<bool>,
@@ -31,6 +51,23 @@ pub struct InputRouter {
     palm_erasing: bool,
     native_pen_blocked: bool,
     native_pen_drawing: bool,
+}
+
+impl Default for InputRouter {
+    /// 以创建路由器的单调时刻作为鼠标和触摸的时间基准。
+    fn default() -> Self {
+        Self {
+            last_cursor_position: None,
+            clock_start: Instant::now(),
+            active_pointer: None,
+            pen_active: false,
+            palm_candidate_over_ui: None,
+            palm_erase_blocked: false,
+            palm_erasing: false,
+            native_pen_blocked: false,
+            native_pen_drawing: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,7 +106,7 @@ impl InputRouter {
                 let point = CanvasPoint::new(position.x as f32, position.y as f32);
                 self.last_cursor_position = Some(point);
                 (self.active_pointer == Some(ActivePointer::Mouse))
-                    .then_some(PointerAction::Move(point))
+                    .then_some(PointerAction::Move(self.sample(point)))
             }
             WindowEvent::MouseInput { state, button, .. }
                 if *button == MouseButton::Left && !self.has_active_touch() =>
@@ -181,7 +218,7 @@ impl InputRouter {
     fn route_pen(
         &mut self,
         phase: PenPhase,
-        points: Vec<CanvasPoint>,
+        points: Vec<PointerSample>,
         ui_hit: bool,
         canvas_enabled: bool,
     ) -> Option<PointerAction> {
@@ -227,11 +264,11 @@ impl InputRouter {
         match state {
             ElementState::Pressed if !ui_consumed && self.active_pointer.is_none() => {
                 self.active_pointer = Some(ActivePointer::Mouse);
-                Some(PointerAction::Begin(point))
+                Some(PointerAction::Begin(self.sample(point)))
             }
             ElementState::Released if self.active_pointer == Some(ActivePointer::Mouse) => {
                 self.active_pointer = None;
-                Some(PointerAction::End(point))
+                Some(PointerAction::End(self.sample(point)))
             }
             _ => None,
         }
@@ -249,14 +286,14 @@ impl InputRouter {
         match phase {
             TouchPhase::Started if !ui_consumed && self.active_pointer.is_none() => {
                 self.active_pointer = Some(pointer);
-                Some(PointerAction::Begin(point))
+                Some(PointerAction::Begin(self.sample(point)))
             }
             TouchPhase::Moved if self.active_pointer == Some(pointer) => {
-                Some(PointerAction::Move(point))
+                Some(PointerAction::Move(self.sample(point)))
             }
             TouchPhase::Ended if self.active_pointer == Some(pointer) => {
                 self.active_pointer = None;
-                Some(PointerAction::End(point))
+                Some(PointerAction::End(self.sample(point)))
             }
             TouchPhase::Cancelled if self.active_pointer == Some(pointer) => {
                 self.active_pointer = None;
@@ -269,6 +306,11 @@ impl InputRouter {
     /// 返回当前是否已有触摸接触占用画布输入。
     fn has_active_touch(&self) -> bool {
         matches!(self.active_pointer, Some(ActivePointer::Touch(_)))
+    }
+
+    /// 将一个普通 winit 点转换为路由器时间基准下的采样。
+    fn sample(&self, point: CanvasPoint) -> PointerSample {
+        PointerSample::new(point, self.clock_start.elapsed().as_micros() as u64)
     }
 
     /// 在存在活动指针时生成一次取消动作。
@@ -315,8 +357,16 @@ mod tests {
     }
 
     /// 创建用于原生触控笔路由测试的批量位置。
-    fn pen_points() -> Vec<CanvasPoint> {
-        vec![CanvasPoint::new(12.0, 16.0), CanvasPoint::new(20.0, 24.0)]
+    fn pen_points() -> Vec<PointerSample> {
+        vec![
+            PointerSample::new(CanvasPoint::new(12.0, 16.0), 100),
+            PointerSample::new(CanvasPoint::new(20.0, 24.0), 200),
+        ]
+    }
+
+    /// 创建用于候选触摸回放断言的固定时间采样。
+    fn buffered_sample(point: CanvasPoint) -> PointerSample {
+        PointerSample::new(point, 100)
     }
 
     /// 验证原生笔接触期间提升的左键和移动事件不会生成重复画布动作。
@@ -594,7 +644,7 @@ mod tests {
         assert_eq!(
             router.route_windows_pointer(
                 WindowsPointerEvent::CandidateRejected {
-                    points: vec![sample.center],
+                    points: vec![buffered_sample(sample.center)],
                     session_ended: false,
                 },
                 false,
@@ -631,13 +681,15 @@ mod tests {
         assert_eq!(
             router.route_windows_pointer(
                 WindowsPointerEvent::CandidateRejected {
-                    points: vec![sample.center],
+                    points: vec![buffered_sample(sample.center)],
                     session_ended: true,
                 },
                 true,
                 true,
             ),
-            Some(PointerAction::CommitBuffered(vec![sample.center]))
+            Some(PointerAction::CommitBuffered(vec![buffered_sample(
+                sample.center,
+            )]))
         );
         router.route_windows_pointer(
             WindowsPointerEvent::PalmCandidate {

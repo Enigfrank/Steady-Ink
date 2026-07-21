@@ -6,7 +6,9 @@ use egui::{
 use super::{
     design_tokens::{self as tokens, InterfaceMetrics},
     pixel_snap,
-    settings_controls::{render_log_level_selector, render_tool_preferences},
+    settings_controls::{
+        render_ink_antialiasing_selector, render_log_level_selector, render_tool_preferences,
+    },
     toolbar::{Icon, UiCommand, UiViewState, paint_icon},
 };
 use crate::slideshow::{ComCandidateStatus, ComDiagnostics};
@@ -42,6 +44,7 @@ pub fn render(ui: &mut Ui, view: UiViewState<'_>) -> Option<UiCommand> {
                             view.tools,
                             tokens::SETTINGS_METRICS,
                             view.readable_mode,
+                            true,
                         );
                     if command.is_none() {
                         command = preferences_command;
@@ -59,6 +62,21 @@ pub fn render(ui: &mut Ui, view: UiViewState<'_>) -> Option<UiCommand> {
                         && command.is_none()
                     {
                         command = Some(UiCommand::SetReadableMode(readable_mode));
+                    }
+                    let antialiasing_command = render_ink_antialiasing_selector(
+                        ui,
+                        view.ink_antialiasing,
+                        metrics,
+                    );
+                    if command.is_none() {
+                        command = antialiasing_command;
+                    }
+                    if let Some(error) = view.ink_rendering_error {
+                        ui.label(
+                            egui::RichText::new(error)
+                                .size(metrics.text_xs)
+                                .color(tokens::COLOR_ERROR),
+                        );
                     }
 
                     section_break(ui, metrics);
@@ -328,6 +346,17 @@ fn render_diagnostics(ui: &mut Ui, view: UiViewState<'_>, metrics: InterfaceMetr
         "图形设备",
         &view.graphics_diagnostics.renderer,
         if view.graphics_diagnostics.software_fallback {
+            tokens::COLOR_ERROR
+        } else {
+            tokens::COLOR_TEXT_PRIMARY
+        },
+        metrics,
+    );
+    diagnostic_row(
+        ui,
+        "墨迹渲染",
+        view.ink_rendering_error.unwrap_or("正常"),
+        if view.ink_rendering_error.is_some() {
             tokens::COLOR_ERROR
         } else {
             tokens::COLOR_TEXT_PRIMARY

@@ -7,7 +7,7 @@ use super::{
 };
 use crate::{
     ink::{EraserSize, InkColor, PenWidth},
-    settings::LogLevel,
+    settings::{InkAntialiasingMode, LogLevel},
 };
 
 const COLORS: [InkColor; 6] = [
@@ -65,12 +65,13 @@ pub(super) const fn pen_width_selector_width(
     orientation.popup_width(PEN_WIDTHS.len(), metrics)
 }
 
-/// 绘制颜色、画笔粗细和区域橡皮擦大小三组共用选择控件。
+/// 绘制共用工具偏好，并按入口决定是否显示速度笔锋开关。
 pub fn render_tool_preferences(
     ui: &mut Ui,
     tools: ToolState,
     metrics: InterfaceMetrics,
     readable_mode: bool,
+    show_speed_taper: bool,
 ) -> Option<UiCommand> {
     let color_command = render_color_selector(
         ui,
@@ -86,9 +87,51 @@ pub fn render_tool_preferences(
         metrics,
         readable_mode,
     );
+    let mut command = color_command.or(pen_width_command);
+    if show_speed_taper {
+        ui.add_space(metrics.space_2);
+        let mut speed_taper_enabled = tools.speed_taper_enabled;
+        if ui
+            .add_sized(
+                [ui.available_width(), metrics.touch_target],
+                egui::Checkbox::new(&mut speed_taper_enabled, "速度模拟笔锋"),
+            )
+            .changed()
+            && command.is_none()
+        {
+            command = Some(UiCommand::SetSpeedTaperEnabled(speed_taper_enabled));
+        }
+    }
     let eraser_size_command =
         render_eraser_size_selector(ui, tools.eraser_size, metrics, readable_mode);
-    color_command.or(pen_width_command).or(eraser_size_command)
+    if command.is_none() {
+        command = eraser_size_command;
+    }
+    command
+}
+
+/// 绘制完整设置页的三档墨迹抗锯齿选择，并返回当前帧的模式命令。
+pub(super) fn render_ink_antialiasing_selector(
+    ui: &mut Ui,
+    selected: InkAntialiasingMode,
+    metrics: InterfaceMetrics,
+) -> Option<UiCommand> {
+    section_label(ui, "墨迹抗锯齿", metrics);
+    let mut command = None;
+    ui.horizontal(|ui| {
+        for mode in InkAntialiasingMode::ALL {
+            if ui
+                .add_sized(
+                    Vec2::splat(metrics.touch_target),
+                    egui::Button::selectable(selected == mode, mode.label()),
+                )
+                .clicked()
+            {
+                command = Some(UiCommand::SetInkAntialiasing(mode));
+            }
+        }
+    });
+    command
 }
 
 /// 绘制四档日志级别的紧凑选择按钮，并返回当前帧的设置命令。

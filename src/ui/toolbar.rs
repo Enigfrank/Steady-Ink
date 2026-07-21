@@ -13,7 +13,7 @@ use super::{
 use crate::{
     app::AppMode,
     ink::{EraserSize, InkColor, InkTool, PenWidth},
-    settings::LogLevel,
+    settings::{InkAntialiasingMode, LogLevel},
     slideshow::ComDiagnostics,
     window::{DockSide, GraphicsDiagnostics},
 };
@@ -29,6 +29,8 @@ pub enum UiCommand {
     SetColor(InkColor),
     SetPenWidth(PenWidth),
     SetEraserSize(EraserSize),
+    SetSpeedTaperEnabled(bool),
+    SetInkAntialiasing(InkAntialiasingMode),
     Undo,
     Clear,
     OpenSettings,
@@ -68,6 +70,8 @@ pub struct UiViewState<'a> {
     pub slideshow_integration_enabled: bool,
     pub log_level: LogLevel,
     pub readable_mode: bool,
+    pub ink_antialiasing: InkAntialiasingMode,
+    pub ink_rendering_error: Option<&'a str>,
     pub slideshow_session_generation: Option<u64>,
     pub slide_page_numbers: Option<(u32, u32)>,
     pub slideshow_controls_enabled: bool,
@@ -88,6 +92,7 @@ pub struct ToolState {
     pub color: InkColor,
     pub pen_width: PenWidth,
     pub eraser_size: EraserSize,
+    pub speed_taper_enabled: bool,
 }
 
 /// 工具按钮组在当前帧产生的命令和拖动状态。
@@ -124,6 +129,7 @@ impl Default for ToolState {
             color: InkColor::default(),
             pen_width: PenWidth::default(),
             eraser_size: EraserSize::default(),
+            speed_taper_enabled: false,
         }
     }
 }

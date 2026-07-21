@@ -16,16 +16,11 @@
 [中文](./README.md)
 
 > [!WARNING]
-> Steady Ink is still in early development. Its main features are usable, but the target 4K touchscreen hardware and additional Office/WPS environments still require validation.
+> Steady Ink is still in early development. Use it with caution.
 
 ## Features
 
-- A draggable floating toolbar and transparent annotation layer that snap to either screen edge.
-- Finger and pen drawing, color and width selection, region erasing, clear, and undo.
-- Pen-first palm rejection and dynamic palm erasing when no pen is active.
-- PowerPoint/WPS presentation detection, navigation, reconnection, and per-position ink.
-- Quick settings, full settings, local preferences, and runtime diagnostics.
-- DirectComposition, D3D12, and Skia GPU composition with no continuous redraw while idle.
+- The standard features expected of a screen annotation tool.
 
 ## Status
 
@@ -35,10 +30,19 @@
 | Windows touch, palm rejection, and palm erasing | Implemented; target hardware tuning remains |
 | PowerPoint presentation integration | Basic validation completed |
 | WPS presentation integration | Adapted; more real environments required |
-| Intel integrated-GPU performance | Pending validation on target hardware |
-| Windows installer and formal release | Pending |
 
-## Run
+## Installation
+
+Download the Windows x64 Inno Setup installer and its SHA-256 file from [GitHub Releases](https://github.com/Enigfrank/Steady-Ink/releases).
+
+- A fresh installation enables machine-wide startup by default.
+- The desktop shortcut is selected by default; the Start Menu shortcut is optional and unselected by default.
+- The completion page runs Steady Ink by default; silent installs never start the interactive app.
+- An upgrade preserves the actual machine-wide startup state. Uninstall removes Steady Ink's startup value and selected shortcuts.
+
+The full settings page exposes “Start with Windows for all users”. Changing it requests UAC; cancelling or failing leaves the previous state unchanged.
+
+## Run from Source
 
 Steady Ink requires 64-bit Windows 10/11, Rust 1.92+, the MSVC toolchain, and a Direct3D 12-capable GPU.
 
@@ -65,10 +69,10 @@ The source is organized into `app`, `window`, `render`, `ui`, `ink`, `input`, `s
 
 ## Scope and Privacy
 
-Steady Ink currently supports Windows and a single monitor. It does not include cloud sync, accounts, collaboration, persistent ink, screenshot saving, or writing ink back to presentation files.
+Steady Ink currently supports Windows and a single monitor. It does not include any network features.
 
 Ink remains in memory for the current run. Preferences are stored in `%APPDATA%\Steady-Ink\settings.toml`. The project contains no telemetry or online services.
 
 ## License
 
-Steady Ink and its original project icon are licensed under [GPL-3.0-or-later](./LICENSE).
+Steady Ink and its original project icon are licensed under [GPL-3.0](./LICENSE).

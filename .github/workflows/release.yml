@@ -1,0 +1,97 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: Release quality gate
+    runs-on: windows-2022
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.92.0-x86_64-pc-windows-msvc
+          components: rustfmt, clippy
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: windows-x64-msvc-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: windows-x64-msvc-release-
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check compilation
+        run: cargo check --locked
+
+      - name: Run strict Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Run tests
+        run: cargo test --locked
+
+      - name: Build release executable
+        run: cargo build --release --locked
+
+  package:
+    name: Build Inno Setup installer
+    needs: quality
+    runs-on: windows-2022
+    permissions:
+      contents: write
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.92.0-x86_64-pc-windows-msvc
+          components: rustfmt, clippy
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --no-progress --yes
+
+      - name: Build installer and checksum
+        shell: pwsh
+        run: .\scripts\release\package.ps1 -Tag "${{ github.ref_name }}"
+
+      - name: Verify release assets
+        shell: pwsh
+        run: |
+          $metadata = cargo metadata --no-deps --format-version 1 --locked | ConvertFrom-Json
+          $version = [string]$metadata.packages[0].version
+          $setup = Join-Path $PWD "dist\Steady-Ink-$version-Setup.exe"
+          $checksum = "$setup.sha256"
+          if (-not (Test-Path -LiteralPath $setup) -or -not (Test-Path -LiteralPath $checksum)) { throw 'Release assets are incomplete.' }
+          $actual = (Get-FileHash -LiteralPath $setup -Algorithm SHA256).Hash.ToLowerInvariant()
+          $expected = (Get-Content -LiteralPath $checksum -Raw).Trim().Split(' ', [System.StringSplitOptions]::RemoveEmptyEntries)[0]
+          if ($actual -ne $expected) { throw 'SHA-256 checksum does not match the installer.' }
+
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $metadata = cargo metadata --no-deps --format-version 1 --locked | ConvertFrom-Json
+          $version = [string]$metadata.packages[0].version
+          $assets = @(
+            (Join-Path $PWD "dist\Steady-Ink-$version-Setup.exe"),
+            (Join-Path $PWD "dist\Steady-Ink-$version-Setup.exe.sha256")
+          )
+          & gh release create "${{ github.ref_name }}" '--title' "Steady Ink $version" '--generate-notes' @assets

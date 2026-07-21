@@ -9,12 +9,16 @@ permissions:
   contents: read
 
 jobs:
-  quality:
-    name: Release quality gate
+  release:
+    name: Build and publish release
     runs-on: windows-2022
+    permissions:
+      contents: write
     steps:
       - name: Check out source
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
@@ -22,21 +26,13 @@ jobs:
           toolchain: 1.92.0-x86_64-pc-windows-msvc
           components: rustfmt, clippy
 
-      - name: Cache Cargo
-        uses: actions/cache@v4
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: windows-x64-msvc-release-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: windows-x64-msvc-release-
+          shared-key: windows-x64-msvc
 
       - name: Check formatting
         run: cargo fmt --all -- --check
-
-      - name: Check compilation
-        run: cargo check --locked
 
       - name: Run strict Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
@@ -46,22 +42,6 @@ jobs:
 
       - name: Build release executable
         run: cargo build --release --locked
-
-  package:
-    name: Build Inno Setup installer
-    needs: quality
-    runs-on: windows-2022
-    permissions:
-      contents: write
-    steps:
-      - name: Check out tagged source
-        uses: actions/checkout@v4
-
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.92.0-x86_64-pc-windows-msvc
-          components: rustfmt, clippy
 
       - name: Install Inno Setup
         shell: pwsh

@@ -24,15 +24,10 @@ jobs:
           toolchain: 1.92.0-x86_64-pc-windows-msvc
           components: rustfmt, clippy
 
-      - name: Cache Cargo
-        uses: actions/cache@v4
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: windows-x64-msvc-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: windows-x64-msvc-cargo-
+          shared-key: windows-x64-msvc
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -45,6 +40,3 @@ jobs:
 
       - name: Run tests
         run: cargo test --locked
-
-      - name: Verify release build
-        run: cargo build --release --locked

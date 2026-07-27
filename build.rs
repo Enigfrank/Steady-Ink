@@ -12,6 +12,7 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=RC");
     println!("cargo:rerun-if-env-changed=ProgramFiles");
+    println!("cargo:rerun-if-env-changed=ProgramFiles(x86)");
     println!("cargo:rerun-if-env-changed=ProgramW6432");
 
     let manifest_dir =
@@ -81,23 +82,63 @@ fn compile_windows_resources(ico_path: &Path, out_dir: &Path) {
 }
 
 /// 返回当前环境中可用的 Windows 资源编译器。
+///
+/// 只探测受信任位置的绝对路径（显式 `RC` 覆盖、LLVM 安装目录、Windows SDK 目录），
+/// 不通过 PATH 解析裸文件名，避免构建时被 PATH 中同名的恶意程序劫持。
 fn find_resource_compiler() -> Option<PathBuf> {
-    let llvm_candidates = ["ProgramW6432", "ProgramFiles"]
+    let rc_override = env::var_os("RC").map(PathBuf::from).and_then(|path| {
+        if path.is_absolute() {
+            Some(path)
+        } else {
+            println!("cargo:warning=忽略非绝对路径的 RC 环境变量: {}", path.display());
+            None
+        }
+    });
+    rc_override
+        .into_iter()
+        .chain(llvm_rc_candidates())
+        .chain(windows_sdk_rc_candidates())
+        .find(|candidate| {
+            candidate.is_file()
+                && Command::new(candidate)
+                    .args(["/?"])
+                    .output()
+                    .is_ok_and(|output| output.status.success() || !output.stderr.is_empty())
+        })
+}
+
+/// 返回 LLVM 安装目录下的 llvm-rc.exe 候选路径。
+fn llvm_rc_candidates() -> impl Iterator<Item = PathBuf> {
+    ["ProgramW6432", "ProgramFiles"]
         .into_iter()
         .filter_map(env::var_os)
         .map(PathBuf::from)
-        .map(|root| root.join("LLVM").join("bin").join("llvm-rc.exe"));
-    let mut candidates = env::var_os("RC")
-        .into_iter()
+        .map(|root| root.join("LLVM").join("bin").join("llvm-rc.exe"))
+}
+
+/// 按版本号倒序返回 Windows 10/11 SDK 自带的 rc.exe 候选路径。
+fn windows_sdk_rc_candidates() -> Vec<PathBuf> {
+    let Some(bin_root) = env::var_os("ProgramFiles(x86)")
         .map(PathBuf::from)
-        .chain([PathBuf::from("rc.exe"), PathBuf::from("llvm-rc.exe")])
-        .chain(llvm_candidates);
-    candidates.find(|candidate| {
-        Command::new(candidate)
-            .args(["/?"])
-            .output()
-            .is_ok_and(|output| output.status.success() || !output.stderr.is_empty())
-    })
+        .map(|root| root.join("Windows Kits").join("10").join("bin"))
+    else {
+        return Vec::new();
+    };
+    let mut versions: Vec<PathBuf> = fs::read_dir(&bin_root)
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| path.is_dir())
+                .collect()
+        })
+        .unwrap_or_default();
+    versions.sort();
+    versions
+        .into_iter()
+        .rev()
+        .map(|version| version.join("x64").join("rc.exe"))
+        .collect()
 }
 
 /// 构造包含图标和 Cargo 版本信息的 .rc 文本。

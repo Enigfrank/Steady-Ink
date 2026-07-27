@@ -1,4 +1,4 @@
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::SyncSender;
 
 use windows::{
     Win32::{
@@ -64,7 +64,7 @@ impl Drop for EventSubscription {
 
 #[implement(IDispatch)]
 struct DispatchEventSink {
-    event_sender: Sender<i32>,
+    event_sender: SyncSender<i32>,
 }
 
 #[allow(non_snake_case)]
@@ -103,7 +103,8 @@ impl IDispatch_Impl for DispatchEventSink_Impl {
         _pexcepinfo: *mut windows::Win32::System::Com::EXCEPINFO,
         _puargerr: *mut u32,
     ) -> windows::core::Result<()> {
-        let _ = self.event_sender.send(dispidmember);
+        // 事件只作为唤醒信号触发状态重查，队列已满时丢弃即可，绝不阻塞 COM 回调线程。
+        let _ = self.event_sender.try_send(dispidmember);
         Ok(())
     }
 }
@@ -146,7 +147,7 @@ pub(crate) fn application_is_visible(application: &IDispatch) -> windows::core::
 /// 为 PowerPoint 兼容的 EApplication connection point 安装事件 sink。
 pub(crate) fn subscribe_application_events(
     application: &IDispatch,
-    event_sender: Sender<i32>,
+    event_sender: SyncSender<i32>,
 ) -> windows::core::Result<EventSubscription> {
     let container = application.cast::<IConnectionPointContainer>()?;
     // SAFETY: 使用 PowerPoint EApplication dispinterface 的稳定 IID 查询连接点。

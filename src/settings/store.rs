@@ -34,18 +34,21 @@ impl SettingsStore {
 
     /// 从磁盘读取设置；文件尚不存在时返回产品默认值。
     pub fn load(&self) -> Result<UserSettings, AppError> {
-        if !self.path.exists() {
-            return Ok(UserSettings::default());
+        match fs::read_to_string(&self.path) {
+            Ok(source) => toml::from_str(&source).map_err(|error| {
+                AppError::Settings(format!("解析 {} 失败: {error}", self.path.display()))
+            }),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(UserSettings::default())
+            }
+            Err(error) => Err(AppError::Settings(format!(
+                "读取 {} 失败: {error}",
+                self.path.display()
+            ))),
         }
-        let source = fs::read_to_string(&self.path).map_err(|error| {
-            AppError::Settings(format!("读取 {} 失败: {error}", self.path.display()))
-        })?;
-        toml::from_str(&source).map_err(|error| {
-            AppError::Settings(format!("解析 {} 失败: {error}", self.path.display()))
-        })
     }
 
-    /// 创建父目录并覆盖写入完整设置快照。
+    /// 创建父目录，先写临时文件再原子替换，避免写入中断留下截断的设置文件。
     pub fn save(&self, settings: &UserSettings) -> Result<(), AppError> {
         let parent = self
             .path
@@ -56,8 +59,13 @@ impl SettingsStore {
         })?;
         let serialized = toml::to_string_pretty(settings)
             .map_err(|error| AppError::Settings(format!("序列化设置失败: {error}")))?;
-        fs::write(&self.path, serialized).map_err(|error| {
-            AppError::Settings(format!("写入 {} 失败: {error}", self.path.display()))
+        let temporary = parent.join(format!("{SETTINGS_FILE}.tmp"));
+        fs::write(&temporary, serialized).map_err(|error| {
+            AppError::Settings(format!("写入 {} 失败: {error}", temporary.display()))
+        })?;
+        fs::rename(&temporary, &self.path).map_err(|error| {
+            let _ = fs::remove_file(&temporary);
+            AppError::Settings(format!("替换 {} 失败: {error}", self.path.display()))
         })
     }
 
@@ -91,10 +99,10 @@ impl SettingsStore {
         Ok(logs_directory)
     }
 
-    /// 确保配置目录存在后，通过 Windows 文件资源管理器打开该目录。
+    /// 确保配置目录存在后，通过系统目录下的 Windows 文件资源管理器打开该目录。
     pub fn open_directory(&self) -> Result<(), AppError> {
         let directory = self.ensure_directory()?;
-        Command::new("explorer.exe")
+        Command::new(explorer_path())
             .arg(directory)
             .spawn()
             .map_err(|error| {
@@ -105,4 +113,12 @@ impl SettingsStore {
             })?;
         Ok(())
     }
+}
+
+/// 返回系统目录中 explorer.exe 的绝对路径，避免 PATH 解析被劫持。
+fn explorer_path() -> PathBuf {
+    std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
+        .join("explorer.exe")
 }

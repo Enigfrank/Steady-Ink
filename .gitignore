@@ -21,3 +21,5 @@ dist/
 /.codex
 /.trellis
 AGENTS.md
+CLAUDE.md
+/.claude

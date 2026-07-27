@@ -269,9 +269,16 @@ impl D3DWindowContext {
         &self.diagnostics
     }
 
-    /// 返回当前 DXGI back buffer 索引。
-    pub fn current_back_buffer_index(&self) -> usize {
-        unsafe { self.swap_chain.GetCurrentBackBufferIndex() as usize }
+    /// 返回当前 DXGI back buffer 索引，如果索引超出预期范围则返回错误。
+    pub fn current_back_buffer_index(&self) -> Result<usize, AppError> {
+        let index = unsafe { self.swap_chain.GetCurrentBackBufferIndex() };
+        let index_usize = index as usize;
+        if index_usize >= SWAP_CHAIN_BUFFER_COUNT {
+            return Err(AppError::Graphics(format!(
+                "DXGI 返回了超出范围的 back buffer 索引: {index}，预期范围 0..{SWAP_CHAIN_BUFFER_COUNT}"
+            )));
+        }
+        Ok(index_usize)
     }
 
     /// 返回当前 composition swap chain 的物理像素尺寸。
@@ -360,8 +367,12 @@ impl D3DWindowContext {
             .unwrap_or_else(|_| self.idle_position(view));
         let window_size = self.window.inner_size();
         let monitor_center =
-            self.geometry.annotation_position.x + self.geometry.annotation_size.width as i32 / 2;
-        let window_center = window_position.x + window_size.width as i32 / 2;
+            self.geometry.annotation_position.x.saturating_add(
+                safe_u32_to_i32(self.geometry.annotation_size.width) / 2
+            );
+        let window_center = window_position.x.saturating_add(
+            safe_u32_to_i32(window_size.width) / 2
+        );
         let side = if window_center < monitor_center {
             DockSide::Left
         } else {
@@ -592,6 +603,11 @@ fn graphics_error(context: &str, error: windows::core::Error) -> AppError {
     AppError::Graphics(format!("{context}: {error}"))
 }
 
+/// 安全地将 u32 转换为 i32，溢出时返回 i32::MAX。
+fn safe_u32_to_i32(value: u32) -> i32 {
+    i32::try_from(value).unwrap_or(i32::MAX)
+}
+
 /// 计算一个窗口在主显示器右侧边缘内缩后的垂直居中位置。
 fn right_centered_position(
     monitor_position: PhysicalPosition<i32>,
@@ -599,9 +615,18 @@ fn right_centered_position(
     window_size: PhysicalSize<u32>,
     edge_margin: i32,
 ) -> PhysicalPosition<i32> {
+    let monitor_width = safe_u32_to_i32(monitor_size.width);
+    let monitor_height = safe_u32_to_i32(monitor_size.height);
+    let window_width = safe_u32_to_i32(window_size.width);
+    let window_height = safe_u32_to_i32(window_size.height);
+
     PhysicalPosition::new(
-        monitor_position.x + monitor_size.width as i32 - window_size.width as i32 - edge_margin,
-        monitor_position.y + (monitor_size.height as i32 - window_size.height as i32) / 2,
+        monitor_position.x.saturating_add(monitor_width)
+            .saturating_sub(window_width)
+            .saturating_sub(edge_margin),
+        monitor_position.y.saturating_add(
+            monitor_height.saturating_sub(window_height) / 2
+        ),
     )
 }
 
@@ -612,9 +637,14 @@ fn left_centered_position(
     window_size: PhysicalSize<u32>,
     edge_margin: i32,
 ) -> PhysicalPosition<i32> {
+    let monitor_height = safe_u32_to_i32(monitor_size.height);
+    let window_height = safe_u32_to_i32(window_size.height);
+
     PhysicalPosition::new(
-        monitor_position.x + edge_margin,
-        monitor_position.y + (monitor_size.height as i32 - window_size.height as i32) / 2,
+        monitor_position.x.saturating_add(edge_margin),
+        monitor_position.y.saturating_add(
+            monitor_height.saturating_sub(window_height) / 2
+        ),
     )
 }
 
@@ -624,9 +654,18 @@ fn centered_position(
     monitor_size: PhysicalSize<u32>,
     window_size: PhysicalSize<u32>,
 ) -> PhysicalPosition<i32> {
+    let monitor_width = safe_u32_to_i32(monitor_size.width);
+    let monitor_height = safe_u32_to_i32(monitor_size.height);
+    let window_width = safe_u32_to_i32(window_size.width);
+    let window_height = safe_u32_to_i32(window_size.height);
+
     PhysicalPosition::new(
-        monitor_position.x + (monitor_size.width as i32 - window_size.width as i32) / 2,
-        monitor_position.y + (monitor_size.height as i32 - window_size.height as i32) / 2,
+        monitor_position.x.saturating_add(
+            monitor_width.saturating_sub(window_width) / 2
+        ),
+        monitor_position.y.saturating_add(
+            monitor_height.saturating_sub(window_height) / 2
+        ),
     )
 }
 
@@ -637,11 +676,18 @@ fn clamp_window_top(
     monitor_size: PhysicalSize<u32>,
     window_size: PhysicalSize<u32>,
 ) -> i32 {
+    let monitor_height = safe_u32_to_i32(monitor_size.height);
+    let window_height = safe_u32_to_i32(window_size.height);
+
     let minimum = monitor_position.y;
-    let maximum = monitor_position.y + monitor_size.height as i32 - window_size.height as i32;
+    let maximum = monitor_position.y.saturating_add(monitor_height)
+        .saturating_sub(window_height);
+
     if minimum <= maximum {
         desired_top.clamp(minimum, maximum)
     } else {
-        monitor_position.y + (monitor_size.height as i32 - window_size.height as i32) / 2
+        monitor_position.y.saturating_add(
+            monitor_height.saturating_sub(window_height) / 2
+        )
     }
 }

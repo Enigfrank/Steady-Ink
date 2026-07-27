@@ -247,6 +247,9 @@ impl EguiSkiaRenderer {
     }
 }
 
+/// 单个分组可容纳的最大顶点数；索引为 u16，达到上限必须切分新分组。
+const MAX_GROUP_VERTICES: usize = u16::MAX as usize + 1;
+
 /// 把字体纹理中的纯色三角形与字形三角形分组，规避 Skia 相同 UV 采样缺陷。
 fn split_font_mesh_by_texture_usage(mesh: Mesh16) -> Vec<Mesh16> {
     if mesh.texture_id != TextureId::default() {
@@ -262,7 +265,11 @@ fn split_font_mesh_by_texture_usage(mesh: Mesh16) -> Vec<Mesh16> {
                 .get(*index as usize)
                 .is_some_and(vertex_uses_white_texel)
         });
-        if current_uses_white != Some(uses_white) {
+        // 分组顶点数达到 u16 索引上限时强制切分新分组,避免索引截断。
+        let group_full = groups
+            .last()
+            .is_some_and(|group| group.vertices.len() + 3 > MAX_GROUP_VERTICES);
+        if current_uses_white != Some(uses_white) || group_full {
             groups.push(Mesh16 {
                 indices: Vec::new(),
                 vertices: Vec::new(),
@@ -270,9 +277,11 @@ fn split_font_mesh_by_texture_usage(mesh: Mesh16) -> Vec<Mesh16> {
             });
             current_uses_white = Some(uses_white);
         }
-        let group = groups
-            .last_mut()
-            .expect("每个三角形都必须拥有目标 mesh 分组");
+        // SAFETY: 每次迭代开始前都会确保 groups 不为空（第一次迭代或条件变化时 push）
+        let Some(group) = groups.last_mut() else {
+            tracing::warn!("egui mesh 分组逻辑错误：三角形没有目标分组");
+            continue;
+        };
         for index in triangle {
             if let Some(vertex) = mesh.vertices.get(*index as usize) {
                 group.vertices.push(*vertex);

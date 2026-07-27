@@ -210,11 +210,10 @@ impl Compositor {
             }
         }
 
-        let index = window_context.current_back_buffer_index();
-        let surface_count = self.window_surfaces.len();
+        let index = window_context.current_back_buffer_index()?;
         let target = self.window_surfaces.get_mut(index).ok_or_else(|| {
             AppError::Graphics(format!(
-                "DXGI 返回了无效 back buffer 索引 {index}，Skia surface 数量为 {surface_count}"
+                "内部错误：back buffer 索引 {index} 超出 Skia surface 数组范围"
             ))
         })?;
         let canvas = target.surface.canvas();

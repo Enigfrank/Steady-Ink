@@ -71,6 +71,26 @@ impl InkBounds {
             && self.top <= other.bottom
             && self.bottom >= other.top
     }
+
+    /// 从左上角坐标和宽高创建包围框。
+    pub const fn from_xywh(x: f32, y: f32, width: f32, height: f32) -> Self {
+        Self {
+            left: x,
+            top: y,
+            right: x + width,
+            bottom: y + height,
+        }
+    }
+
+    /// 返回包围框的宽度。
+    pub const fn width(&self) -> f32 {
+        self.right - self.left
+    }
+
+    /// 返回包围框的高度。
+    pub const fn height(&self) -> f32 {
+        self.bottom - self.top
+    }
 }
 
 /// 快速画笔颜色。

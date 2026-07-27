@@ -86,6 +86,14 @@ impl InkDocument {
         &self.operations
     }
 
+    /// 按单调操作标识使用二分查找返回事实历史中的操作。
+    pub fn operation(&self, id: OperationId) -> Option<&InkOperation> {
+        self.operations
+            .binary_search_by_key(&id.get(), |operation| operation.id().get())
+            .ok()
+            .map(|index| &self.operations[index])
+    }
+
     /// 返回从最近一次清屏之后开始、需要重放到空画布上的操作。
     pub fn replay_operations(&self) -> &[InkOperation] {
         let replay_start = self
@@ -113,5 +121,37 @@ impl InkDocument {
     fn allocate_operation_id(&mut self) -> OperationId {
         self.next_operation_id += 1;
         OperationId::new(self.next_operation_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 验证撤销后产生的操作标识间隙不会破坏二分查找。
+    #[test]
+    fn operation_finds_ids_across_undo_gap() {
+        let mut document = InkDocument::new();
+        let removed_id = document
+            .append_draw_stroke(
+                vec![CanvasPoint::new(0.0, 0.0), CanvasPoint::new(4.0, 4.0)],
+                InkColor::Red,
+                PenWidth::Px4,
+            )
+            .expect("有效笔画应创建操作");
+        document.undo();
+        let retained_id = document
+            .append_draw_stroke(
+                vec![CanvasPoint::new(8.0, 8.0), CanvasPoint::new(12.0, 12.0)],
+                InkColor::Blue,
+                PenWidth::Px8,
+            )
+            .expect("撤销后的有效笔画应创建新操作");
+
+        assert!(document.operation(removed_id).is_none());
+        assert_eq!(
+            document.operation(retained_id).map(InkOperation::id),
+            Some(retained_id)
+        );
     }
 }

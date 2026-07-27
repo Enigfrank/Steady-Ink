@@ -7,8 +7,8 @@ use skia_safe::{
 };
 
 use super::{
-    CanvasPoint, EraseSample, EraserSize, InkBounds, InkColor, InkDocument, InkOperation, InkTool,
-    OperationId, PenWidth, VariableStrokePoint,
+    BatchDrawer, CanvasPoint, EraseSample, EraserSize, InkBounds, InkColor, InkDocument,
+    InkOperation, InkSpatialIndex, InkTool, OperationId, PenWidth, VariableStrokePoint,
     stroke_geometry::{StrokeSegment, variable_outline, visit_smoothed_segments},
 };
 use crate::error::AppError;
@@ -40,6 +40,7 @@ const PALM_INTERPOLATION_MIN_STEP: f32 = 4.0;
 const PALM_INTERPOLATION_MAX_STEP: f32 = 24.0;
 const SUPER_SAMPLE_SCALE: f32 = 1.5;
 const PREVIEW_TILE_SIZE: f32 = 512.0;
+const MAX_INCREMENTAL_REBUILD_AREA_RATIO: f32 = 0.1;
 
 /// 描述墨迹离屏 surface 的逻辑尺寸、渲染尺寸和实际多采样配置。
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -94,6 +95,9 @@ pub struct InkRenderCache {
     config: InkSurfaceConfig,
     applied_operation_count: usize,
     last_operation_id: Option<OperationId>,
+    last_operation_was_clear: bool,
+    spatial_index: InkSpatialIndex,
+    batch_drawer: BatchDrawer,
     pending_region_rebuild: Option<InkBounds>,
     full_rebuild_requested: bool,
 }
@@ -118,6 +122,9 @@ impl InkRenderCache {
             config,
             applied_operation_count: 0,
             last_operation_id: None,
+            last_operation_was_clear: false,
+            spatial_index: InkSpatialIndex::new(logical_size),
+            batch_drawer: BatchDrawer::new(),
             pending_region_rebuild: None,
             full_rebuild_requested: false,
         })
@@ -147,11 +154,27 @@ impl InkRenderCache {
             return;
         }
 
-        for operation in &history[self.applied_operation_count..] {
-            draw_operation_with_config(self.surface.canvas(), operation, self.config);
+        let new_operations = &history[self.applied_operation_count..];
+        let started_at = (!new_operations.is_empty() && tracing::enabled!(tracing::Level::DEBUG))
+            .then(std::time::Instant::now);
+        let draw_calls = draw_operations_with_config(
+            self.surface.canvas(),
+            new_operations.iter(),
+            self.config,
+            &mut self.batch_drawer,
+        );
+        for operation in new_operations {
+            self.index_operation(operation);
         }
-        self.applied_operation_count = history.len();
-        self.last_operation_id = history.last().map(InkOperation::id);
+        if let Some(started_at) = started_at {
+            tracing::debug!(
+                operations = new_operations.len(),
+                draw_calls,
+                elapsed_micros = started_at.elapsed().as_micros(),
+                "增量墨迹渲染完成"
+            );
+        }
+        self.mark_document_applied(document);
     }
 
     /// 返回当前 GPU 墨迹层快照，供同一上下文合成到窗口 framebuffer。
@@ -188,28 +211,53 @@ impl InkRenderCache {
         if self.full_rebuild_requested {
             return;
         }
-        self.pending_region_rebuild = Some(
-            self.pending_region_rebuild
-                .map_or(bounds, |current| current.union(bounds)),
-        );
+        let combined_bounds = self
+            .pending_region_rebuild
+            .map_or(bounds, |current| current.union(bounds));
+        if is_small_rebuild_region(self.logical_size, combined_bounds) {
+            self.pending_region_rebuild = Some(combined_bounds);
+        } else {
+            self.invalidate();
+        }
     }
 
     /// 从最近一次清屏后的可见操作重建整个活动页 GPU surface。
     fn rebuild(&mut self, document: &InkDocument) {
         self.surface.canvas().clear(Color::TRANSPARENT);
-        for operation in document.replay_operations() {
-            draw_operation_with_config(self.surface.canvas(), operation, self.config);
+        let operations = document.replay_operations();
+        let started_at = tracing::enabled!(tracing::Level::DEBUG).then(std::time::Instant::now);
+        let draw_calls = draw_operations_with_config(
+            self.surface.canvas(),
+            operations.iter(),
+            self.config,
+            &mut self.batch_drawer,
+        );
+        self.rebuild_spatial_index(document);
+        if let Some(started_at) = started_at {
+            tracing::debug!(
+                operations = operations.len(),
+                draw_calls,
+                elapsed_micros = started_at.elapsed().as_micros(),
+                "全量墨迹重建完成"
+            );
         }
-        self.applied_operation_count = document.operations().len();
-        self.last_operation_id = document.operations().last().map(InkOperation::id);
+        self.mark_document_applied(document);
         self.pending_region_rebuild = None;
         self.full_rebuild_requested = false;
     }
 
     /// 清理指定矩形并按事实历史顺序重放所有与该矩形相交的可见操作。
     fn rebuild_region(&mut self, document: &InkDocument, bounds: InkBounds) {
+        self.prepare_spatial_index_for_region(document);
+        let mut operation_ids = self.spatial_index.query(bounds);
+        operation_ids.sort_unstable_by_key(|id| id.get());
+        let operations: Vec<_> = operation_ids
+            .into_iter()
+            .filter_map(|id| document.operation(id))
+            .collect();
         let clip_rect = Rect::new(bounds.left, bounds.top, bounds.right, bounds.bottom);
-        with_logical_canvas(self.surface.canvas(), self.config, |canvas| {
+        let started_at = tracing::enabled!(tracing::Level::DEBUG).then(std::time::Instant::now);
+        let draw_calls = with_logical_canvas(self.surface.canvas(), self.config, |canvas| {
             let save_count = canvas.save();
             canvas.clip_rect(clip_rect, ClipOp::Intersect, false);
 
@@ -217,19 +265,85 @@ impl InkRenderCache {
             clear_paint.set_style(PaintStyle::Fill);
             clear_paint.set_blend_mode(BlendMode::Clear);
             canvas.draw_rect(clip_rect, &clear_paint);
-            for operation in document.replay_operations() {
-                if operation
-                    .bounds()
-                    .is_some_and(|operation_bounds| operation_bounds.intersects(bounds))
-                {
-                    draw_operation(canvas, operation);
-                }
-            }
+            let draw_calls =
+                draw_operations(canvas, operations.iter().copied(), &mut self.batch_drawer);
             canvas.restore_to_count(save_count);
+            draw_calls + 1
         });
-        self.applied_operation_count = document.operations().len();
-        self.last_operation_id = document.operations().last().map(InkOperation::id);
+        if let Some(started_at) = started_at {
+            tracing::debug!(
+                operations = operations.len(),
+                draw_calls,
+                elapsed_micros = started_at.elapsed().as_micros(),
+                "局部墨迹重建完成"
+            );
+        }
+        self.mark_document_applied(document);
     }
+
+    /// 把一个新事实操作同步到当前可见操作的空间索引。
+    fn index_operation(&mut self, operation: &InkOperation) {
+        if matches!(operation, InkOperation::Clear(_)) {
+            self.spatial_index.clear();
+        } else if let Some(bounds) = operation.bounds() {
+            self.spatial_index.insert(operation.id(), bounds);
+        }
+    }
+
+    /// 按最近一次清屏后的事实历史重建空间索引。
+    fn rebuild_spatial_index(&mut self, document: &InkDocument) {
+        self.spatial_index.rebuild(
+            document
+                .replay_operations()
+                .iter()
+                .filter_map(|operation| operation.bounds().map(|bounds| (operation.id(), bounds))),
+        );
+    }
+
+    /// 为局部重建同步索引，优先处理无变化或单次尾部撤销。
+    fn prepare_spatial_index_for_region(&mut self, document: &InkDocument) {
+        let history = document.operations();
+        let unchanged = self.applied_operation_count == history.len()
+            && self.last_operation_id == history.last().map(InkOperation::id);
+        if unchanged {
+            return;
+        }
+
+        let current_tail_precedes_applied = match (history.last(), self.last_operation_id) {
+            (Some(current), Some(applied)) => current.id().get() < applied.get(),
+            (None, Some(_)) => true,
+            _ => false,
+        };
+        let single_tail_removal = !self.last_operation_was_clear
+            && self.applied_operation_count == history.len() + 1
+            && current_tail_precedes_applied;
+        if single_tail_removal && let Some(removed_id) = self.last_operation_id {
+            self.spatial_index.remove(removed_id);
+        } else {
+            self.rebuild_spatial_index(document);
+        }
+    }
+
+    /// 记录缓存和索引已经同步到文档事实历史末尾。
+    fn mark_document_applied(&mut self, document: &InkDocument) {
+        let history = document.operations();
+        self.applied_operation_count = history.len();
+        self.last_operation_id = history.last().map(InkOperation::id);
+        self.last_operation_was_clear = history
+            .last()
+            .is_some_and(|operation| matches!(operation, InkOperation::Clear(_)));
+    }
+}
+
+/// 返回目标区域裁剪到逻辑画布后是否适合局部重建。
+fn is_small_rebuild_region(logical_size: [u32; 2], bounds: InkBounds) -> bool {
+    let canvas_width = logical_size[0].max(1) as f32;
+    let canvas_height = logical_size[1].max(1) as f32;
+    let width = bounds.right.min(canvas_width) - bounds.left.max(0.0);
+    let height = bounds.bottom.min(canvas_height) - bounds.top.max(0.0);
+    let affected_area = width.max(0.0) * height.max(0.0);
+    affected_area.is_finite()
+        && affected_area < canvas_width * canvas_height * MAX_INCREMENTAL_REBUILD_AREA_RATIO
 }
 
 /// 创建活动页或局部预览的离屏 GPU surface，并校验实际 MSAA 配置。
@@ -282,20 +396,52 @@ fn create_gpu_surface(
 }
 
 /// 在需要时给逻辑墨迹绘制设置固定的渲染倍率。
-fn with_logical_canvas(canvas: &Canvas, config: InkSurfaceConfig, draw: impl FnOnce(&Canvas)) {
+fn with_logical_canvas<T>(
+    canvas: &Canvas,
+    config: InkSurfaceConfig,
+    draw: impl FnOnce(&Canvas) -> T,
+) -> T {
     if (config.render_scale - 1.0).abs() <= f32::EPSILON {
-        draw(canvas);
-        return;
+        return draw(canvas);
     }
     let save_count = canvas.save();
     canvas.scale((config.render_scale, config.render_scale));
-    draw(canvas);
+    let result = draw(canvas);
     canvas.restore_to_count(save_count);
+    result
 }
 
-/// 将事实 operation 通过指定 surface 的逻辑坐标系绘制。
-fn draw_operation_with_config(canvas: &Canvas, operation: &InkOperation, config: InkSurfaceConfig) {
-    with_logical_canvas(canvas, config, |canvas| draw_operation(canvas, operation));
+/// 通过指定 surface 的逻辑坐标系批量绘制一组事实操作。
+fn draw_operations_with_config<'a>(
+    canvas: &Canvas,
+    operations: impl IntoIterator<Item = &'a InkOperation>,
+    config: InkSurfaceConfig,
+    batch_drawer: &mut BatchDrawer,
+) -> usize {
+    with_logical_canvas(canvas, config, |canvas| {
+        draw_operations(canvas, operations, batch_drawer)
+    })
+}
+
+/// 按事实顺序绘制操作，并合并连续同属性的固定宽度笔画。
+fn draw_operations<'a>(
+    canvas: &Canvas,
+    operations: impl IntoIterator<Item = &'a InkOperation>,
+    batch_drawer: &mut BatchDrawer,
+) -> usize {
+    let mut draw_calls = 0;
+    for operation in operations {
+        if batch_drawer.try_add(operation) {
+            continue;
+        }
+        draw_calls += batch_drawer.flush(canvas);
+        if batch_drawer.try_add(operation) {
+            continue;
+        }
+        draw_operation(canvas, operation);
+        draw_calls += 1;
+    }
+    draw_calls + batch_drawer.flush(canvas)
 }
 
 /// 将一个事实 operation 应用到当前 GPU 墨迹层。
@@ -933,5 +1079,55 @@ mod tests {
         );
         assert_eq!(origin, CanvasPoint::new(512.0, 512.0));
         assert_eq!(size, [388, 188]);
+    }
+
+    /// 验证小脏区使用局部重建，而达到阈值时回退全量重建。
+    #[test]
+    fn dirty_region_strategy_uses_ten_percent_area_threshold() {
+        assert!(is_small_rebuild_region(
+            [1000, 1000],
+            InkBounds::from_xywh(0.0, 0.0, 100.0, 100.0)
+        ));
+        assert!(!is_small_rebuild_region(
+            [1000, 1000],
+            InkBounds::from_xywh(0.0, 0.0, 500.0, 200.0)
+        ));
+    }
+
+    /// 验证脏区按画布可见交集计算，画布外部分不会扩大重建范围。
+    #[test]
+    fn dirty_region_strategy_clips_area_to_canvas() {
+        assert!(is_small_rebuild_region(
+            [1000, 1000],
+            InkBounds::from_xywh(-900.0, -900.0, 1000.0, 1000.0)
+        ));
+    }
+
+    /// 验证生产批处理路径把 1000 条同属性笔画压缩为 10 次 Skia 提交。
+    #[test]
+    fn thousand_matching_strokes_use_ten_draw_calls() {
+        let mut document = InkDocument::new();
+        for index in 0..1000 {
+            let offset = (index % 32) as f32;
+            document.append_draw_stroke(
+                vec![
+                    CanvasPoint::new(offset, 0.0),
+                    CanvasPoint::new(offset, 32.0),
+                ],
+                InkColor::Red,
+                PenWidth::Px4,
+            );
+        }
+        let mut surface = skia_safe::surfaces::raster_n32_premul((64, 64))
+            .expect("测试 raster surface 应创建成功");
+
+        let draw_calls = draw_operations(
+            surface.canvas(),
+            document.operations().iter(),
+            &mut BatchDrawer::new(),
+        );
+
+        assert_eq!(draw_calls, 10);
+        assert!(draw_calls <= 700);
     }
 }

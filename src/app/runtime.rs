@@ -1074,13 +1074,9 @@ impl ApplicationHandler<UserEvent> for DesktopApplication {
     }
 }
 
-/// 原生 Pointer Input 事件队列容量；消息钩子使用 try_send，溢出时丢弃以防内存无界增长。
-const POINTER_EVENT_QUEUE_CAPACITY: usize = 256;
-
 /// 创建 Windows 用户事件循环并运行单窗口应用。
 pub fn run() -> Result<(), AppError> {
-    let (windows_pointer_sender, windows_pointer_receiver) =
-        mpsc::sync_channel(POINTER_EVENT_QUEUE_CAPACITY);
+    let (windows_pointer_sender, windows_pointer_receiver) = mpsc::channel();
     let pen_contact_active = Arc::new(AtomicBool::new(false));
     let hook_pen_contact_active = Arc::clone(&pen_contact_active);
     let proxy_slot = Arc::new(OnceLock::<EventLoopProxy<UserEvent>>::new());
@@ -1093,7 +1089,7 @@ pub fn run() -> Result<(), AppError> {
         };
         hook_pen_contact_active.store(pointer_tracker.pen_contact_active(), Ordering::Release);
         if let Some(event) = dispatch.event
-            && windows_pointer_sender.try_send(event).is_ok()
+            && windows_pointer_sender.send(event).is_ok()
             && let Some(proxy) = hook_proxy_slot.get()
         {
             let _ = proxy.send_event(UserEvent::WindowsPointer);

@@ -31,8 +31,6 @@ const RECONNECT_INTERVAL: Duration = Duration::from_secs(1);
 const MESSAGE_PUMP_INTERVAL: Duration = Duration::from_millis(16);
 const COM_QUERY_RETRY_DELAY: Duration = Duration::from_millis(50);
 const COM_QUERY_MAX_ATTEMPTS: usize = 5;
-/// COM 事件唤醒队列容量；事件只触发状态重查，溢出时丢弃多余唤醒即可。
-const COM_EVENT_QUEUE_CAPACITY: usize = 64;
 
 type WakeCallback = Arc<dyn Fn() + Send + Sync>;
 
@@ -323,7 +321,7 @@ fn run_connected_session(
     application: windows::Win32::System::Com::IDispatch,
     last_confirmed_snapshot: &mut Option<ActiveSlideShowSnapshot>,
 ) {
-    let (raw_event_sender, raw_event_receiver) = mpsc::sync_channel(COM_EVENT_QUEUE_CAPACITY);
+    let (raw_event_sender, raw_event_receiver) = mpsc::channel();
     let subscription = match subscribe_application_events(&application, raw_event_sender) {
         Ok(subscription) => subscription,
         Err(error) => {

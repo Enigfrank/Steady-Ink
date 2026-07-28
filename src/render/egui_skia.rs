@@ -8,17 +8,41 @@ use egui::{
 use egui_winit::EventResponse;
 use skia_safe::{
     AlphaType, BlendMode, Canvas, ClipOp, Color, ColorType, Data, FilterMode, Image, ImageInfo,
-    M44, Matrix, MipmapMode, Paint, Point, Rect, SamplingOptions, TileMode, Vertices,
-    vertices::VertexMode,
+    M44, Matrix, MipmapMode, Paint, Picture, PictureRecorder, Point, Rect, SamplingOptions,
+    TileMode, Vertices, vertices::VertexMode,
 };
 use winit::{event::WindowEvent, event_loop::ActiveEventLoop, window::Window};
 
 use crate::{error::AppError, ui};
 
+const RETAINED_UI_PICTURE_BUDGET_BYTES: usize = 4 * 1024 * 1024;
+
 /// egui 纹理及其对应的 Skia shader paint。
 struct TexturePaint {
     image: Image,
     paint: Paint,
+}
+
+/// 保存最近一个已转换完成、可精确复用的 egui 显示列表。
+struct RetainedUiFrame {
+    shapes: Vec<egui::epaint::ClippedShape>,
+    pixels_per_point: f32,
+    target_size: [i32; 2],
+    picture: Picture,
+}
+
+impl RetainedUiFrame {
+    /// 判断输入是否与录制该显示列表时的完整绘制条件一致。
+    fn matches(
+        &self,
+        shapes: &[egui::epaint::ClippedShape],
+        pixels_per_point: f32,
+        target_size: [i32; 2],
+    ) -> bool {
+        self.shapes == shapes
+            && self.pixels_per_point.to_bits() == pixels_per_point.to_bits()
+            && self.target_size == target_size
+    }
 }
 
 /// 使用 egui-winit 收集输入，并把 egui mesh 绘制到任意 Skia canvas。
@@ -30,6 +54,7 @@ pub struct EguiSkiaRenderer {
     pixels_per_point: f32,
     textures_delta: TexturesDelta,
     textures: HashMap<TextureId, TexturePaint>,
+    retained_frame: Option<RetainedUiFrame>,
 }
 
 impl EguiSkiaRenderer {
@@ -53,6 +78,7 @@ impl EguiSkiaRenderer {
             pixels_per_point: window.scale_factor() as f32,
             textures_delta: TexturesDelta::default(),
             textures: HashMap::new(),
+            retained_frame: None,
         }
     }
 
@@ -101,13 +127,55 @@ impl EguiSkiaRenderer {
     /// 把上次布局产生的纹理和 mesh 绘制到当前 Skia canvas。
     pub fn paint(&mut self, canvas: &Canvas) -> Result<(), AppError> {
         let mut textures_delta = std::mem::take(&mut self.textures_delta);
+        let can_reuse_retained = texture_delta_allows_reuse(&textures_delta);
+        let can_retain_recording = texture_delta_allows_retention(&textures_delta);
+        if !can_reuse_retained {
+            self.retained_frame = None;
+        }
         for (id, image_delta) in textures_delta.set.drain(..) {
             self.update_texture(id, image_delta)?;
         }
 
         let shapes = std::mem::take(&mut self.shapes);
-        let primitives = self.context.tessellate(shapes, self.pixels_per_point);
-        self.paint_primitives(canvas, primitives)?;
+        let target = canvas.base_layer_size();
+        let target_size = [target.width, target.height];
+        let cache_hit = can_reuse_retained
+            && self.retained_frame.as_ref().is_some_and(|retained| {
+                retained.matches(&shapes, self.pixels_per_point, target_size)
+            });
+
+        if cache_hit {
+            self.retained_frame
+                .as_ref()
+                .expect("命中状态必须持有 egui retained frame")
+                .picture
+                .playback(canvas);
+        } else {
+            self.retained_frame = None;
+            let primitives = self
+                .context
+                .tessellate(shapes.clone(), self.pixels_per_point);
+            let recording_bounds =
+                Rect::from_xywh(0.0, 0.0, target_size[0] as f32, target_size[1] as f32);
+            let mut recorder = PictureRecorder::new();
+            self.paint_primitives(
+                recorder.begin_recording(recording_bounds, false),
+                primitives,
+            )?;
+            let picture = recorder
+                .finish_recording_as_picture(None)
+                .ok_or_else(|| AppError::Graphics("无法完成 egui Skia Picture 录制".to_owned()))?;
+            let picture_bytes = picture.approximate_bytes_used();
+            picture.playback(canvas);
+            if can_retain_recording && retained_picture_fits_budget(picture_bytes) {
+                self.retained_frame = Some(RetainedUiFrame {
+                    shapes,
+                    pixels_per_point: self.pixels_per_point,
+                    target_size,
+                    picture,
+                });
+            }
+        }
 
         for id in textures_delta.free.drain(..) {
             self.textures.remove(&id);
@@ -245,6 +313,21 @@ impl EguiSkiaRenderer {
         }
         Ok(())
     }
+}
+
+/// 只有完全没有纹理生命周期变更时才允许回放旧显示列表。
+fn texture_delta_allows_reuse(textures_delta: &TexturesDelta) -> bool {
+    textures_delta.is_empty()
+}
+
+/// 纹理释放会让当前显示列表持有过期资源，因此禁止保留该帧。
+fn texture_delta_allows_retention(textures_delta: &TexturesDelta) -> bool {
+    textures_delta.free.is_empty()
+}
+
+/// 判断 Picture 自报内存是否仍在单帧 retained 缓存预算内。
+const fn retained_picture_fits_budget(approximate_bytes_used: usize) -> bool {
+    approximate_bytes_used <= RETAINED_UI_PICTURE_BUDGET_BYTES
 }
 
 /// 把字体纹理中的纯色三角形与字形三角形分组，规避 Skia 相同 UV 采样缺陷。
@@ -408,4 +491,159 @@ fn unpremultiplied_skia_color(color: egui::Color32) -> Color {
         unpremultiply(green),
         unpremultiply(blue),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egui::{Color32, Pos2, Shape, TextureOptions, Vec2};
+
+    /// 创建用于 retained frame key 比较的固定圆形。
+    fn test_shape(center_x: f32) -> egui::epaint::ClippedShape {
+        egui::epaint::ClippedShape {
+            clip_rect: egui::Rect::from_min_size(Pos2::ZERO, Vec2::splat(64.0)),
+            shape: Shape::circle_filled(Pos2::new(center_x, 16.0), 8.0, Color32::WHITE),
+        }
+    }
+
+    /// 创建只用于 key 测试、不包含实际绘制指令的 retained frame。
+    fn test_retained_frame(
+        shapes: Vec<egui::epaint::ClippedShape>,
+        pixels_per_point: f32,
+        target_size: [i32; 2],
+    ) -> RetainedUiFrame {
+        RetainedUiFrame {
+            shapes,
+            pixels_per_point,
+            target_size,
+            picture: Picture::new_placeholder(Rect::from_xywh(
+                0.0,
+                0.0,
+                target_size[0] as f32,
+                target_size[1] as f32,
+            )),
+        }
+    }
+
+    /// 验证完全相同的形状、DPI 和目标尺寸可命中 retained frame。
+    #[test]
+    fn retained_frame_matches_identical_input() {
+        let shapes = vec![test_shape(16.0)];
+        let retained = test_retained_frame(shapes.clone(), 1.5, [800, 600]);
+
+        assert!(retained.matches(&shapes, 1.5, [800, 600]));
+    }
+
+    /// 验证形状、DPI 位模式或目标尺寸任一变化都会使缓存失效。
+    #[test]
+    fn retained_frame_rejects_any_key_change() {
+        let shapes = vec![test_shape(16.0)];
+        let retained = test_retained_frame(shapes.clone(), 0.0, [800, 600]);
+
+        assert!(!retained.matches(&[test_shape(17.0)], 0.0, [800, 600]));
+        assert!(!retained.matches(&shapes, -0.0, [800, 600]));
+        assert!(!retained.matches(&shapes, 0.0, [801, 600]));
+    }
+
+    /// 验证纹理 set 会禁止旧缓存命中，而 free 还会禁止保留当前帧。
+    #[test]
+    fn texture_deltas_follow_reuse_and_retention_contract() {
+        let empty = TexturesDelta::default();
+        assert!(texture_delta_allows_reuse(&empty));
+        assert!(texture_delta_allows_retention(&empty));
+
+        let mut set = TexturesDelta::default();
+        set.set.push((
+            TextureId::Managed(1),
+            egui::epaint::ImageDelta::full(
+                egui::ColorImage::filled([1, 1], Color32::WHITE),
+                TextureOptions::LINEAR,
+            ),
+        ));
+        assert!(!texture_delta_allows_reuse(&set));
+        assert!(texture_delta_allows_retention(&set));
+
+        let free = TexturesDelta {
+            set: Vec::new(),
+            free: vec![TextureId::Managed(1)],
+        };
+        assert!(!texture_delta_allows_reuse(&free));
+        assert!(!texture_delta_allows_retention(&free));
+    }
+
+    /// 验证 Picture 仅在包含上限的 4MB 预算内被保留。
+    #[test]
+    fn retained_picture_budget_is_inclusive() {
+        assert!(retained_picture_fits_budget(
+            RETAINED_UI_PICTURE_BUDGET_BYTES
+        ));
+        assert!(!retained_picture_fits_budget(
+            RETAINED_UI_PICTURE_BUDGET_BYTES + 1
+        ));
+    }
+
+    /// 验证字体 mesh 在三角形边界按白色 texel 使用方式分组。
+    #[test]
+    fn font_mesh_groups_white_and_textured_triangles() {
+        let white_vertex = Vertex {
+            pos: Pos2::ZERO,
+            uv: WHITE_UV,
+            color: Color32::WHITE,
+        };
+        let textured_vertex = Vertex {
+            uv: Pos2::new(0.5, 0.5),
+            ..white_vertex
+        };
+        let mesh = Mesh16 {
+            indices: (0..9).collect(),
+            vertices: vec![
+                white_vertex,
+                white_vertex,
+                white_vertex,
+                textured_vertex,
+                textured_vertex,
+                textured_vertex,
+                white_vertex,
+                white_vertex,
+                white_vertex,
+            ],
+            texture_id: TextureId::default(),
+        };
+
+        let groups = split_font_mesh_by_texture_usage(mesh);
+
+        assert_eq!(groups.len(), 3);
+        assert!(font_mesh_uses_white_paint(&groups[0]));
+        assert!(!font_mesh_uses_white_paint(&groups[1]));
+        assert!(font_mesh_uses_white_paint(&groups[2]));
+        assert!(groups.iter().all(|group| group.indices.len() == 3));
+    }
+
+    /// 验证白色 texel 向量透明顶点继承可见边缘 RGB，纹理 mesh 不受影响。
+    #[test]
+    fn transparent_edge_rgb_only_extends_for_white_vector_meshes() {
+        let opaque_red = Vertex {
+            pos: Pos2::ZERO,
+            uv: WHITE_UV,
+            color: Color32::RED,
+        };
+        let transparent = Vertex {
+            pos: Pos2::new(1.0, 0.0),
+            uv: WHITE_UV,
+            color: Color32::TRANSPARENT,
+        };
+        let vector_mesh = Mesh16 {
+            indices: vec![0, 1, 2],
+            vertices: vec![opaque_red, transparent, transparent],
+            texture_id: TextureId::default(),
+        };
+
+        let vector_colors = skia_vertex_colors(&vector_mesh);
+        assert_eq!(vector_colors[1], Color::from_argb(0, 255, 0, 0));
+
+        let mut textured_mesh = vector_mesh;
+        textured_mesh.texture_id = TextureId::Managed(2);
+        let textured_colors = skia_vertex_colors(&textured_mesh);
+        assert_eq!(textured_colors[1], Color::TRANSPARENT);
+    }
 }

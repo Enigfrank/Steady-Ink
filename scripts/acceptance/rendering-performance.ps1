@@ -1,9 +1,10 @@
 param(
-    [ValidateSet('All', 'Batch', 'Gpu')]
+    [ValidateSet('All', 'Batch', 'Gpu', 'Egui')]
     [string]$Scenario = 'All',
     [int]$StrokeCount = 1000,
     [int]$ResizeIterations = 8,
     [int]$EraserIterations = 6,
+    [int]$EguiInputSamples = 160,
     [int]$IdleMemoryWaitSeconds = 2,
     [string]$OutputPath = 'target/acceptance-results/rendering-performance.json'
 )
@@ -125,7 +126,7 @@ function Invoke-ClientClick {
 
     $point = ConvertTo-ScreenPoint $WindowHandle $X $Y
     [void][RenderingAcceptanceNative]::SetCursorPos($point.X, $point.Y)
-    Start-Sleep -Milliseconds 30
+    Start-Sleep -Milliseconds 120
     [RenderingAcceptanceNative]::mouse_event(
         $script:MouseLeftDown,
         0,
@@ -133,7 +134,7 @@ function Invoke-ClientClick {
         0,
         [UIntPtr]::Zero
     )
-    Start-Sleep -Milliseconds 20
+    Start-Sleep -Milliseconds 80
     [RenderingAcceptanceNative]::mouse_event(
         $script:MouseLeftUp,
         0,
@@ -174,6 +175,52 @@ function Invoke-ClientStroke {
         0,
         [UIntPtr]::Zero
     )
+}
+
+# 按固定采样间隔生成一条持续移动的真实鼠标笔画。
+function Invoke-ContinuousClientStroke {
+    param(
+        [IntPtr]$WindowHandle,
+        [int]$SampleCount
+    )
+
+    $size = Get-ClientSize $WindowHandle
+    $startX = [math]::Max(120, [int]($size.Width * 0.1))
+    $endX = [math]::Min($size.Width - 320, [int]($size.Width * 0.8))
+    $centerY = [int]($size.Height / 2)
+    $start = ConvertTo-ScreenPoint $WindowHandle $startX $centerY
+    [void][RenderingAcceptanceNative]::SetCursorPos($start.X, $start.Y)
+    Start-Sleep -Milliseconds 30
+    [RenderingAcceptanceNative]::mouse_event(
+        $script:MouseLeftDown,
+        0,
+        0,
+        0,
+        [UIntPtr]::Zero
+    )
+    try {
+        for ($index = 1; $index -le $SampleCount; $index++) {
+            $progress = $index / [double]$SampleCount
+            $clientX = [int]($startX + ($endX - $startX) * $progress)
+            $clientY = $centerY + [int](80.0 * [math]::Sin($progress * 8.0 * [math]::PI))
+            $point = ConvertTo-ScreenPoint $WindowHandle $clientX $clientY
+            [void][RenderingAcceptanceNative]::SetCursorPos($point.X, $point.Y)
+            Start-Sleep -Milliseconds 8
+        }
+    }
+    finally {
+        [RenderingAcceptanceNative]::mouse_event(
+            $script:MouseLeftUp,
+            0,
+            0,
+            0,
+            [UIntPtr]::Zero
+        )
+    }
+    [pscustomobject]@{
+        ProbeX = [int](($startX + $endX) / 2)
+        ProbeY = $centerY
+    }
 }
 
 # 读取指定客户区位置最终合成到桌面的颜色值。
@@ -742,6 +789,87 @@ function Invoke-GpuAcceptanceCase {
     }
 }
 
+# 等待临时 instrumented renderer 产出足量 egui 绘制样本。
+function Wait-EguiRendererSamples {
+    param(
+        [string]$LogPath,
+        [int]$StartLine,
+        [int]$MinimumSamples,
+        [int]$TimeoutSeconds = 15
+    )
+
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    do {
+        $samples = @(
+            Get-NewLogLines $LogPath $StartLine |
+                Where-Object { $_ -match 'egui 验收绘制完成' }
+        )
+        if ($samples.Count -ge $MinimumSamples) {
+            return $samples
+        }
+        Start-Sleep -Milliseconds 50
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw "egui renderer 只产生了 $($samples.Count)/$MinimumSamples 个验收样本"
+}
+
+# 运行持续书写下的 egui renderer 计时、重建次数和内存场景。
+function Invoke-EguiAcceptanceCase {
+    param(
+        [string]$Executable,
+        [string]$Label
+    )
+
+    $session = Start-AcceptanceProcess $Executable $Label
+    $process = $session.Process
+    $windowHandle = $session.WindowHandle
+    $logPath = $session.LogPath
+    try {
+        Start-Sleep -Milliseconds 500
+        $idleMemory = Get-ProcessMemorySnapshot $process
+        $annotationSize = Enter-Annotation $windowHandle
+        Start-Sleep -Milliseconds 500
+
+        $sampleStart = Get-LogLineCount $logPath
+        $strokeProbe = Invoke-ContinuousClientStroke $windowHandle $EguiInputSamples
+        $minimumSamples = [math]::Max(30, [int]($EguiInputSamples / 3))
+        $rendererLines = Wait-EguiRendererSamples $logPath $sampleStart $minimumSamples
+        $rendererMicros = @(
+            $rendererLines | ForEach-Object { Get-LogNumber $_ 'elapsed_micros' }
+        )
+        $rebuildCount = @($rendererLines | Where-Object { $_ -match 'rebuilt=true' }).Count
+        $cacheHitCount = @($rendererLines | Where-Object { $_ -match 'cache_hit=true' }).Count
+        $pictureBytes = @(
+            $rendererLines | ForEach-Object { Get-LogNumber $_ 'picture_bytes' }
+        )
+        $activeMemory = Get-ProcessMemorySnapshot $process
+        $inkPixel = Get-ClientPixel `
+            $windowHandle `
+            $strokeProbe.ProbeX `
+            $strokeProbe.ProbeY
+
+        Invoke-ToolbarAction $windowHandle Exit
+        $idleSize = Wait-WindowMode $windowHandle Idle
+
+        [pscustomobject]@{
+            Label = $Label
+            RendererMedianMicros = [math]::Round((Get-Median $rendererMicros), 2)
+            SampleCount = $rendererLines.Count
+            RebuildCount = $rebuildCount
+            CacheHitCount = $cacheHitCount
+            MaxPictureBytes = [math]::Round(($pictureBytes | Measure-Object -Maximum).Maximum, 0)
+            IdleMemory = $idleMemory
+            ActiveMemory = $activeMemory
+            AnnotationSize = $annotationSize
+            IdleSize = $idleSize
+            InkPixel = ('0x{0:X8}' -f $inkPixel)
+            Responding = $process.Responding
+        }
+    }
+    finally {
+        Stop-AcceptanceProcess $process
+    }
+}
+
 # 计算从基线到优化版本的百分比下降。
 function Get-ReductionPercent {
     param(
@@ -761,6 +889,7 @@ $result = [ordered]@{
     StrokeCount = $StrokeCount
     ResizeIterations = $ResizeIterations
     EraserIterations = $EraserIterations
+    EguiInputSamples = $EguiInputSamples
 }
 
 try {
@@ -820,6 +949,41 @@ try {
                 $gpuOptimized.ResizeMedianMicros
         }
     }
+
+    if ($Scenario -in @('All', 'Egui')) {
+        $eguiBaseline = Invoke-EguiAcceptanceCase `
+            'target/acceptance-bin/egui-baseline-instrumented.exe' `
+            'egui-baseline'
+        $eguiOptimized = Invoke-EguiAcceptanceCase `
+            'target/acceptance-bin/egui-optimized-instrumented.exe' `
+            'egui-optimized'
+        $memoryIncreaseMB =
+            $eguiOptimized.ActiveMemory.PrivateMemoryMB -
+            $eguiBaseline.ActiveMemory.PrivateMemoryMB
+        $rendererReductionPercent = Get-ReductionPercent `
+            $eguiBaseline.RendererMedianMicros `
+            $eguiOptimized.RendererMedianMicros
+        $rebuildReductionPercent = Get-ReductionPercent `
+            $eguiBaseline.RebuildCount `
+            $eguiOptimized.RebuildCount
+        $eguiPassed =
+            $rendererReductionPercent -ge 20.0 -and
+            $rebuildReductionPercent -ge 80.0 -and
+            $memoryIncreaseMB -lt 5.0 -and
+            $eguiOptimized.MaxPictureBytes -gt 0 -and
+            $eguiOptimized.MaxPictureBytes -le (4 * 1024 * 1024) -and
+            $eguiBaseline.InkPixel -eq $eguiOptimized.InkPixel -and
+            $eguiBaseline.Responding -and
+            $eguiOptimized.Responding
+        $result.Egui = [ordered]@{
+            Baseline = $eguiBaseline
+            Optimized = $eguiOptimized
+            RendererReductionPercent = $rendererReductionPercent
+            RebuildReductionPercent = $rebuildReductionPercent
+            PrivateMemoryIncreaseMB = [math]::Round($memoryIncreaseMB, 2)
+            Passed = $eguiPassed
+        }
+    }
 }
 finally {
     [void][RenderingAcceptanceNative]::SetCursorPos(
@@ -833,3 +997,6 @@ $outputDirectory = Split-Path -Parent $resolvedOutput
 New-Item -ItemType Directory -Force $outputDirectory | Out-Null
 $result | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $resolvedOutput -Encoding utf8
 $result | ConvertTo-Json -Depth 8
+if ($Scenario -in @('All', 'Egui') -and -not $result.Egui.Passed) {
+    throw 'egui retained frame 验收未达到性能、内存或运行状态阈值'
+}

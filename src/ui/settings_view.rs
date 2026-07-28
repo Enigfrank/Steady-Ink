@@ -6,7 +6,9 @@ use egui::{
 use super::{
     design_tokens::{self as tokens, InterfaceMetrics},
     pixel_snap,
-    settings_controls::{render_log_level_selector, render_tool_preferences},
+    settings_controls::{
+        render_log_level_selector, render_palm_size_selector, render_tool_preferences,
+    },
     toolbar::{Icon, UiCommand, UiViewState, paint_icon},
 };
 use crate::autostart::MachineAutostartState;
@@ -68,6 +70,14 @@ pub fn render(ui: &mut Ui, view: UiViewState<'_>) -> Option<UiCommand> {
                                 .size(metrics.text_xs)
                                 .color(tokens::COLOR_ERROR),
                         );
+                    }
+
+                    section_break(ui, metrics);
+                    section_heading(ui, "触摸与手掌", metrics);
+                    let palm_size_command =
+                        render_palm_size_selector(ui, view.palm_size_preset, metrics);
+                    if command.is_none() {
+                        command = palm_size_command;
                     }
 
                     section_break(ui, metrics);

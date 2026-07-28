@@ -1,6 +1,10 @@
 use std::{
     collections::{HashMap, HashSet},
     ffi::c_void,
+    sync::{
+        Arc,
+        atomic::{AtomicU8, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -10,9 +14,9 @@ use windows::Win32::{
     System::Performance::QueryPerformanceFrequency,
     UI::{
         Input::Pointer::{
-            GetPointerInfo, GetPointerInfoHistory, GetPointerTouchInfo, GetPointerType,
-            POINTER_FLAG_CONFIDENCE, POINTER_FLAG_INCONTACT, POINTER_FLAG_INRANGE, POINTER_INFO,
-            POINTER_TOUCH_INFO,
+            GetPointerFrameTouchInfoHistory, GetPointerInfo, GetPointerInfoHistory,
+            GetPointerTouchInfo, GetPointerType, POINTER_FLAG_CONFIDENCE, POINTER_FLAG_INCONTACT,
+            POINTER_FLAG_INRANGE, POINTER_INFO, POINTER_TOUCH_INFO,
         },
         WindowsAndMessaging::{
             MSG, POINTER_INPUT_TYPE, PT_PEN, PT_TOUCH, TOUCH_MASK_CONTACTAREA,
@@ -23,6 +27,7 @@ use windows::Win32::{
 };
 
 use crate::ink::{CanvasPoint, EraseSample};
+use crate::settings::PalmSizePreset;
 
 use super::router::PointerSample;
 
@@ -33,6 +38,76 @@ const CLUSTER_PALM_MIN_AREA: f32 = 6_400.0;
 const CLUSTER_PALM_MIN_MAJOR_AXIS: f32 = 96.0;
 const CLUSTER_PALM_MAX_MAJOR_AXIS: f32 = 320.0;
 const MIN_CONTACT_RADIUS: f32 = 8.0;
+const MAX_TOUCH_HISTORY_ITEMS: usize = 4_096;
+
+/// 在原生消息 hook 与应用设置之间同步手掌尺寸预设。
+#[derive(Clone)]
+pub struct SharedPalmSizePreset(Arc<AtomicU8>);
+
+impl Default for SharedPalmSizePreset {
+    /// 创建使用标准尺寸的共享预设。
+    fn default() -> Self {
+        Self(Arc::new(AtomicU8::new(palm_size_code(
+            PalmSizePreset::Standard,
+        ))))
+    }
+}
+
+impl SharedPalmSizePreset {
+    /// 原子更新下一条触摸消息使用的手掌尺寸预设。
+    pub fn store(&self, preset: PalmSizePreset) {
+        self.0.store(palm_size_code(preset), Ordering::Release);
+    }
+
+    /// 读取当前预设，并将未知编码安全退化为标准档。
+    fn load(&self) -> PalmSizePreset {
+        palm_size_from_code(self.0.load(Ordering::Acquire))
+    }
+}
+
+/// 把手掌尺寸预设编码为共享原子的稳定小整数。
+const fn palm_size_code(preset: PalmSizePreset) -> u8 {
+    match preset {
+        PalmSizePreset::Small => 0,
+        PalmSizePreset::Standard => 1,
+        PalmSizePreset::Large => 2,
+    }
+}
+
+/// 把共享原子的整数恢复为手掌尺寸预设。
+const fn palm_size_from_code(code: u8) -> PalmSizePreset {
+    match code {
+        0 => PalmSizePreset::Small,
+        2 => PalmSizePreset::Large,
+        _ => PalmSizePreset::Standard,
+    }
+}
+
+/// 一档手掌预设对应的单接触与多接触联合分类阈值。
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PalmThresholds {
+    single_min_area: f32,
+    single_min_major_axis: f32,
+    cluster_min_area: f32,
+    cluster_min_major_axis: f32,
+}
+
+impl PalmThresholds {
+    /// 按产品三档比例缩放当前标准阈值。
+    fn for_preset(preset: PalmSizePreset) -> Self {
+        let scale = match preset {
+            PalmSizePreset::Small => 0.75,
+            PalmSizePreset::Standard => 1.0,
+            PalmSizePreset::Large => 1.25,
+        };
+        Self {
+            single_min_area: SINGLE_PALM_MIN_AREA * scale,
+            single_min_major_axis: SINGLE_PALM_MIN_MAJOR_AXIS * scale,
+            cluster_min_area: CLUSTER_PALM_MIN_AREA * scale,
+            cluster_min_major_axis: CLUSTER_PALM_MIN_MAJOR_AXIS * scale,
+        }
+    }
+}
 
 /// 原生 Pointer Input hook 需要交给运行时的高层语义。
 #[derive(Debug)]
@@ -117,6 +192,7 @@ pub struct WindowsPointerTracker {
     pen_ids: HashSet<u32>,
     pen_contact_ids: HashSet<u32>,
     pointer_history: Vec<POINTER_INFO>,
+    touch_history: Vec<POINTER_TOUCH_INFO>,
     clock_start: Instant,
     qpc_frequency: Option<f64>,
     pen_time_sources: HashMap<u32, PenTimeState>,
@@ -124,6 +200,7 @@ pub struct WindowsPointerTracker {
     candidate_ids: HashSet<u32>,
     palm_ids: HashSet<u32>,
     palm_started: bool,
+    palm_size_preset: SharedPalmSizePreset,
 }
 
 impl Default for WindowsPointerTracker {
@@ -133,6 +210,7 @@ impl Default for WindowsPointerTracker {
             pen_ids: HashSet::new(),
             pen_contact_ids: HashSet::new(),
             pointer_history: Vec::new(),
+            touch_history: Vec::new(),
             clock_start: Instant::now(),
             qpc_frequency: query_qpc_frequency(),
             pen_time_sources: HashMap::new(),
@@ -140,6 +218,7 @@ impl Default for WindowsPointerTracker {
             candidate_ids: HashSet::new(),
             palm_ids: HashSet::new(),
             palm_started: false,
+            palm_size_preset: SharedPalmSizePreset::default(),
         }
     }
 }
@@ -182,6 +261,14 @@ fn qpc_timestamp_micros(counter: u64, frequency: f64) -> Option<u64> {
 }
 
 impl WindowsPointerTracker {
+    /// 创建使用应用共享手掌尺寸预设的原生 Pointer 跟踪器。
+    pub fn with_palm_size_preset(palm_size_preset: SharedPalmSizePreset) -> Self {
+        Self {
+            palm_size_preset,
+            ..Self::default()
+        }
+    }
+
     /// 返回 hook 当前是否观察到正在接触屏幕的原生触控笔。
     pub fn pen_contact_active(&self) -> bool {
         !self.pen_contact_ids.is_empty()
@@ -400,22 +487,7 @@ impl WindowsPointerTracker {
         }
 
         let now = Instant::now();
-        let touch = read_touch_contact(
-            pointer_id,
-            message.hwnd,
-            now,
-            self.arrival_timestamp_micros(),
-        );
-        if let Some(touch) = touch {
-            match self.touches.entry(pointer_id) {
-                std::collections::hash_map::Entry::Occupied(mut entry) => {
-                    entry.get_mut().update(touch);
-                }
-                std::collections::hash_map::Entry::Vacant(entry) => {
-                    entry.insert(touch);
-                }
-            }
-        }
+        self.update_touch_frame(pointer_id, message.hwnd, now);
 
         if !self.pen_ids.is_empty() {
             if matches!(message.message, WM_POINTERUP | WM_POINTERCAPTURECHANGED) {
@@ -473,6 +545,74 @@ impl WindowsPointerTracker {
         WindowsPointerDispatch {
             event: None,
             swallow_winit: false,
+        }
+    }
+
+    /// 批量读取同一触摸帧的历史接触，并在失败时退化到当前消息接触。
+    fn update_touch_frame(&mut self, pointer_id: u32, window: HWND, now: Instant) {
+        let arrival_timestamp_micros = self.arrival_timestamp_micros();
+        let mut entries_count = 0_u32;
+        let mut pointer_count = 0_u32;
+        // SAFETY: 空缓冲调用只查询系统为当前 Pointer 帧报告的两个维度。
+        let _ = unsafe {
+            GetPointerFrameTouchInfoHistory(
+                pointer_id,
+                &mut entries_count,
+                &mut pointer_count,
+                None,
+            )
+        };
+        let total_items = (entries_count as usize).checked_mul(pointer_count as usize);
+        if let Some(total_items) = total_items.filter(|count| {
+            entries_count > 0 && pointer_count > 0 && *count <= MAX_TOUCH_HISTORY_ITEMS
+        }) {
+            self.touch_history
+                .resize(total_items, POINTER_TOUCH_INFO::default());
+            let mut read_entries = entries_count;
+            let mut read_pointers = pointer_count;
+            // SAFETY: 缓冲区按查询得到的 entries * pointers 大小分配，并在调用期间有效。
+            let read_succeeded = unsafe {
+                GetPointerFrameTouchInfoHistory(
+                    pointer_id,
+                    &mut read_entries,
+                    &mut read_pointers,
+                    Some(self.touch_history.as_mut_ptr()),
+                )
+            }
+            .is_ok();
+            if read_succeeded {
+                let mut updated = false;
+                for info in chronological_touch_history(
+                    &self.touch_history,
+                    read_entries as usize,
+                    read_pointers as usize,
+                ) {
+                    let timestamp_micros = touch_timestamp_micros(
+                        &info.pointerInfo,
+                        self.qpc_frequency,
+                        arrival_timestamp_micros,
+                    );
+                    if let Some(touch) =
+                        touch_contact_from_info(info, window, now, timestamp_micros)
+                    {
+                        update_touch_contact(&mut self.touches, info.pointerInfo.pointerId, touch);
+                        updated = true;
+                    }
+                }
+                if updated {
+                    return;
+                }
+            }
+        }
+
+        if let Some(touch) = read_touch_contact(
+            pointer_id,
+            window,
+            now,
+            arrival_timestamp_micros,
+            self.qpc_frequency,
+        ) {
+            update_touch_contact(&mut self.touches, pointer_id, touch);
         }
     }
 
@@ -552,10 +692,11 @@ impl WindowsPointerTracker {
 
     /// 根据单接触面积、置信度和聚集多触点联合范围更新候选集合。
     fn refresh_candidates(&mut self) {
+        let thresholds = PalmThresholds::for_preset(self.palm_size_preset.load());
         for (pointer_id, touch) in &self.touches {
             if !touch.confident
-                || (touch.geometry.area() >= SINGLE_PALM_MIN_AREA
-                    && touch.geometry.major_axis() >= SINGLE_PALM_MIN_MAJOR_AXIS)
+                || (touch.geometry.area() >= thresholds.single_min_area
+                    && touch.geometry.major_axis() >= thresholds.single_min_major_axis)
             {
                 self.candidate_ids.insert(*pointer_id);
             }
@@ -569,8 +710,8 @@ impl WindowsPointerTracker {
                 .reduce(ContactGeometry::union);
             if let Some(union) = union {
                 let major_axis = union.major_axis();
-                if union.area() >= CLUSTER_PALM_MIN_AREA
-                    && (CLUSTER_PALM_MIN_MAJOR_AXIS..=CLUSTER_PALM_MAX_MAJOR_AXIS)
+                if union.area() >= thresholds.cluster_min_area
+                    && (thresholds.cluster_min_major_axis..=CLUSTER_PALM_MAX_MAJOR_AXIS)
                         .contains(&major_axis)
                 {
                     self.candidate_ids.extend(self.touches.keys().copied());
@@ -651,6 +792,23 @@ fn chronological_pointer_history(
     history[..count.min(history.len())].iter().rev()
 }
 
+/// 按时间正序遍历 Windows 以新帧到旧帧排列的触摸历史矩阵。
+fn chronological_touch_history(
+    history: &[POINTER_TOUCH_INFO],
+    entries_count: usize,
+    pointer_count: usize,
+) -> impl Iterator<Item = &POINTER_TOUCH_INFO> {
+    let available_entries = if pointer_count == 0 {
+        0
+    } else {
+        entries_count.min(history.len() / pointer_count)
+    };
+    (0..available_entries).rev().flat_map(move |entry| {
+        let start = entry * pointer_count;
+        history[start..start + pointer_count].iter()
+    })
+}
+
 /// 返回接触中心最远点对的稳定椭圆方向，范围归一化到 `[0, PI)`。
 fn farthest_contact_rotation(contacts: &[&TouchContact]) -> f32 {
     let mut farthest_distance_squared = 0.0;
@@ -677,6 +835,8 @@ struct TouchContact {
     geometry: ContactGeometry,
     confident: bool,
     started_at: Instant,
+    last_frame_id: u32,
+    last_timestamp_micros: u64,
     points: Vec<PointerSample>,
 }
 
@@ -687,6 +847,7 @@ impl TouchContact {
         geometry: ContactGeometry,
         confident: bool,
         started_at: Instant,
+        frame_id: u32,
         timestamp_micros: u64,
     ) -> Self {
         Self {
@@ -694,15 +855,27 @@ impl TouchContact {
             geometry,
             confident,
             started_at,
+            last_frame_id: frame_id,
+            last_timestamp_micros: timestamp_micros,
             points: vec![PointerSample::new(point, timestamp_micros)],
         }
     }
 
     /// 更新接触几何和去重后的轨迹点。
     fn update(&mut self, next: Self) {
+        if !touch_frame_is_newer(
+            next.last_frame_id,
+            self.last_frame_id,
+            next.last_timestamp_micros,
+            self.last_timestamp_micros,
+        ) {
+            return;
+        }
         self.point = next.point;
         self.geometry = next.geometry;
         self.confident = next.confident;
+        self.last_frame_id = next.last_frame_id;
+        self.last_timestamp_micros = next.last_timestamp_micros;
         if self.points.last().is_none_or(|last| {
             let delta_x = last.point.x - next.point.x;
             let delta_y = last.point.y - next.point.y;
@@ -712,6 +885,34 @@ impl TouchContact {
                 next.point,
                 next.points[0].timestamp_micros,
             ));
+        }
+    }
+}
+
+/// 判断触摸帧是否更新，并在驱动不提供 frameId 时退化到时间戳。
+fn touch_frame_is_newer(
+    next_frame_id: u32,
+    current_frame_id: u32,
+    next_timestamp_micros: u64,
+    current_timestamp_micros: u64,
+) -> bool {
+    if next_frame_id == 0 || current_frame_id == 0 {
+        return next_timestamp_micros > current_timestamp_micros;
+    }
+    let delta = next_frame_id.wrapping_sub(current_frame_id);
+    delta != 0 && delta <= u32::MAX / 2
+}
+
+/// 将一条触摸接触插入跟踪表，或按帧顺序更新已有接触。
+fn update_touch_contact(
+    touches: &mut HashMap<u32, TouchContact>,
+    pointer_id: u32,
+    touch: TouchContact,
+) {
+    match touches.entry(pointer_id) {
+        std::collections::hash_map::Entry::Occupied(mut entry) => entry.get_mut().update(touch),
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            entry.insert(touch);
         }
     }
 }
@@ -773,10 +974,23 @@ fn read_touch_contact(
     window: HWND,
     now: Instant,
     timestamp_micros: u64,
+    qpc_frequency: Option<f64>,
 ) -> Option<TouchContact> {
     let mut touch_info = POINTER_TOUCH_INFO::default();
     // SAFETY: 输出结构在调用期间有效，pointer_id 来自当前 WM_POINTER 消息。
     unsafe { GetPointerTouchInfo(pointer_id, &mut touch_info) }.ok()?;
+    let timestamp_micros =
+        touch_timestamp_micros(&touch_info.pointerInfo, qpc_frequency, timestamp_micros);
+    touch_contact_from_info(&touch_info, window, now, timestamp_micros)
+}
+
+/// 将一条已初始化的 Windows 触摸信息转换为物理像素接触记录。
+fn touch_contact_from_info(
+    touch_info: &POINTER_TOUCH_INFO,
+    window: HWND,
+    now: Instant,
+    timestamp_micros: u64,
+) -> Option<TouchContact> {
     let point = screen_to_client(window, touch_info.pointerInfo.ptPixelLocation)?;
     let geometry = if touch_info.touchMask & TOUCH_MASK_CONTACTAREA != 0 {
         let top_left = screen_to_client(
@@ -814,8 +1028,21 @@ fn read_touch_contact(
         geometry,
         has_pointer_flag(touch_info.pointerInfo, POINTER_FLAG_CONFIDENCE),
         now,
+        touch_info.pointerInfo.frameId,
         timestamp_micros,
     ))
+}
+
+/// 从触摸 Pointer 信息选择 QPC、毫秒时间或到达时间作为去重时间戳。
+fn touch_timestamp_micros(
+    info: &POINTER_INFO,
+    qpc_frequency: Option<f64>,
+    arrival_timestamp_micros: u64,
+) -> u64 {
+    qpc_frequency
+        .and_then(|frequency| qpc_timestamp_micros(info.PerformanceCount, frequency))
+        .or_else(|| (info.dwTime > 0).then_some(info.dwTime as u64 * 1_000))
+        .unwrap_or(arrival_timestamp_micros)
 }
 
 /// 查询一个 Pointer Input 标识的设备类型。
@@ -884,6 +1111,7 @@ mod tests {
             },
             true,
             Instant::now(),
+            1,
             100,
         )
     }
@@ -921,6 +1149,184 @@ mod tests {
             .collect();
 
         assert_eq!(frame_ids, vec![1, 2, 3]);
+    }
+
+    /// 验证触摸历史只反转帧顺序，并保留每帧内的接触顺序。
+    #[test]
+    fn touch_history_is_chronological_and_bounded() {
+        let history = [
+            POINTER_TOUCH_INFO {
+                pointerInfo: POINTER_INFO {
+                    frameId: 3,
+                    pointerId: 31,
+                    ..POINTER_INFO::default()
+                },
+                ..POINTER_TOUCH_INFO::default()
+            },
+            POINTER_TOUCH_INFO {
+                pointerInfo: POINTER_INFO {
+                    frameId: 3,
+                    pointerId: 32,
+                    ..POINTER_INFO::default()
+                },
+                ..POINTER_TOUCH_INFO::default()
+            },
+            POINTER_TOUCH_INFO {
+                pointerInfo: POINTER_INFO {
+                    frameId: 2,
+                    pointerId: 21,
+                    ..POINTER_INFO::default()
+                },
+                ..POINTER_TOUCH_INFO::default()
+            },
+            POINTER_TOUCH_INFO {
+                pointerInfo: POINTER_INFO {
+                    frameId: 2,
+                    pointerId: 22,
+                    ..POINTER_INFO::default()
+                },
+                ..POINTER_TOUCH_INFO::default()
+            },
+        ];
+
+        let identifiers: Vec<_> = chronological_touch_history(&history, usize::MAX, 2)
+            .map(|info| (info.pointerInfo.frameId, info.pointerInfo.pointerId))
+            .collect();
+
+        assert_eq!(identifiers, vec![(2, 21), (2, 22), (3, 31), (3, 32)]);
+        assert_eq!(chronological_touch_history(&history, 2, 0).count(), 0);
+    }
+
+    /// 验证相邻消息重复返回同一时间戳时不会覆盖几何或追加缓冲点。
+    #[test]
+    fn touch_contact_ignores_duplicate_history_samples() {
+        let mut contact = touch_contact();
+        let duplicate = TouchContact::new(
+            CanvasPoint::new(140.0, 160.0),
+            ContactGeometry {
+                left: 120.0,
+                top: 130.0,
+                right: 160.0,
+                bottom: 190.0,
+                rotation_radians: 0.0,
+            },
+            true,
+            Instant::now(),
+            1,
+            100,
+        );
+
+        contact.update(duplicate);
+
+        assert_eq!(contact.point, CanvasPoint::new(100.0, 120.0));
+        assert_eq!(contact.points.len(), 1);
+    }
+
+    /// 验证同一毫秒内 frameId 递增的有效触摸不会被时间戳去重误删。
+    #[test]
+    fn touch_contact_accepts_a_new_frame_with_the_same_timestamp() {
+        let mut contact = touch_contact();
+        let next = TouchContact::new(
+            CanvasPoint::new(104.0, 124.0),
+            ContactGeometry {
+                left: 84.0,
+                top: 94.0,
+                right: 124.0,
+                bottom: 154.0,
+                rotation_radians: 0.0,
+            },
+            true,
+            Instant::now(),
+            2,
+            100,
+        );
+
+        contact.update(next);
+
+        assert_eq!(contact.point, CanvasPoint::new(104.0, 124.0));
+        assert_eq!(contact.points.len(), 2);
+    }
+
+    /// 验证三档阈值严格递增，并保留当前标准档数值。
+    #[test]
+    fn palm_size_thresholds_are_ordered() {
+        let small = PalmThresholds::for_preset(PalmSizePreset::Small);
+        let standard = PalmThresholds::for_preset(PalmSizePreset::Standard);
+        let large = PalmThresholds::for_preset(PalmSizePreset::Large);
+
+        assert!(small.single_min_area < standard.single_min_area);
+        assert!(standard.single_min_area < large.single_min_area);
+        assert!(small.single_min_major_axis < standard.single_min_major_axis);
+        assert!(standard.single_min_major_axis < large.single_min_major_axis);
+        assert!(small.cluster_min_area < standard.cluster_min_area);
+        assert!(standard.cluster_min_area < large.cluster_min_area);
+        assert!(small.cluster_min_major_axis < standard.cluster_min_major_axis);
+        assert!(standard.cluster_min_major_axis < large.cluster_min_major_axis);
+        assert_eq!(standard.single_min_area, SINGLE_PALM_MIN_AREA);
+    }
+
+    /// 验证小档可识别低于标准阈值的单接触，而标准档保持保守。
+    #[test]
+    fn small_preset_classifies_a_smaller_single_contact() {
+        let shared = SharedPalmSizePreset::default();
+        let mut tracker = WindowsPointerTracker::with_palm_size_preset(shared.clone());
+        tracker.touches.insert(
+            7,
+            TouchContact::new(
+                CanvasPoint::new(30.0, 30.0),
+                ContactGeometry {
+                    left: 0.0,
+                    top: 0.0,
+                    right: 60.0,
+                    bottom: 60.0,
+                    rotation_radians: 0.0,
+                },
+                true,
+                Instant::now(),
+                1,
+                100,
+            ),
+        );
+
+        tracker.refresh_candidates();
+        assert!(!tracker.candidate_ids.contains(&7));
+
+        shared.store(PalmSizePreset::Small);
+        tracker.refresh_candidates();
+        assert!(tracker.candidate_ids.contains(&7));
+    }
+
+    /// 验证小档可识别低于标准联合阈值的双触点簇。
+    #[test]
+    fn small_preset_classifies_a_smaller_contact_cluster() {
+        let shared = SharedPalmSizePreset::default();
+        let mut tracker = WindowsPointerTracker::with_palm_size_preset(shared.clone());
+        for (pointer_id, left) in [(7, 0.0), (8, 50.0)] {
+            tracker.touches.insert(
+                pointer_id,
+                TouchContact::new(
+                    CanvasPoint::new(left + 15.0, 35.0),
+                    ContactGeometry {
+                        left,
+                        top: 0.0,
+                        right: left + 30.0,
+                        bottom: 70.0,
+                        rotation_radians: 0.0,
+                    },
+                    true,
+                    Instant::now(),
+                    1,
+                    100,
+                ),
+            );
+        }
+
+        tracker.refresh_candidates();
+        assert!(tracker.candidate_ids.is_empty());
+
+        shared.store(PalmSizePreset::Small);
+        tracker.refresh_candidates();
+        assert_eq!(tracker.candidate_ids, HashSet::from([7, 8]));
     }
 
     /// 验证候选手掌离开窗口时只清理状态，不提交缓冲普通笔画。

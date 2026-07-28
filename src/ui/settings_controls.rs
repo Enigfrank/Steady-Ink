@@ -7,7 +7,7 @@ use super::{
 };
 use crate::{
     ink::{EraserSize, InkColor, PenWidth},
-    settings::LogLevel,
+    settings::{LogLevel, PalmSizePreset},
 };
 
 const COLORS: [InkColor; 6] = [
@@ -128,6 +128,30 @@ pub(super) fn render_log_level_selector(
                 .clicked()
             {
                 command = Some(UiCommand::SetLogLevel(level));
+            }
+        }
+    });
+    command
+}
+
+/// 绘制小、标准、大三档手掌尺寸选择器。
+pub(super) fn render_palm_size_selector(
+    ui: &mut Ui,
+    selected: PalmSizePreset,
+    metrics: InterfaceMetrics,
+) -> Option<UiCommand> {
+    section_label(ui, "手掌尺寸", metrics);
+    let mut command = None;
+    ui.horizontal(|ui| {
+        for preset in PalmSizePreset::ALL {
+            if ui
+                .add_sized(
+                    Vec2::splat(metrics.touch_target),
+                    egui::Button::selectable(selected == preset, preset.label()),
+                )
+                .clicked()
+            {
+                command = Some(UiCommand::SetPalmSizePreset(preset));
             }
         }
     });

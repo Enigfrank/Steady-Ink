@@ -44,6 +44,36 @@ impl Default for LogLevel {
     }
 }
 
+/// 用户可持久化的手掌尺寸分类预设。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PalmSizePreset {
+    Small,
+    Standard,
+    Large,
+}
+
+impl PalmSizePreset {
+    /// 返回设置页按尺寸递增顺序展示的全部预设。
+    pub const ALL: [Self; 3] = [Self::Small, Self::Standard, Self::Large];
+
+    /// 返回三档手掌尺寸的中文名称。
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Small => "小",
+            Self::Standard => "标准",
+            Self::Large => "大",
+        }
+    }
+}
+
+impl Default for PalmSizePreset {
+    /// 返回兼顾漏判和误判的标准手掌尺寸。
+    fn default() -> Self {
+        Self::Standard
+    }
+}
+
 /// 渲染器内部使用的墨迹 surface 抗锯齿配置。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InkAntialiasingMode {
@@ -90,6 +120,7 @@ impl Default for ToolPreferences {
 #[serde(default)]
 pub struct UserSettings {
     pub tools: ToolPreferences,
+    pub palm_size_preset: PalmSizePreset,
     pub slideshow_integration_enabled: bool,
     pub log_level: LogLevel,
     pub readable_mode: bool,
@@ -100,6 +131,7 @@ impl Default for UserSettings {
     fn default() -> Self {
         Self {
             tools: ToolPreferences::default(),
+            palm_size_preset: PalmSizePreset::default(),
             slideshow_integration_enabled: true,
             log_level: LogLevel::default(),
             readable_mode: false,
@@ -109,7 +141,7 @@ impl Default for UserSettings {
 
 #[cfg(test)]
 mod tests {
-    use super::UserSettings;
+    use super::{PalmSizePreset, UserSettings};
     use crate::ink::PenWidth;
 
     #[test]
@@ -134,6 +166,7 @@ mod tests {
         .expect("旧版设置应能反序列化");
 
         assert!(!settings.tools.speed_taper_enabled);
+        assert_eq!(settings.palm_size_preset, PalmSizePreset::Standard);
     }
 
     #[test]
@@ -161,6 +194,21 @@ mod tests {
         let reloaded: UserSettings = toml::from_str(&serialized).expect("设置应能反序列化");
 
         assert!(reloaded.tools.speed_taper_enabled);
+    }
+
+    /// 验证三档手掌尺寸使用稳定名称完成设置往返。
+    #[test]
+    fn palm_size_presets_survive_a_toml_round_trip() {
+        for preset in PalmSizePreset::ALL {
+            let settings = UserSettings {
+                palm_size_preset: preset,
+                ..UserSettings::default()
+            };
+            let serialized = toml::to_string(&settings).expect("设置应能序列化");
+            let reloaded: UserSettings = toml::from_str(&serialized).expect("设置应能反序列化");
+
+            assert_eq!(reloaded.palm_size_preset, preset);
+        }
     }
 
     /// 验证新增 6px 档位保持准确像素宽度和稳定的 TOML 名称。

@@ -24,7 +24,8 @@ use crate::{
         SpeedStrokeBuilder, VariableStrokePoint,
     },
     input::{
-        InputRouter, PointerAction, PointerSample, WindowsPointerEvent, WindowsPointerTracker,
+        InputRouter, PointerAction, PointerSample, SharedPalmSizePreset, WindowsPointerEvent,
+        WindowsPointerTracker,
     },
     logging,
     render::Compositor,
@@ -215,6 +216,7 @@ struct DesktopRuntime {
     active_gesture: Option<ActiveGesture>,
     windows_pointer_receiver: Receiver<WindowsPointerEvent>,
     pen_contact_active: Arc<AtomicBool>,
+    palm_size_preset: SharedPalmSizePreset,
     slideshow_detector: ComDetector,
     settings_store: SettingsStore,
     settings: UserSettings,
@@ -239,6 +241,7 @@ impl DesktopRuntime {
         event_proxy: EventLoopProxy<UserEvent>,
         windows_pointer_receiver: Receiver<WindowsPointerEvent>,
         pen_contact_active: Arc<AtomicBool>,
+        palm_size_preset: SharedPalmSizePreset,
     ) -> Result<Self, AppError> {
         let settings_store = SettingsStore::new()?;
         let (settings, settings_error) = match settings_store.load() {
@@ -249,6 +252,7 @@ impl DesktopRuntime {
             }
         };
         let (machine_autostart_state, machine_autostart_error) = load_machine_autostart_state();
+        palm_size_preset.store(settings.palm_size_preset);
         let tools = ToolState {
             tool: InkTool::Pen,
             color: settings.tools.color,
@@ -272,6 +276,7 @@ impl DesktopRuntime {
             active_gesture: None,
             windows_pointer_receiver,
             pen_contact_active,
+            palm_size_preset,
             slideshow_detector,
             settings_store,
             settings,
@@ -412,6 +417,7 @@ impl DesktopRuntime {
             idle_panel: self.idle_panel,
             dock_side: self.window_context.dock_side(),
             tools,
+            palm_size_preset: self.settings.palm_size_preset,
             slideshow_integration_enabled: self.settings.slideshow_integration_enabled,
             log_level: self.settings.log_level,
             readable_mode: self.settings.readable_mode,
@@ -487,6 +493,11 @@ impl DesktopRuntime {
             UiCommand::SetSpeedTaperEnabled(enabled) => {
                 self.tools.speed_taper_enabled = enabled;
                 self.settings.tools.speed_taper_enabled = enabled;
+                self.save_settings();
+            }
+            UiCommand::SetPalmSizePreset(preset) => {
+                self.settings.palm_size_preset = preset;
+                self.palm_size_preset.store(preset);
                 self.save_settings();
             }
             UiCommand::Undo => {
@@ -876,6 +887,7 @@ struct DesktopApplication {
     proxy: EventLoopProxy<UserEvent>,
     windows_pointer_receiver: Option<Receiver<WindowsPointerEvent>>,
     pen_contact_active: Arc<AtomicBool>,
+    palm_size_preset: SharedPalmSizePreset,
     runtime: Option<DesktopRuntime>,
     startup_error: Option<AppError>,
     next_repaint: Option<Instant>,
@@ -887,11 +899,13 @@ impl DesktopApplication {
         proxy: EventLoopProxy<UserEvent>,
         windows_pointer_receiver: Receiver<WindowsPointerEvent>,
         pen_contact_active: Arc<AtomicBool>,
+        palm_size_preset: SharedPalmSizePreset,
     ) -> Self {
         Self {
             proxy,
             windows_pointer_receiver: Some(windows_pointer_receiver),
             pen_contact_active,
+            palm_size_preset,
             runtime: None,
             startup_error: None,
             next_repaint: None,
@@ -937,6 +951,7 @@ impl ApplicationHandler<UserEvent> for DesktopApplication {
             self.proxy.clone(),
             windows_pointer_receiver,
             Arc::clone(&self.pen_contact_active),
+            self.palm_size_preset.clone(),
         ) {
             Ok(runtime) => {
                 self.install_repaint_callback(&runtime);
@@ -1055,7 +1070,9 @@ pub fn run() -> Result<(), AppError> {
     let hook_pen_contact_active = Arc::clone(&pen_contact_active);
     let proxy_slot = Arc::new(OnceLock::<EventLoopProxy<UserEvent>>::new());
     let hook_proxy_slot = Arc::clone(&proxy_slot);
-    let mut pointer_tracker = WindowsPointerTracker::default();
+    let palm_size_preset = SharedPalmSizePreset::default();
+    let mut pointer_tracker =
+        WindowsPointerTracker::with_palm_size_preset(palm_size_preset.clone());
     let mut event_loop_builder = EventLoop::<UserEvent>::with_user_event();
     event_loop_builder.with_msg_hook(move |raw_message| {
         let Some(dispatch) = pointer_tracker.capture_message(raw_message) else {
@@ -1073,8 +1090,12 @@ pub fn run() -> Result<(), AppError> {
     let event_loop = event_loop_builder.build()?;
     let proxy = event_loop.create_proxy();
     let _ = proxy_slot.set(proxy.clone());
-    let mut application =
-        DesktopApplication::new(proxy, windows_pointer_receiver, pen_contact_active);
+    let mut application = DesktopApplication::new(
+        proxy,
+        windows_pointer_receiver,
+        pen_contact_active,
+        palm_size_preset,
+    );
     event_loop.run_app(&mut application)?;
     application.startup_error.map_or(Ok(()), Err)
 }
@@ -1125,5 +1146,71 @@ mod tests {
             vec![CanvasPoint::new(0.0, 0.0), CanvasPoint::new(1.0, 0.0)]
         );
         assert!(timestamps_micros.is_none());
+    }
+
+    /// 验证固定宽度预览在急转弯时严格结束于最后一个真实采样。
+    #[test]
+    fn fixed_preview_has_no_extrapolated_tail() {
+        let mut gesture = ActiveGesture::from_points(
+            vec![
+                PointerSample::new(CanvasPoint::new(0.0, 0.0), 0),
+                PointerSample::new(CanvasPoint::new(8.0, 0.0), 8_000),
+                PointerSample::new(CanvasPoint::new(8.0, 8.0), 16_000),
+            ],
+            ToolState::default(),
+            1.0,
+        )
+        .expect("有效批次应创建活动手势");
+
+        let ActiveInkPreview::Tool { points, .. } = gesture.preview() else {
+            panic!("固定宽度画笔应生成固定预览");
+        };
+        assert_eq!(points.len(), 3);
+        assert_eq!(points.last(), Some(&CanvasPoint::new(8.0, 8.0)));
+
+        let mut document = InkDocument::new();
+        gesture.commit(&mut document);
+        let [InkOperation::DrawStroke(stroke)] = document.operations() else {
+            panic!("提交应生成一条画笔操作");
+        };
+        let crate::ink::DrawStrokeShape::Fixed { points, .. } = &stroke.shape else {
+            panic!("默认画笔应提交固定宽度几何");
+        };
+        assert_eq!(points.len(), 3);
+        assert_eq!(points.last(), Some(&CanvasPoint::new(8.0, 8.0)));
+    }
+
+    /// 验证速度笔锋预览不在最后一个真实采样之外追加直线尾段。
+    #[test]
+    fn speed_taper_preview_has_no_extrapolated_tail() {
+        let tools = ToolState {
+            speed_taper_enabled: true,
+            ..ToolState::default()
+        };
+        let mut gesture = ActiveGesture::from_points(
+            vec![
+                PointerSample::new(CanvasPoint::new(0.0, 0.0), 0),
+                PointerSample::new(CanvasPoint::new(8.0, 0.0), 8_000),
+                PointerSample::new(CanvasPoint::new(8.0, 8.0), 16_000),
+            ],
+            tools,
+            1.0,
+        )
+        .expect("有效批次应创建活动手势");
+        let real_count = gesture
+            .speed_builder
+            .as_ref()
+            .expect("速度笔锋应创建构建器")
+            .finalized_points()
+            .len();
+
+        let ActiveInkPreview::VariableTool { points, .. } = gesture.preview() else {
+            panic!("速度笔锋应生成可变宽度预览");
+        };
+        assert_eq!(points.len(), real_count);
+        assert_eq!(
+            points.last().map(|point| point.point),
+            Some(CanvasPoint::new(8.0, 8.0))
+        );
     }
 }

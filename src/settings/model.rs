@@ -124,6 +124,7 @@ pub struct UserSettings {
     pub slideshow_integration_enabled: bool,
     pub log_level: LogLevel,
     pub readable_mode: bool,
+    pub performance_monitoring_enabled: bool,
 }
 
 impl Default for UserSettings {
@@ -135,6 +136,7 @@ impl Default for UserSettings {
             slideshow_integration_enabled: true,
             log_level: LogLevel::default(),
             readable_mode: false,
+            performance_monitoring_enabled: false,
         }
     }
 }
@@ -154,6 +156,7 @@ mod tests {
         .expect("旧版设置应能反序列化");
 
         assert!(!settings.readable_mode);
+        assert!(!settings.performance_monitoring_enabled);
     }
 
     #[test]
@@ -179,6 +182,19 @@ mod tests {
         let reloaded: UserSettings = toml::from_str(&serialized).expect("设置应能反序列化");
 
         assert!(reloaded.readable_mode);
+    }
+
+    /// 验证性能监控默认关闭且启用值可稳定持久化。
+    #[test]
+    fn performance_monitoring_survives_a_toml_round_trip() {
+        let settings = UserSettings {
+            performance_monitoring_enabled: true,
+            ..UserSettings::default()
+        };
+        let serialized = toml::to_string(&settings).expect("设置应能序列化");
+        let reloaded: UserSettings = toml::from_str(&serialized).expect("设置应能反序列化");
+
+        assert!(reloaded.performance_monitoring_enabled);
     }
 
     #[test]

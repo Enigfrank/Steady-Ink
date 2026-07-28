@@ -186,7 +186,7 @@ impl SurfacePool {
 }
 
 /// 保守估算 surface 的颜色缓冲和 MSAA 样本占用。
-fn estimate_surface_bytes(render_size: [u32; 2], config: InkSurfaceConfig) -> usize {
+pub(crate) fn estimate_surface_bytes(render_size: [u32; 2], config: InkSurfaceConfig) -> usize {
     let sample_multiplier = if config.sample_count == 0 {
         1
     } else {

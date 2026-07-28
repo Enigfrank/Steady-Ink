@@ -2,6 +2,7 @@ use std::{
     collections::VecDeque,
     sync::{Arc, Condvar, Mutex, mpsc},
     thread::{self, JoinHandle},
+    time::Instant,
 };
 
 use winit::dpi::PhysicalSize;
@@ -9,9 +10,20 @@ use winit::dpi::PhysicalSize;
 use super::{Compositor, EguiFrame};
 use crate::{
     error::AppError,
-    ink::{InkBounds, InkDocument, OwnedActiveInkPreview},
+    ink::{InkBounds, InkDocument, InkOperation, InkSyncKind, OwnedActiveInkPreview},
+    performance::{
+        PerformanceFrameSample, PerformanceInkSync, PerformanceMonitor, PerformanceSnapshot,
+        PerformanceSnapshotReader,
+    },
     window::{D3DRenderContext, D3DRenderTarget, GraphicsDiagnostics},
 };
+
+/// 事件线程仅在用户开启监控时附加的一帧时间事实。
+#[derive(Debug, Clone, Copy)]
+pub struct RenderPerformanceMetadata {
+    pub submitted_at: Instant,
+    pub input_started_at: Option<Instant>,
+}
 
 /// 事件线程提交给渲染线程的完整 owned 画面快照。
 pub struct RenderFrame {
@@ -19,6 +31,7 @@ pub struct RenderFrame {
     pub document: InkDocument,
     pub active_preview: Option<OwnedActiveInkPreview>,
     pub egui: EguiFrame,
+    pub performance: Option<RenderPerformanceMetadata>,
 }
 
 /// 渲染线程异步返回给事件线程的状态变化。
@@ -61,16 +74,29 @@ struct RenderMailbox {
 }
 
 impl RenderMailbox {
-    /// 无阻塞地替换待渲染画面，并保留旧画面的纹理生命周期命令。
+    /// 无阻塞地替换待渲染画面，并保留纹理命令和最早关联输入。
     fn submit_frame(&self, frame: RenderFrame) {
         let mut state = self.state.lock().expect("渲染邮箱互斥量不应中毒");
         if state.closed {
             return;
         }
         if let Some(skipped) = state.frame.replace(frame) {
+            let skipped_input = skipped
+                .performance
+                .and_then(|metadata| metadata.input_started_at);
             state
                 .skipped_texture_deltas
                 .extend(skipped.egui.texture_deltas);
+            if let Some(metadata) = state
+                .frame
+                .as_mut()
+                .and_then(|frame| frame.performance.as_mut())
+            {
+                metadata.input_started_at = match (metadata.input_started_at, skipped_input) {
+                    (Some(current), Some(skipped)) => Some(current.min(skipped)),
+                    (current, skipped) => current.or(skipped),
+                };
+            }
         }
         self.ready.notify_one();
     }
@@ -155,6 +181,7 @@ pub struct RenderThread {
     join: Option<JoinHandle<()>>,
     diagnostics: GraphicsDiagnostics,
     initial_ink_error: Option<String>,
+    performance: PerformanceSnapshotReader,
 }
 
 impl RenderThread {
@@ -166,6 +193,8 @@ impl RenderThread {
     ) -> Result<Self, AppError> {
         let mailbox = Arc::new(RenderMailbox::default());
         let worker_mailbox = Arc::clone(&mailbox);
+        let performance_monitor = PerformanceMonitor::new();
+        let performance = performance_monitor.snapshot_reader();
         let (events_tx, events) = mpsc::channel();
         let (initialized_tx, initialized_rx) = mpsc::sync_channel(1);
         let join = thread::Builder::new()
@@ -177,6 +206,7 @@ impl RenderThread {
                     worker_mailbox,
                     events_tx,
                     initialized_tx,
+                    performance_monitor,
                     &wake_event_loop,
                 );
             })
@@ -191,6 +221,7 @@ impl RenderThread {
             join: Some(join),
             diagnostics,
             initial_ink_error,
+            performance,
         })
     }
 
@@ -202,6 +233,11 @@ impl RenderThread {
     /// 返回 compositor 初始化时发生的非致命墨迹增强降级错误。
     pub fn initial_ink_error(&self) -> Option<&str> {
         self.initial_ink_error.as_deref()
+    }
+
+    /// 复制渲染线程最新发布的固定大小性能快照。
+    pub fn performance_snapshot(&self) -> PerformanceSnapshot {
+        self.performance.snapshot()
     }
 
     /// 提交最新 owned frame；若旧帧尚未消费则只保留其纹理命令。
@@ -268,6 +304,7 @@ fn run_render_thread(
     mailbox: Arc<RenderMailbox>,
     events: mpsc::Sender<RenderEvent>,
     initialized: mpsc::SyncSender<Result<(GraphicsDiagnostics, Option<String>), String>>,
+    mut performance_monitor: PerformanceMonitor,
     wake_event_loop: &impl Fn(),
 ) {
     let initialization = D3DRenderContext::new(target).and_then(|context| {
@@ -340,21 +377,71 @@ fn run_render_thread(
         }
 
         if let Some(frame) = work.frame {
+            let performance_metadata = frame.performance;
+            let monitoring_started =
+                performance_monitor.set_enabled(performance_metadata.is_some());
+            let render_started_at = performance_metadata.map(|_| Instant::now());
+            let generation = frame.generation;
             let preview = frame
                 .active_preview
                 .as_ref()
                 .map(OwnedActiveInkPreview::as_borrowed);
             let result = compositor
                 .paint(&window_context, &frame.document, preview, frame.egui)
-                .and_then(|()| window_context.present());
-            if let Err(error) = result {
-                send_render_event(
-                    &events,
-                    RenderEvent::Fatal(error.to_string()),
-                    wake_event_loop,
-                );
-                mailbox.close();
-                return;
+                .and_then(|ink_sync| window_context.present().map(|()| ink_sync));
+            let ink_sync = match result {
+                Ok(ink_sync) => ink_sync,
+                Err(error) => {
+                    send_render_event(
+                        &events,
+                        RenderEvent::Fatal(error.to_string()),
+                        wake_event_loop,
+                    );
+                    mailbox.close();
+                    return;
+                }
+            };
+            if let (Some(metadata), Some(render_started_at)) =
+                (performance_metadata, render_started_at)
+            {
+                let presented_at = Instant::now();
+                let count_document = monitoring_started || ink_sync != InkSyncKind::Unchanged;
+                let (visible_strokes, visible_operations) = count_document
+                    .then(|| visible_ink_counts(&frame.document))
+                    .map_or((None, None), |(strokes, operations)| {
+                        (Some(strokes), Some(operations))
+                    });
+                let frame_time = presented_at.saturating_duration_since(metadata.submitted_at);
+                let render_time = presented_at.saturating_duration_since(render_started_at);
+                let input_latency = metadata
+                    .input_started_at
+                    .map(|started_at| presented_at.saturating_duration_since(started_at));
+                let managed_gpu_bytes = compositor.estimated_managed_gpu_bytes(&window_context);
+                let performance_ink_sync = performance_ink_sync(ink_sync);
+                let slow_frame = performance_monitor.record_frame(PerformanceFrameSample {
+                    presented_at,
+                    frame_time,
+                    render_time,
+                    input_latency,
+                    visible_strokes,
+                    visible_operations,
+                    ink_sync: performance_ink_sync,
+                    managed_gpu_bytes,
+                });
+                if slow_frame {
+                    let snapshot = performance_monitor.snapshot();
+                    tracing::warn!(
+                        generation,
+                        frame_time_micros = frame_time.as_micros(),
+                        render_time_micros = render_time.as_micros(),
+                        input_latency_micros = ?input_latency.map(|duration| duration.as_micros()),
+                        visible_strokes = snapshot.visible_strokes(),
+                        visible_operations = snapshot.visible_operations(),
+                        ink_sync = ?performance_ink_sync,
+                        managed_gpu_bytes,
+                        "检测到异常渲染帧"
+                    );
+                }
             }
             let ink_error = compositor.ink_rendering_error().map(str::to_owned);
             if ink_error != last_ink_error {
@@ -366,6 +453,26 @@ fn run_render_thread(
                 );
             }
         }
+    }
+}
+
+/// 统计最近一次清屏后的可见画笔数和全部操作数。
+fn visible_ink_counts(document: &InkDocument) -> (usize, usize) {
+    let operations = document.replay_operations();
+    let strokes = operations
+        .iter()
+        .filter(|operation| matches!(operation, InkOperation::DrawStroke(_)))
+        .count();
+    (strokes, operations.len())
+}
+
+/// 把墨迹域同步事实映射为稳定的性能域分类。
+const fn performance_ink_sync(sync: InkSyncKind) -> PerformanceInkSync {
+    match sync {
+        InkSyncKind::Unchanged => PerformanceInkSync::Unchanged,
+        InkSyncKind::Incremental => PerformanceInkSync::Incremental,
+        InkSyncKind::RegionRebuild => PerformanceInkSync::RegionRebuild,
+        InkSyncKind::FullRebuild => PerformanceInkSync::FullRebuild,
     }
 }
 
@@ -387,6 +494,7 @@ mod tests {
     use egui::{TextureId, TexturesDelta};
 
     use super::*;
+    use crate::ink::{CanvasPoint, InkColor, PenWidth};
 
     /// 创建只携带 generation 和纹理释放标识的测试帧。
     fn test_frame(generation: u64, texture: u64) -> RenderFrame {
@@ -402,6 +510,7 @@ mod tests {
                     free: vec![TextureId::Managed(texture)],
                 }],
             },
+            performance: None,
         }
     }
 
@@ -416,13 +525,30 @@ mod tests {
         assert_send::<RenderFrame>();
     }
 
-    /// 验证多次提交只保留最新画面，但逐帧纹理命令仍保持原顺序。
+    /// 验证只保留最新画面，同时保留纹理命令和最早关联输入。
     #[test]
     fn latest_frame_replaces_stale_frames_without_losing_texture_deltas() {
         let mailbox = RenderMailbox::default();
-        mailbox.submit_frame(test_frame(1, 11));
-        mailbox.submit_frame(test_frame(2, 22));
-        mailbox.submit_frame(test_frame(3, 33));
+        let submitted_at = Instant::now();
+        let earliest_input = submitted_at - Duration::from_millis(6);
+        let mut first = test_frame(1, 11);
+        first.performance = Some(RenderPerformanceMetadata {
+            submitted_at: submitted_at - Duration::from_millis(4),
+            input_started_at: Some(earliest_input),
+        });
+        mailbox.submit_frame(first);
+        let mut second = test_frame(2, 22);
+        second.performance = Some(RenderPerformanceMetadata {
+            submitted_at: submitted_at - Duration::from_millis(2),
+            input_started_at: None,
+        });
+        mailbox.submit_frame(second);
+        let mut latest = test_frame(3, 33);
+        latest.performance = Some(RenderPerformanceMetadata {
+            submitted_at,
+            input_started_at: Some(submitted_at - Duration::from_millis(2)),
+        });
+        mailbox.submit_frame(latest);
 
         let work = mailbox.wait_for_work();
         let frame = work.frame.expect("最新画面应可消费");
@@ -435,6 +561,20 @@ mod tests {
             .collect();
 
         assert_eq!(frame.generation, 3);
+        assert_eq!(
+            frame
+                .performance
+                .expect("最新画面的性能 metadata 应保留")
+                .submitted_at,
+            submitted_at
+        );
+        assert_eq!(
+            frame
+                .performance
+                .expect("被覆盖画面的输入起点应合并到最终画面")
+                .input_started_at,
+            Some(earliest_input)
+        );
         assert_eq!(
             textures,
             vec![
@@ -505,6 +645,30 @@ mod tests {
         consumer.join().expect("慢消费者线程应正常退出");
 
         assert!(percentile_95(&asynchronous) * 2 < percentile_95(&synchronous));
+    }
+
+    /// 验证性能统计只计算最近一次清屏后的可见画笔和操作。
+    #[test]
+    fn visible_counts_follow_replay_operations() {
+        let mut document = InkDocument::new();
+        document.append_draw_stroke(
+            vec![CanvasPoint::new(0.0, 0.0), CanvasPoint::new(4.0, 4.0)],
+            InkColor::Red,
+            PenWidth::Px4,
+        );
+        document.append_draw_stroke(
+            vec![CanvasPoint::new(8.0, 8.0), CanvasPoint::new(12.0, 12.0)],
+            InkColor::Blue,
+            PenWidth::Px6,
+        );
+        document.clear();
+        document.append_draw_stroke(
+            vec![CanvasPoint::new(16.0, 16.0), CanvasPoint::new(20.0, 20.0)],
+            InkColor::Black,
+            PenWidth::Px8,
+        );
+
+        assert_eq!(visible_ink_counts(&document), (1, 1));
     }
 
     /// 返回一组测试耗时的最近秩 p95。

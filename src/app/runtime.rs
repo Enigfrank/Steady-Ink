@@ -28,8 +28,9 @@ use crate::{
         WindowsPointerTracker,
     },
     logging,
+    performance::{PerformanceSnapshot, export_snapshot},
     recovery::{RecoveryEvent, RecoveryManager, RecoveryStartup},
-    render::{EguiUiState, RenderEvent, RenderFrame, RenderThread},
+    render::{EguiUiState, RenderEvent, RenderFrame, RenderPerformanceMetadata, RenderThread},
     settings::{SettingsStore, UserSettings},
     slideshow::{
         ComDetector, ComDetectorEvent, ComDiagnostics, SlideShowControlAction, SlideShowSession,
@@ -232,6 +233,9 @@ struct DesktopRuntime {
     settings_error: Option<String>,
     recovery_error: Option<String>,
     settings_directory_error: Option<String>,
+    performance_export_status: Option<String>,
+    performance_export_failed: bool,
+    pending_performance_input: Option<Instant>,
     machine_autostart_state: Option<MachineAutostartState>,
     machine_autostart_error: Option<String>,
     ink_rendering_error: Option<String>,
@@ -318,6 +322,9 @@ impl DesktopRuntime {
             settings_error,
             recovery_error,
             settings_directory_error: None,
+            performance_export_status: None,
+            performance_export_failed: false,
+            pending_performance_input: None,
             machine_autostart_state,
             machine_autostart_error,
             ink_rendering_error,
@@ -379,6 +386,7 @@ impl DesktopRuntime {
 
     /// 将统一指针动作应用到当前活动手势或普通批注文档。
     fn apply_pointer_action(&mut self, action: PointerAction) -> bool {
+        self.note_performance_input();
         let dpi_scale = self.window_context.window().scale_factor() as f32;
         match action {
             PointerAction::Begin(point) => {
@@ -465,6 +473,13 @@ impl DesktopRuntime {
                     .and_then(|session| session.current_page().reliable_page_numbers())
             })
             .flatten();
+        let performance_snapshot = if self.settings.performance_monitoring_enabled
+            || self.idle_panel == IdlePanel::Settings
+        {
+            self.render_thread.performance_snapshot()
+        } else {
+            PerformanceSnapshot::default()
+        };
         let view = UiViewState {
             mode,
             idle_panel: self.idle_panel,
@@ -474,6 +489,10 @@ impl DesktopRuntime {
             slideshow_integration_enabled: self.settings.slideshow_integration_enabled,
             log_level: self.settings.log_level,
             readable_mode: self.settings.readable_mode,
+            performance_monitoring_enabled: self.settings.performance_monitoring_enabled,
+            performance_snapshot,
+            performance_export_status: self.performance_export_status.as_deref(),
+            performance_export_failed: self.performance_export_failed,
             ink_rendering_error: self.ink_rendering_error.as_deref(),
             slideshow_session_generation: self
                 .state
@@ -501,11 +520,22 @@ impl DesktopRuntime {
         let document = self.state.active_document().unwrap_or(&self.empty_document);
         let preview = self.active_gesture.as_mut().map(ActiveGesture::preview);
         self.render_generation = self.render_generation.wrapping_add(1);
+        let performance =
+            self.settings
+                .performance_monitoring_enabled
+                .then(|| RenderPerformanceMetadata {
+                    submitted_at: Instant::now(),
+                    input_started_at: self.pending_performance_input.take(),
+                });
+        if performance.is_none() {
+            self.pending_performance_input = None;
+        }
         self.render_thread.submit_frame(RenderFrame {
             generation: self.render_generation,
             document: document.clone(),
             active_preview: preview.map(OwnedActiveInkPreview::from),
             egui: egui_frame,
+            performance,
         });
 
         let exit_requested = if let Some(command) = ui_command {
@@ -651,6 +681,14 @@ impl DesktopRuntime {
                 self.settings.readable_mode = enabled;
                 self.save_settings();
             }
+            UiCommand::SetPerformanceMonitoringEnabled(enabled) => {
+                self.settings.performance_monitoring_enabled = enabled;
+                if !enabled {
+                    self.pending_performance_input = None;
+                }
+                self.save_settings();
+            }
+            UiCommand::ExportPerformanceData => self.export_performance_data(),
             UiCommand::ToggleSlideshowToolbar => match self.state.mode() {
                 AppMode::SlideShowAnnotatingExpanded => {
                     self.state.collapse_slideshow_toolbar();
@@ -698,6 +736,35 @@ impl DesktopRuntime {
                 tracing::warn!(%error, "保存设置失败");
                 self.settings_error = Some(error.to_string());
             }
+        }
+    }
+
+    /// 把最新有界性能快照写入日志目录，并保存非致命 UI 诊断。
+    fn export_performance_data(&mut self) {
+        let snapshot = self.render_thread.performance_snapshot();
+        let result = self
+            .settings_store
+            .ensure_logs_directory()
+            .and_then(|directory| export_snapshot(&directory, snapshot));
+        match result {
+            Ok(path) => {
+                tracing::info!(path = %path.display(), "性能快照已导出");
+                self.performance_export_status = Some(format!("已导出至 {}", path.display()));
+                self.performance_export_failed = false;
+            }
+            Err(error) => {
+                tracing::warn!(%error, "导出性能快照失败");
+                self.performance_export_status = Some(error.to_string());
+                self.performance_export_failed = true;
+            }
+        }
+    }
+
+    /// 仅在监控开启时记录自上一帧以来最早的墨迹输入时间。
+    fn note_performance_input(&mut self) {
+        if self.settings.performance_monitoring_enabled {
+            self.pending_performance_input
+                .get_or_insert_with(Instant::now);
         }
     }
 

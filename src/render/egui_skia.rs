@@ -215,6 +215,15 @@ impl EguiSkiaPainter {
         Ok(())
     }
 
+    /// 保守估算当前 egui 纹理可能占用的 RGBA GPU 上传字节数。
+    pub(crate) fn estimated_texture_bytes(&self) -> usize {
+        self.textures.values().fold(0_usize, |total, texture| {
+            let width = usize::try_from(texture.image.width().max(0)).unwrap_or(usize::MAX);
+            let height = usize::try_from(texture.image.height().max(0)).unwrap_or(usize::MAX);
+            total.saturating_add(width.saturating_mul(height).saturating_mul(4))
+        })
+    }
+
     /// 按 egui 产生顺序应用一个纹理 delta 的 set 阶段。
     fn apply_texture_sets(&mut self, textures_delta: &mut TexturesDelta) -> Result<(), AppError> {
         for (id, image_delta) in textures_delta.set.drain(..) {

@@ -4,6 +4,7 @@ pub mod error;
 pub mod ink;
 pub mod input;
 mod logging;
+pub mod performance;
 pub mod recovery;
 pub mod render;
 pub mod settings;

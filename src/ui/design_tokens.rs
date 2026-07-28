@@ -224,6 +224,9 @@ pub const ICON_SIZE: f32 = TOOL_METRICS.icon_size;
 pub const PAGE_NUMBER_WIDTH: f32 = scale_points(80.0);
 pub const QUICK_SETTINGS_CONTENT_WIDTH: f32 = scale_points(424.0);
 pub const SLIDESHOW_TOOLBAR_ANIMATION_SECONDS: f32 = 0.2;
+pub const PERFORMANCE_OVERLAY_WIDTH: f32 = scale_points(240.0);
+pub const PERFORMANCE_CHART_HEIGHT: f32 = scale_points(48.0);
+pub const PERFORMANCE_OVERLAY_MARGIN: f32 = SPACE_6;
 
 /// 将设置类界面的内建 egui 控件改为不透明表面，且不影响全局工具栏样式。
 pub fn apply_widget_style(ui: &mut Ui, readable_mode: bool, role: MaterialRole) {

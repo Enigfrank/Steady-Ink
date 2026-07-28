@@ -64,6 +64,23 @@ pub fn render(ui: &mut Ui, view: UiViewState<'_>) -> Option<UiCommand> {
                     {
                         command = Some(UiCommand::SetReadableMode(readable_mode));
                     }
+                    let mut performance_monitoring_enabled =
+                        view.performance_monitoring_enabled;
+                    if ui
+                        .add_sized(
+                            [ui.available_width(), metrics.touch_target],
+                            egui::Checkbox::new(
+                                &mut performance_monitoring_enabled,
+                                "显示性能监控",
+                            ),
+                        )
+                        .changed()
+                        && command.is_none()
+                    {
+                        command = Some(UiCommand::SetPerformanceMonitoringEnabled(
+                            performance_monitoring_enabled,
+                        ));
+                    }
                     if let Some(error) = view.ink_rendering_error {
                         ui.label(
                             egui::RichText::new(error)
@@ -123,7 +140,10 @@ pub fn render(ui: &mut Ui, view: UiViewState<'_>) -> Option<UiCommand> {
                                 command = log_level_command;
                             }
                             ui.add_space(metrics.space_4);
-                            render_diagnostics(ui, view, metrics);
+                            let diagnostics_command = render_diagnostics(ui, view, metrics);
+                            if command.is_none() {
+                                command = diagnostics_command;
+                            }
                             ui.add_space(metrics.space_4);
                             diagnostic_row(
                                 ui,
@@ -379,8 +399,12 @@ fn section_break(ui: &mut Ui, metrics: InterfaceMetrics) {
     ui.add_space(metrics.space_4);
 }
 
-/// 绘制 COM、控制、GPU、恢复、配置目录和设置文件状态。
-fn render_diagnostics(ui: &mut Ui, view: UiViewState<'_>, metrics: InterfaceMetrics) {
+/// 绘制运行诊断、性能摘要和性能快照导出操作。
+fn render_diagnostics(
+    ui: &mut Ui,
+    view: UiViewState<'_>,
+    metrics: InterfaceMetrics,
+) -> Option<UiCommand> {
     let (com_status, com_color) =
         com_status(view.slideshow_integration_enabled, view.com_diagnostics);
     diagnostic_row(ui, "COM 检测", com_status, com_color, metrics);
@@ -491,6 +515,59 @@ fn render_diagnostics(ui: &mut Ui, view: UiViewState<'_>, metrics: InterfaceMetr
         },
         metrics,
     );
+    let performance_summary = if view.performance_snapshot.frame_count() == 0 {
+        "等待样本".to_owned()
+    } else {
+        format!(
+            "{:.1} FPS / {:.2} ms p95",
+            view.performance_snapshot.fps(),
+            view.performance_snapshot.p95_frame_time_ms()
+        )
+    };
+    diagnostic_row(
+        ui,
+        "渲染性能",
+        &performance_summary,
+        tokens::COLOR_TEXT_PRIMARY,
+        metrics,
+    );
+    let gpu_resources = format!(
+        "{:.1} MiB（应用自有估算）",
+        view.performance_snapshot.managed_gpu_mebibytes()
+    );
+    diagnostic_row(
+        ui,
+        "GPU 渲染资源",
+        &gpu_resources,
+        tokens::COLOR_TEXT_PRIMARY,
+        metrics,
+    );
+    if let Some(status) = view.performance_export_status {
+        diagnostic_row(
+            ui,
+            "性能导出",
+            status,
+            if view.performance_export_failed {
+                tokens::COLOR_ERROR
+            } else {
+                tokens::COLOR_TEXT_PRIMARY
+            },
+            metrics,
+        );
+    }
+    ui.add_space(metrics.space_4);
+    let button_width = ui.available_width();
+    settings_action_button(
+        ui,
+        "导出性能数据",
+        Icon::Download,
+        SettingsActionStyle::Neutral,
+        button_width,
+        metrics,
+        view.readable_mode,
+    )
+    .clicked()
+    .then_some(UiCommand::ExportPerformanceData)
 }
 
 /// 根据联动开关和候选诊断生成设置页 COM 状态。

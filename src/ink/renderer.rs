@@ -11,6 +11,7 @@ use super::{
     InkBounds, InkColor, InkDocument, InkOperation, InkSpatialIndex, InkTool, OperationId,
     PenWidth, SurfacePool, VariableStrokePoint,
     stroke_geometry::{StrokeSegment, variable_outline, visit_smoothed_segments},
+    surface_pool::estimate_surface_bytes,
 };
 use crate::error::AppError;
 use crate::settings::InkAntialiasingMode;
@@ -234,6 +235,15 @@ pub struct InkRenderCache {
     deferred_erase: Option<EraseStroke>,
 }
 
+/// 一帧同步对持久墨迹缓存执行的工作类型。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InkSyncKind {
+    Unchanged,
+    Incremental,
+    RegionRebuild,
+    FullRebuild,
+}
+
 impl InkRenderCache {
     /// 为指定逻辑尺寸创建透明的 GPU 墨迹层，并验证请求的 MSAA sample count。
     pub fn new(
@@ -264,14 +274,14 @@ impl InkRenderCache {
     }
 
     /// 将尚未应用的新 operation 增量绘制到持久 GPU surface。
-    pub fn sync(&mut self, document: &InkDocument) {
+    pub fn sync(&mut self, document: &InkDocument) -> InkSyncKind {
         if self.full_rebuild_requested {
             self.rebuild(document);
-            return;
+            return InkSyncKind::FullRebuild;
         }
         if let Some(bounds) = self.pending_region_rebuild.take() {
             self.rebuild_region(document, bounds);
-            return;
+            return InkSyncKind::RegionRebuild;
         }
 
         let history = document.operations();
@@ -284,12 +294,12 @@ impl InkRenderCache {
 
         if !prefix_still_matches {
             self.rebuild(document);
-            return;
+            return InkSyncKind::FullRebuild;
         }
 
         let new_operations = &history[self.applied_operation_count..];
         if new_operations.is_empty() {
-            return;
+            return InkSyncKind::Unchanged;
         }
         let started_at = tracing::enabled!(tracing::Level::DEBUG).then(std::time::Instant::now);
         self.commit_deferred_erase();
@@ -321,6 +331,7 @@ impl InkRenderCache {
             );
         }
         self.mark_document_applied(document);
+        InkSyncKind::Incremental
     }
 
     /// 返回当前 GPU 墨迹层快照，供同一上下文合成到窗口 framebuffer。
@@ -373,6 +384,11 @@ impl InkRenderCache {
     /// 返回缓存的固定 surface 配置。
     pub(crate) const fn config(&self) -> InkSurfaceConfig {
         self.config
+    }
+
+    /// 返回持久墨迹 surface 的保守颜色/MSAA 缓冲字节估算。
+    pub(crate) fn estimated_bytes(&self) -> usize {
+        estimate_surface_bytes(self.render_size, self.config)
     }
 
     /// 强制下次同步从文档事实历史重建缓存。
@@ -911,6 +927,11 @@ impl InkPreviewCache {
     /// 消耗缓存并把拥有的离屏 surface 归还资源池。
     pub(crate) fn release(self, surface_pool: &mut SurfacePool) {
         surface_pool.release(self.surface, self.render_size, self.config);
+    }
+
+    /// 返回当前活动预览 surface 的保守颜色/MSAA 缓冲字节估算。
+    pub(crate) fn estimated_bytes(&self) -> usize {
+        estimate_surface_bytes(self.render_size, self.config)
     }
 
     /// 以透明底清理当前局部预览 surface。

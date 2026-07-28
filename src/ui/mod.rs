@@ -1,4 +1,5 @@
 pub(crate) mod design_tokens;
+mod performance_overlay;
 mod pixel_snap;
 mod quick_settings;
 mod settings_controls;

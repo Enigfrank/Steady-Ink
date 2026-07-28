@@ -14,6 +14,7 @@ use crate::{
     app::AppMode,
     autostart::MachineAutostartState,
     ink::{EraserSize, InkColor, InkTool, PenWidth},
+    performance::PerformanceSnapshot,
     settings::{LogLevel, PalmSizePreset},
     slideshow::ComDiagnostics,
     window::{DockSide, GraphicsDiagnostics},
@@ -44,6 +45,8 @@ pub enum UiCommand {
     SetSlideshowIntegrationEnabled(bool),
     SetLogLevel(LogLevel),
     SetReadableMode(bool),
+    SetPerformanceMonitoringEnabled(bool),
+    ExportPerformanceData,
     SetMachineAutostart(bool),
     ToggleSlideshowToolbar,
     PreviousSlide,
@@ -73,6 +76,10 @@ pub struct UiViewState<'a> {
     pub slideshow_integration_enabled: bool,
     pub log_level: LogLevel,
     pub readable_mode: bool,
+    pub performance_monitoring_enabled: bool,
+    pub performance_snapshot: PerformanceSnapshot,
+    pub performance_export_status: Option<&'a str>,
+    pub performance_export_failed: bool,
     pub ink_rendering_error: Option<&'a str>,
     pub slideshow_session_generation: Option<u64>,
     pub slide_page_numbers: Option<(u32, u32)>,
@@ -152,7 +159,7 @@ impl ToolState {
 
 /// 根据顶层模式绘制当前工具栏，并返回最多一个离散 UI 命令。
 pub fn render(ui: &mut Ui, view: UiViewState<'_>) -> Option<UiCommand> {
-    match view.mode {
+    let command = match view.mode {
         AppMode::IdleFloatingToolbar => match view.idle_panel {
             IdlePanel::Toolbar => render_idle_toolbar(ui, view.readable_mode),
             IdlePanel::QuickSettings => super::quick_settings::render(ui, view),
@@ -164,7 +171,11 @@ pub fn render(ui: &mut Ui, view: UiViewState<'_>) -> Option<UiCommand> {
         AppMode::SlideShowAnnotatingExpanded
         | AppMode::SlideShowAnnotatingCollapsed
         | AppMode::SlideShowConnectionLost => super::slideshow_toolbar::render(ui.ctx(), view),
+    };
+    if view.performance_monitoring_enabled && view.mode.accepts_ink_input() {
+        super::performance_overlay::render(ui.ctx(), view.performance_snapshot, view.readable_mode);
     }
+    command
 }
 
 /// 绘制右侧中部非批注悬浮卡片工具栏。
@@ -979,6 +990,31 @@ pub(super) fn paint_icon(
                 paint_line(points, stroke);
             }
         }
+        Icon::Download => {
+            paint_line(
+                [
+                    center + egui::vec2(0.0, -half * 0.8),
+                    center + egui::vec2(0.0, half * 0.35),
+                ],
+                stroke,
+            );
+            for points in [
+                [
+                    center + egui::vec2(-half * 0.4, 0.0),
+                    center + egui::vec2(0.0, half * 0.4),
+                ],
+                [
+                    center + egui::vec2(0.0, half * 0.4),
+                    center + egui::vec2(half * 0.4, 0.0),
+                ],
+                [
+                    center + egui::vec2(-half * 0.7, half * 0.75),
+                    center + egui::vec2(half * 0.7, half * 0.75),
+                ],
+            ] {
+                paint_line(points, stroke);
+            }
+        }
         Icon::Power => {
             painter.circle_stroke(center, half * 0.72, stroke);
             paint_line(
@@ -1036,5 +1072,6 @@ pub(super) enum Icon {
     Confirm,
     Cancel,
     Folder,
+    Download,
     Power,
 }

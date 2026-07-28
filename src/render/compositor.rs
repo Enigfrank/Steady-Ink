@@ -8,8 +8,9 @@ use crate::{
     error::AppError,
     ink::{
         ActiveInkPreview, BASE_PREVIEW_TILE_SIZE, InkBounds, InkDocument, InkPreviewCache,
-        InkRenderCache, SurfacePool, VelocityTracker, active_preview_bounds, draw_active_preview,
-        draw_image_rect_logical, preview_replaces_region, preview_tile_size_for_velocity,
+        InkRenderCache, InkSyncKind, SurfacePool, VelocityTracker, active_preview_bounds,
+        draw_active_preview, draw_image_rect_logical, preview_replaces_region,
+        preview_tile_size_for_velocity,
     },
     settings::InkAntialiasingMode,
     window::{D3DRenderContext, SWAP_CHAIN_BUFFER_COUNT},
@@ -197,6 +198,27 @@ impl Compositor {
         self.ink_rendering_error.as_deref()
     }
 
+    /// 保守估算交换链、墨迹、预览池和 egui 持有的 GPU 渲染资源字节数。
+    pub(crate) fn estimated_managed_gpu_bytes(&self, window_context: &D3DRenderContext) -> u64 {
+        let size = window_context.swap_chain_size();
+        let surface_count = u64::try_from(self.window_surfaces.len()).unwrap_or(u64::MAX);
+        let swap_chain_bytes = u64::from(size.width)
+            .saturating_mul(u64::from(size.height))
+            .saturating_mul(4)
+            .saturating_mul(surface_count);
+        let offscreen_bytes = self
+            .ink_cache
+            .estimated_bytes()
+            .saturating_add(
+                self.preview_cache
+                    .as_ref()
+                    .map_or(0, InkPreviewCache::estimated_bytes),
+            )
+            .saturating_add(self.preview_surface_pool.stats().estimated_bytes)
+            .saturating_add(self.egui.estimated_texture_bytes());
+        swap_chain_bytes.saturating_add(u64::try_from(offscreen_bytes).unwrap_or(u64::MAX))
+    }
+
     /// 完成透明清理、Skia 墨迹、egui、Skia submit 的一帧 D3D12 合成。
     pub fn paint(
         &mut self,
@@ -204,12 +226,12 @@ impl Compositor {
         document: &InkDocument,
         active_preview: Option<ActiveInkPreview<'_>>,
         egui_frame: EguiFrame,
-    ) -> Result<(), AppError> {
+    ) -> Result<InkSyncKind, AppError> {
         let preview_frame_started = active_preview
             .is_some_and(|preview| self.adaptive_aa.preview_quality(preview).is_some())
             .then(Instant::now);
         self.gr_context.reset(None);
-        self.ink_cache.sync(document);
+        let mut ink_sync = self.ink_cache.sync(document);
 
         if let Some(preview) = active_preview {
             if let Some(position) = preview.latest_position() {
@@ -242,6 +264,7 @@ impl Compositor {
             };
             if let Some(error) = reset_error {
                 self.fallback_to_off(document, format!("活动墨迹预览回收失败: {error}"))?;
+                ink_sync = InkSyncKind::FullRebuild;
                 ink_image = self.ink_cache.snapshot();
             }
         }
@@ -252,6 +275,7 @@ impl Compositor {
                 Ok(composite) => preview_composite = Some(composite),
                 Err(error) => {
                     self.fallback_to_off(document, format!("活动墨迹预览创建失败: {error}"))?;
+                    ink_sync = InkSyncKind::FullRebuild;
                     ink_image = self.ink_cache.snapshot();
                 }
             }
@@ -314,7 +338,7 @@ impl Compositor {
                 "活动预览抗锯齿质量已按帧时间调整"
             );
         }
-        Ok(())
+        Ok(ink_sync)
     }
 
     /// 将活动预览绘制到局部增强 surface，并返回其目标区域。

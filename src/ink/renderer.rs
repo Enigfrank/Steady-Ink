@@ -7,8 +7,9 @@ use skia_safe::{
 };
 
 use super::{
-    BatchDrawer, CanvasPoint, EraseSample, EraserSize, InkBounds, InkColor, InkDocument,
-    InkOperation, InkSpatialIndex, InkTool, OperationId, PenWidth, VariableStrokePoint,
+    BASE_PREVIEW_TILE_SIZE, BatchDrawer, CanvasPoint, EraseSample, EraserSize, InkBounds, InkColor,
+    InkDocument, InkOperation, InkSpatialIndex, InkTool, OperationId, PenWidth, SurfacePool,
+    VariableStrokePoint,
     stroke_geometry::{StrokeSegment, variable_outline, visit_smoothed_segments},
 };
 use crate::error::AppError;
@@ -34,12 +35,22 @@ pub enum ActiveInkPreview<'a> {
     },
 }
 
+impl ActiveInkPreview<'_> {
+    /// 返回活动手势最新的物理像素位置，供预览资源策略采样。
+    pub(crate) fn latest_position(self) -> Option<CanvasPoint> {
+        match self {
+            Self::Tool { points, .. } => points.last().copied(),
+            Self::VariableTool { points, .. } => points.last().map(|sample| sample.point),
+            Self::PalmErase { samples } => samples.last().map(|sample| sample.center),
+        }
+    }
+}
+
 const ERASE_RADIUS_EPSILON: f32 = 0.01;
 const PALM_INTERPOLATION_STEP_FRACTION: f32 = 0.75;
 const PALM_INTERPOLATION_MIN_STEP: f32 = 4.0;
 const PALM_INTERPOLATION_MAX_STEP: f32 = 24.0;
 const SUPER_SAMPLE_SCALE: f32 = 1.5;
-const PREVIEW_TILE_SIZE: f32 = 512.0;
 const MAX_INCREMENTAL_REBUILD_AREA_RATIO: f32 = 0.1;
 
 /// 描述墨迹离屏 surface 的逻辑尺寸、渲染尺寸和实际多采样配置。
@@ -599,17 +610,33 @@ pub(crate) struct InkPreviewCache {
 }
 
 impl InkPreviewCache {
+    /// 为目标 bounds 创建一个按自适应分块对齐的局部预览 surface。
+    pub(crate) fn for_bounds(
+        context: &mut DirectContext,
+        bounds: InkBounds,
+        window_size: [u32; 2],
+        tile_size: u32,
+        config: InkSurfaceConfig,
+        surface_pool: &mut SurfacePool,
+    ) -> Result<Self, AppError> {
+        let (origin, logical_size) = preview_region(bounds, window_size, tile_size);
+        Self::new(context, origin, logical_size, config, surface_pool)
+    }
+
     /// 创建一个按 512px 块对齐的局部预览 surface。
     pub(crate) fn new(
         context: &mut DirectContext,
         origin: CanvasPoint,
         logical_size: [u32; 2],
         config: InkSurfaceConfig,
+        surface_pool: &mut SurfacePool,
     ) -> Result<Self, AppError> {
         let render_size = config
             .render_size(logical_size)
             .ok_or_else(|| AppError::Graphics("活动墨迹预览尺寸超出 Skia 支持范围".to_owned()))?;
-        let mut surface = create_gpu_surface(context, render_size, config)?;
+        let mut surface = surface_pool.acquire(render_size, config, || {
+            create_gpu_surface(context, render_size, config)
+        })?;
         surface.canvas().clear(Color::TRANSPARENT);
         Ok(Self {
             surface,
@@ -626,8 +653,10 @@ impl InkPreviewCache {
         context: &mut DirectContext,
         bounds: InkBounds,
         window_size: [u32; 2],
+        tile_size: u32,
+        surface_pool: &mut SurfacePool,
     ) -> Result<(), AppError> {
-        let (origin, logical_size) = preview_region(bounds, window_size);
+        let (origin, logical_size) = preview_region(bounds, window_size, tile_size);
         let current_right = self.origin.x + self.logical_size[0] as f32;
         let current_bottom = self.origin.y + self.logical_size[1] as f32;
         let requested_right = origin.x + logical_size[0] as f32;
@@ -645,9 +674,16 @@ impl InkPreviewCache {
             right: current_right.max(requested_right),
             bottom: current_bottom.max(requested_bottom),
         };
-        let (expanded_origin, expanded_size) = preview_region(union_bounds, window_size);
-        let replacement = Self::new(context, expanded_origin, expanded_size, self.config)?;
-        *self = replacement;
+        let (expanded_origin, expanded_size) = preview_region(union_bounds, window_size, tile_size);
+        let replacement = Self::new(
+            context,
+            expanded_origin,
+            expanded_size,
+            self.config,
+            surface_pool,
+        )?;
+        let previous = std::mem::replace(self, replacement);
+        previous.release(surface_pool);
         Ok(())
     }
 
@@ -656,15 +692,25 @@ impl InkPreviewCache {
         &mut self,
         context: &mut DirectContext,
         window_size: [u32; 2],
+        surface_pool: &mut SurfacePool,
     ) -> Result<(), AppError> {
         let origin = CanvasPoint::new(0.0, 0.0);
-        let logical_size = [window_size[0].clamp(1, 512), window_size[1].clamp(1, 512)];
+        let logical_size = [
+            window_size[0].clamp(1, BASE_PREVIEW_TILE_SIZE),
+            window_size[1].clamp(1, BASE_PREVIEW_TILE_SIZE),
+        ];
         if self.origin == origin && self.logical_size == logical_size {
             return Ok(());
         }
-        let replacement = Self::new(context, origin, logical_size, self.config)?;
-        *self = replacement;
+        let replacement = Self::new(context, origin, logical_size, self.config, surface_pool)?;
+        let previous = std::mem::replace(self, replacement);
+        previous.release(surface_pool);
         Ok(())
+    }
+
+    /// 消耗缓存并把拥有的离屏 surface 归还资源池。
+    pub(crate) fn release(self, surface_pool: &mut SurfacePool) {
+        surface_pool.release(self.surface, self.render_size, self.config);
     }
 
     /// 以透明底清理当前局部预览 surface。
@@ -741,18 +787,23 @@ impl InkPreviewCache {
     }
 }
 
-/// 计算覆盖活动 bounds 的 512px 对齐逻辑区域，并裁剪到窗口尺寸内。
-fn preview_region(bounds: InkBounds, window_size: [u32; 2]) -> (CanvasPoint, [u32; 2]) {
+/// 计算覆盖活动 bounds 的自适应分块区域，并裁剪到窗口尺寸内。
+fn preview_region(
+    bounds: InkBounds,
+    window_size: [u32; 2],
+    tile_size: u32,
+) -> (CanvasPoint, [u32; 2]) {
     let window_width = window_size[0].max(1) as f32;
     let window_height = window_size[1].max(1) as f32;
+    let tile_size = tile_size.max(1) as f32;
     let left = bounds.left.max(0.0).min(window_width - 1.0);
     let top = bounds.top.max(0.0).min(window_height - 1.0);
     let right = bounds.right.max(left + 1.0).min(window_width);
     let bottom = bounds.bottom.max(top + 1.0).min(window_height);
-    let origin_x = (left / PREVIEW_TILE_SIZE).floor() * PREVIEW_TILE_SIZE;
-    let origin_y = (top / PREVIEW_TILE_SIZE).floor() * PREVIEW_TILE_SIZE;
-    let end_x = (right / PREVIEW_TILE_SIZE).ceil() * PREVIEW_TILE_SIZE;
-    let end_y = (bottom / PREVIEW_TILE_SIZE).ceil() * PREVIEW_TILE_SIZE;
+    let origin_x = (left / tile_size).floor() * tile_size;
+    let origin_y = (top / tile_size).floor() * tile_size;
+    let end_x = (right / tile_size).ceil() * tile_size;
+    let end_y = (bottom / tile_size).ceil() * tile_size;
     let width = end_x.min(window_width).max(origin_x + 1.0) - origin_x;
     let height = end_y.min(window_height).max(origin_y + 1.0) - origin_y;
     (
@@ -1002,6 +1053,45 @@ fn draw_erase_sample_outline(canvas: &Canvas, sample: EraseSample) {
 mod tests {
     use super::*;
 
+    /// 验证三类活动预览都暴露最新物理位置供速度策略采样。
+    #[test]
+    fn active_preview_reports_latest_position() {
+        let tool_points = [CanvasPoint::new(1.0, 2.0), CanvasPoint::new(3.0, 4.0)];
+        let variable_points = [VariableStrokePoint {
+            point: CanvasPoint::new(5.0, 6.0),
+            width: 4.0,
+        }];
+        let erase_samples = [EraseSample::circle(CanvasPoint::new(7.0, 8.0), 24.0)];
+
+        assert_eq!(
+            ActiveInkPreview::Tool {
+                points: &tool_points,
+                tool: InkTool::Pen,
+                color: InkColor::Red,
+                pen_width: PenWidth::Px4,
+                eraser_size: EraserSize::Px24,
+            }
+            .latest_position(),
+            Some(CanvasPoint::new(3.0, 4.0))
+        );
+        assert_eq!(
+            ActiveInkPreview::VariableTool {
+                points: &variable_points,
+                color: InkColor::Red,
+                eraser_size: EraserSize::Px24,
+            }
+            .latest_position(),
+            Some(CanvasPoint::new(5.0, 6.0))
+        );
+        assert_eq!(
+            ActiveInkPreview::PalmErase {
+                samples: &erase_samples,
+            }
+            .latest_position(),
+            Some(CanvasPoint::new(7.0, 8.0))
+        );
+    }
+
     /// 创建仅旋转角不同的椭圆采样。
     fn sample(rotation_radians: f32) -> EraseSample {
         EraseSample {
@@ -1064,6 +1154,7 @@ mod tests {
                 bottom: 30.0,
             },
             [900, 700],
+            512,
         );
         assert_eq!(origin, CanvasPoint::new(0.0, 0.0));
         assert_eq!(size, [900, 512]);
@@ -1076,9 +1167,23 @@ mod tests {
                 bottom: 720.0,
             },
             [900, 700],
+            512,
         );
         assert_eq!(origin, CanvasPoint::new(512.0, 512.0));
         assert_eq!(size, [388, 188]);
+    }
+
+    /// 验证快速书写使用 768px 分块扩大首次预览区域。
+    #[test]
+    fn preview_region_uses_adaptive_tile_size() {
+        let (origin, size) = preview_region(
+            InkBounds::from_xywh(520.0, 20.0, 20.0, 20.0),
+            [1600, 900],
+            768,
+        );
+
+        assert_eq!(origin, CanvasPoint::new(0.0, 0.0));
+        assert_eq!(size, [768, 768]);
     }
 
     /// 验证小脏区使用局部重建，而达到阈值时回退全量重建。

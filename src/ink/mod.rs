@@ -6,6 +6,8 @@ pub(crate) mod renderer;
 mod spatial_index;
 mod speed_taper;
 mod stroke_geometry;
+mod surface_pool;
+mod velocity_tracker;
 
 pub(crate) use batch_drawer::BatchDrawer;
 pub use document::InkDocument;
@@ -21,3 +23,7 @@ pub(crate) use renderer::{
 };
 pub(crate) use spatial_index::InkSpatialIndex;
 pub(crate) use speed_taper::SpeedStrokeBuilder;
+pub(crate) use surface_pool::SurfacePool;
+pub(crate) use velocity_tracker::{
+    BASE_PREVIEW_TILE_SIZE, VelocityTracker, preview_tile_size_for_velocity,
+};

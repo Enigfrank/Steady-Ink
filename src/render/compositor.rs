@@ -1,3 +1,5 @@
+use std::time::{Duration, Instant};
+
 use skia_safe::{
     BlendMode, Color, ColorType, Rect, Surface,
     gpu::{
@@ -15,13 +17,17 @@ use super::egui_skia::EguiSkiaRenderer;
 use crate::{
     error::AppError,
     ink::{
-        ActiveInkPreview, InkBounds, InkDocument, InkPreviewCache, InkRenderCache,
-        InkSurfaceConfig, active_preview_bounds, draw_active_preview, draw_image_rect_logical,
-        preview_replaces_region,
+        ActiveInkPreview, BASE_PREVIEW_TILE_SIZE, InkBounds, InkDocument, InkPreviewCache,
+        InkRenderCache, SurfacePool, VelocityTracker, active_preview_bounds, draw_active_preview,
+        draw_image_rect_logical, preview_replaces_region, preview_tile_size_for_velocity,
     },
     settings::InkAntialiasingMode,
     window::{D3DWindowContext, SWAP_CHAIN_BUFFER_COUNT},
 };
+
+const MAX_IDLE_PREVIEW_SURFACES: usize = 5;
+const MAX_PREVIEW_POOL_BYTES: usize = 5 * 1024 * 1024;
+const PREVIEW_POOL_GC_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// 保持 Skia surface 与其外部 DXGI backend target 的生命周期一致。
 struct SwapChainSurface {
@@ -34,8 +40,13 @@ pub struct Compositor {
     egui: EguiSkiaRenderer,
     ink_cache: InkRenderCache,
     ink_mode: InkAntialiasingMode,
+    preferred_ink_mode: InkAntialiasingMode,
+    annotation_resources_enabled: bool,
     ink_rendering_error: Option<String>,
     preview_cache: Option<InkPreviewCache>,
+    preview_surface_pool: SurfacePool,
+    preview_velocity: VelocityTracker,
+    preview_tile_size: u32,
     window_surfaces: Vec<SwapChainSurface>,
     gr_context: DirectContext,
 }
@@ -75,18 +86,26 @@ impl Compositor {
             .ok_or_else(|| AppError::Graphics("无法创建 Skia D3D12 DirectContext".to_owned()))?;
         let size: [u32; 2] = window_context.window().inner_size().into();
         let window_surfaces = create_window_surfaces(&mut gr_context, window_context, size)?;
-        let resources = create_ink_resources(&mut gr_context, size, requested_mode)?;
+        let resources = create_ink_resources(&mut gr_context, size, InkAntialiasingMode::Off)?;
         let egui = EguiSkiaRenderer::new(event_loop, window_context.window());
 
-        let applied_mode = resources.mode;
+        let applied_mode = requested_mode;
         let error = resources.error.clone();
         Ok((
             Self {
                 egui,
                 ink_cache: resources.cache,
                 ink_mode: resources.mode,
+                preferred_ink_mode: requested_mode,
+                annotation_resources_enabled: false,
                 ink_rendering_error: resources.error,
                 preview_cache: resources.preview_cache,
+                preview_surface_pool: SurfacePool::new(
+                    MAX_IDLE_PREVIEW_SURFACES,
+                    MAX_PREVIEW_POOL_BYTES,
+                ),
+                preview_velocity: VelocityTracker::new(),
+                preview_tile_size: BASE_PREVIEW_TILE_SIZE,
                 window_surfaces,
                 gr_context,
             },
@@ -130,16 +149,22 @@ impl Compositor {
             return Ok(());
         }
         self.gr_context.flush_and_submit();
+        self.release_preview_cache();
         self.window_surfaces.clear();
-        self.gr_context
-            .purge_unlocked_resources(gpu::PurgeResourceOptions::AllResources);
         window_context.recreate_swap_chain(physical_size)?;
         self.window_surfaces = create_window_surfaces(&mut self.gr_context, window_context, size)?;
-        let resources = create_ink_resources(&mut self.gr_context, size, self.ink_mode)?;
+        let target_mode =
+            desired_ink_mode(self.annotation_resources_enabled, self.preferred_ink_mode);
+        let resources = create_ink_resources(&mut self.gr_context, size, target_mode)?;
         self.ink_cache = resources.cache;
         self.ink_mode = resources.mode;
+        if self.annotation_resources_enabled {
+            self.preferred_ink_mode = resources.mode;
+        }
         self.ink_rendering_error = resources.error;
         self.preview_cache = resources.preview_cache;
+        self.preview_surface_pool.gc(PREVIEW_POOL_GC_TIMEOUT);
+        self.log_surface_pool_stats("窗口 resize 后预览资源池状态");
         Ok(())
     }
 
@@ -149,21 +174,51 @@ impl Compositor {
         window_context: &D3DWindowContext,
         requested_mode: InkAntialiasingMode,
     ) -> Result<(), AppError> {
-        if requested_mode == self.ink_mode && self.ink_rendering_error.is_none() {
+        if requested_mode == self.preferred_ink_mode && self.ink_rendering_error.is_none() {
             return Ok(());
         }
+        self.preferred_ink_mode = requested_mode;
+        if !self.annotation_resources_enabled {
+            self.ink_rendering_error = None;
+            return Ok(());
+        }
+        self.release_preview_cache();
         let size: [u32; 2] = window_context.window().inner_size().into();
         let resources = create_ink_resources(&mut self.gr_context, size, requested_mode)?;
         self.ink_cache = resources.cache;
         self.ink_mode = resources.mode;
+        self.preferred_ink_mode = resources.mode;
         self.ink_rendering_error = resources.error;
         self.preview_cache = resources.preview_cache;
         Ok(())
     }
 
-    /// 返回当前实际生效的墨迹抗锯齿模式。
+    /// 返回批注资源应恢复的用户首选抗锯齿模式。
     pub const fn ink_antialiasing_mode(&self) -> InkAntialiasingMode {
-        self.ink_mode
+        self.preferred_ink_mode
+    }
+
+    /// 在批注与 idle 模式之间切换大型墨迹资源的驻留策略。
+    pub fn set_annotation_resources_enabled(&mut self, enabled: bool) -> Result<(), AppError> {
+        if self.annotation_resources_enabled == enabled {
+            return Ok(());
+        }
+        self.annotation_resources_enabled = enabled;
+        self.release_preview_cache();
+        self.preview_velocity.reset();
+        self.preview_tile_size = BASE_PREVIEW_TILE_SIZE;
+        if enabled {
+            return Ok(());
+        }
+
+        self.ink_cache =
+            InkRenderCache::new(&mut self.gr_context, [1, 1], InkAntialiasingMode::Off)?;
+        self.ink_mode = InkAntialiasingMode::Off;
+        self.preview_surface_pool.clear();
+        self.gr_context.flush_and_submit();
+        self.gr_context
+            .purge_unlocked_resources(gpu::PurgeResourceOptions::AllResources);
+        Ok(())
     }
 
     /// 返回最近一次墨迹增强资源错误，供设置页非阻塞展示。
@@ -181,17 +236,31 @@ impl Compositor {
         self.gr_context.reset(None);
         self.ink_cache.sync(document);
 
+        if let Some(preview) = active_preview {
+            if let Some(position) = preview.latest_position() {
+                self.preview_velocity.update(position, Instant::now());
+                self.preview_tile_size = self.preview_tile_size.max(
+                    preview_tile_size_for_velocity(self.preview_velocity.velocity()),
+                );
+            }
+        } else {
+            self.preview_velocity.reset();
+            self.preview_tile_size = BASE_PREVIEW_TILE_SIZE;
+        }
+
         let mut ink_image = self.ink_cache.snapshot();
         let mut preview_composite = None;
         if active_preview.is_none() && self.ink_mode != InkAntialiasingMode::Off {
             let reset_error = if let Some(preview_cache) = self.preview_cache.as_mut() {
                 preview_cache
-                    .reset_to_base(&mut self.gr_context, self.ink_cache.logical_size())
+                    .reset_to_base(
+                        &mut self.gr_context,
+                        self.ink_cache.logical_size(),
+                        &mut self.preview_surface_pool,
+                    )
                     .err()
             } else {
-                Some(AppError::Graphics(
-                    "增强墨迹模式缺少基础预览 surface".to_owned(),
-                ))
+                None
             };
             if let Some(error) = reset_error {
                 self.fallback_to_off(document, format!("活动墨迹预览回收失败: {error}"))?;
@@ -264,16 +333,33 @@ impl Compositor {
         preview: ActiveInkPreview<'_>,
         persistent_image: &skia_safe::Image,
     ) -> Result<PreviewComposite, AppError> {
+        let pool_stats_before = self.preview_surface_pool.stats();
         let bounds = active_preview_bounds(preview)
             .ok_or_else(|| AppError::Graphics("活动墨迹预览没有有效采样".to_owned()))?;
         let logical_size = self.ink_cache.logical_size();
         let source_render_size = self.ink_cache.render_size();
         let source_config = self.ink_cache.config();
+        if self.preview_cache.is_none() {
+            self.preview_cache = Some(InkPreviewCache::for_bounds(
+                &mut self.gr_context,
+                bounds,
+                logical_size,
+                self.preview_tile_size,
+                source_config,
+                &mut self.preview_surface_pool,
+            )?);
+        }
         let preview_cache = self
             .preview_cache
             .as_mut()
             .ok_or_else(|| AppError::Graphics("增强墨迹模式缺少活动预览 surface".to_owned()))?;
-        preview_cache.ensure(&mut self.gr_context, bounds, logical_size)?;
+        preview_cache.ensure(
+            &mut self.gr_context,
+            bounds,
+            logical_size,
+            self.preview_tile_size,
+            &mut self.preview_surface_pool,
+        )?;
         if preview_replaces_region(preview) {
             preview_cache.seed_from_image(
                 persistent_image,
@@ -285,25 +371,55 @@ impl Compositor {
             preview_cache.clear();
         }
         preview_cache.draw(preview);
-        Ok(PreviewComposite {
+        let composite = PreviewComposite {
             image: preview_cache.snapshot(),
             origin: preview_cache.origin(),
             logical_size: preview_cache.logical_size(),
             render_size: preview_cache.render_size(),
             replace_region: preview_replaces_region(preview),
-        })
+        };
+        if self.preview_surface_pool.stats() != pool_stats_before {
+            self.log_surface_pool_stats("活动预览资源变化");
+        }
+        Ok(composite)
     }
 
     /// 增强资源创建或扩展失败时立即恢复关闭模式并重放文档。
     fn fallback_to_off(&mut self, document: &InkDocument, detail: String) -> Result<(), AppError> {
+        self.release_preview_cache();
         let size = self.ink_cache.logical_size();
         let mut cache = InkRenderCache::new(&mut self.gr_context, size, InkAntialiasingMode::Off)?;
         cache.sync(document);
         self.ink_cache = cache;
         self.ink_mode = InkAntialiasingMode::Off;
+        self.preferred_ink_mode = InkAntialiasingMode::Off;
         self.ink_rendering_error = Some(detail);
-        self.preview_cache = None;
         Ok(())
+    }
+
+    /// 把当前增强预览 surface 归还精确匹配资源池。
+    fn release_preview_cache(&mut self) {
+        if let Some(preview_cache) = self.preview_cache.take() {
+            preview_cache.release(&mut self.preview_surface_pool);
+        }
+    }
+
+    /// 在 debug 级别记录预览池容量、命中率和淘汰数。
+    fn log_surface_pool_stats(&self, message: &'static str) {
+        if !tracing::enabled!(tracing::Level::DEBUG) {
+            return;
+        }
+        let stats = self.preview_surface_pool.stats();
+        tracing::debug!(
+            event = message,
+            idle_surfaces = stats.idle_count,
+            estimated_bytes = stats.estimated_bytes,
+            reused = stats.reused_count,
+            created = stats.created_count,
+            evicted = stats.eviction_count,
+            hit_rate = stats.hit_rate(),
+            "预览资源池状态"
+        );
     }
 
     /// 强制下次绘制从文档事实历史重建 GPU 墨迹缓存。
@@ -341,45 +457,24 @@ fn create_ink_resources(
         Err(error) => return Err(error),
     };
 
-    if requested_mode == InkAntialiasingMode::Off {
-        return Ok(InkResources {
-            cache,
-            preview_cache: None,
-            mode: InkAntialiasingMode::Off,
-            error: None,
-        });
-    }
-
-    let config = InkSurfaceConfig::for_mode(requested_mode);
-    let (origin, preview_size) = preview_region_for_window(size);
-    match InkPreviewCache::new(context, origin, preview_size, config) {
-        Ok(preview_cache) => Ok(InkResources {
-            cache,
-            preview_cache: Some(preview_cache),
-            mode: requested_mode,
-            error: None,
-        }),
-        Err(error) => {
-            let off_cache = InkRenderCache::new(context, size, InkAntialiasingMode::Off)?;
-            Ok(InkResources {
-                cache: off_cache,
-                preview_cache: None,
-                mode: InkAntialiasingMode::Off,
-                error: Some(format!(
-                    "墨迹抗锯齿 {} 的活动预览初始化失败，已关闭：{error}",
-                    requested_mode.label()
-                )),
-            })
-        }
-    }
+    Ok(InkResources {
+        cache,
+        preview_cache: None,
+        mode: requested_mode,
+        error: None,
+    })
 }
 
-/// 返回启动时覆盖窗口左上角的基础 512px 预览区域。
-fn preview_region_for_window(size: [u32; 2]) -> (crate::ink::CanvasPoint, [u32; 2]) {
-    (
-        crate::ink::CanvasPoint::new(0.0, 0.0),
-        [size[0].clamp(1, 512), size[1].clamp(1, 512)],
-    )
+/// 返回当前应用资源模式应使用的实际墨迹质量。
+const fn desired_ink_mode(
+    annotation_resources_enabled: bool,
+    preferred_mode: InkAntialiasingMode,
+) -> InkAntialiasingMode {
+    if annotation_resources_enabled {
+        preferred_mode
+    } else {
+        InkAntialiasingMode::Off
+    }
 }
 
 /// 为双缓冲 DXGI swap chain 的每个 D3D12 resource 创建 Skia surface。
@@ -425,4 +520,31 @@ fn create_window_surfaces(
         });
     }
     Ok(surfaces)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 验证 idle 模式始终使用最小 Off 资源，同时保留用户首选配置。
+    #[test]
+    fn idle_resource_mode_uses_off_quality() {
+        assert_eq!(
+            desired_ink_mode(false, InkAntialiasingMode::Supersample),
+            InkAntialiasingMode::Off
+        );
+        assert_eq!(
+            desired_ink_mode(false, InkAntialiasingMode::Msaa),
+            InkAntialiasingMode::Off
+        );
+    }
+
+    /// 验证批注模式恢复用户首选抗锯齿配置。
+    #[test]
+    fn annotation_resource_mode_restores_preferred_quality() {
+        assert_eq!(
+            desired_ink_mode(true, InkAntialiasingMode::Supersample),
+            InkAntialiasingMode::Supersample
+        );
+    }
 }

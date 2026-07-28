@@ -463,18 +463,12 @@ impl DesktopRuntime {
             UiCommand::ExitApplication => return true,
             UiCommand::EnterAnnotation => {
                 if self.state.enter_normal_annotation() {
-                    self.idle_panel = IdlePanel::Toolbar;
-                    self.update_interface_zoom();
-                    self.window_context.set_annotation_mode(true);
-                    self.compositor.invalidate_ink_cache();
+                    self.prepare_annotation_transition(true);
                 }
             }
             UiCommand::ExitAnnotation => {
                 if self.state.exit_normal_annotation() {
-                    self.active_gesture = None;
-                    self.input_router.cancel();
-                    self.window_context.set_annotation_mode(false);
-                    self.compositor.invalidate_ink_cache();
+                    self.prepare_annotation_transition(false);
                 }
             }
             UiCommand::SelectPen => self.tools.tool = InkTool::Pen,
@@ -852,6 +846,13 @@ impl DesktopRuntime {
         self.input_router.cancel();
         self.idle_panel = IdlePanel::Toolbar;
         self.update_interface_zoom();
+        if let Err(error) = self
+            .compositor
+            .set_annotation_resources_enabled(annotation_enabled)
+        {
+            tracing::warn!(%error, annotation_enabled, "切换墨迹资源驻留模式失败");
+            self.ink_rendering_error = Some(error.to_string());
+        }
         self.window_context.set_annotation_mode(annotation_enabled);
         self.compositor.invalidate_ink_cache();
     }

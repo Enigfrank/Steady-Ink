@@ -4,7 +4,7 @@ use crate::{
 };
 
 /// 顶层界面与输入路由使用的应用模式。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AppMode {
     IdleFloatingToolbar,
     NormalAnnotating,
@@ -37,7 +37,7 @@ impl AppMode {
 }
 
 /// 应用状态机，集中维护普通墨迹、放映会话和断线抑制规则。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AppState {
     mode: AppMode,
     normal_document: InkDocument,
@@ -245,5 +245,39 @@ impl AppState {
             self.mode,
             AppMode::SlideShowAnnotatingExpanded | AppMode::SlideShowAnnotatingCollapsed
         ) && self.slideshow_session.is_some()
+    }
+
+    /// 校验恢复后的文档与顶层模式关系，拒绝会破坏状态机的不一致数据。
+    pub(crate) fn validate_recovery(&self) -> Result<(), String> {
+        self.normal_document.validate_recovery()?;
+        if let Some(session) = &self.slideshow_session {
+            session.validate_recovery()?;
+        }
+        if self.mode.is_slideshow() != self.slideshow_session.is_some() {
+            return Err("应用模式与放映会话存在状态不一致".to_owned());
+        }
+        if self.slideshow_session.is_some() && self.suppressed_show_key.is_some() {
+            return Err("活动放映会话不能同时持有重入抑制键".to_owned());
+        }
+        Ok(())
+    }
+}
+use serde::{Deserialize, Serialize};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ink::PageKey, slideshow::PresentationApplication};
+
+    /// 验证恢复数据不能同时表示活动放映和已抑制放映。
+    #[test]
+    fn recovery_rejects_active_and_suppressed_slideshow() {
+        let key = SlideShowKey::new(PresentationApplication::PowerPoint, "deck", 1);
+        let page = SlidePage::new(PageKey::new(1).expect("测试页键有效"), Some(10), Some(2));
+        let mut state = AppState::default();
+        assert!(state.start_slideshow(SlideShowSession::new(key.clone(), page)));
+        state.suppressed_show_key = Some(key);
+
+        assert!(state.validate_recovery().is_err());
     }
 }

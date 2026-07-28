@@ -379,7 +379,7 @@ fn section_break(ui: &mut Ui, metrics: InterfaceMetrics) {
     ui.add_space(metrics.space_4);
 }
 
-/// 绘制 COM、控制、GPU、配置目录和设置文件状态。
+/// 绘制 COM、控制、GPU、恢复、配置目录和设置文件状态。
 fn render_diagnostics(ui: &mut Ui, view: UiViewState<'_>, metrics: InterfaceMetrics) {
     let (com_status, com_color) =
         com_status(view.slideshow_integration_enabled, view.com_diagnostics);
@@ -440,6 +440,17 @@ fn render_diagnostics(ui: &mut Ui, view: UiViewState<'_>, metrics: InterfaceMetr
         "设置保存",
         view.settings_error.unwrap_or("正常"),
         if view.settings_error.is_some() {
+            tokens::COLOR_ERROR
+        } else {
+            tokens::COLOR_TEXT_PRIMARY
+        },
+        metrics,
+    );
+    diagnostic_row(
+        ui,
+        "墨迹恢复",
+        view.recovery_error.unwrap_or("正常"),
+        if view.recovery_error.is_some() {
             tokens::COLOR_ERROR
         } else {
             tokens::COLOR_TEXT_PRIMARY

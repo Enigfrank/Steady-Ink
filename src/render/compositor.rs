@@ -1,5 +1,19 @@
 use std::time::{Duration, Instant};
 
+use super::{
+    adaptive_aa::AdaptiveAaPolicy,
+    egui_skia::{EguiFrame, EguiSkiaPainter},
+};
+use crate::{
+    error::AppError,
+    ink::{
+        ActiveInkPreview, BASE_PREVIEW_TILE_SIZE, InkBounds, InkDocument, InkPreviewCache,
+        InkRenderCache, SurfacePool, VelocityTracker, active_preview_bounds, draw_active_preview,
+        draw_image_rect_logical, preview_replaces_region, preview_tile_size_for_velocity,
+    },
+    settings::InkAntialiasingMode,
+    window::{D3DRenderContext, SWAP_CHAIN_BUFFER_COUNT},
+};
 use skia_safe::{
     BlendMode, Color, ColorType, Rect, Surface,
     gpu::{
@@ -10,19 +24,6 @@ use skia_safe::{
 use windows::Win32::Graphics::{
     Direct3D12::D3D12_RESOURCE_STATE_COMMON,
     Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_STANDARD_MULTISAMPLE_QUALITY_PATTERN},
-};
-use winit::{event::WindowEvent, event_loop::ActiveEventLoop, window::Window};
-
-use super::{adaptive_aa::AdaptiveAaPolicy, egui_skia::EguiSkiaRenderer};
-use crate::{
-    error::AppError,
-    ink::{
-        ActiveInkPreview, BASE_PREVIEW_TILE_SIZE, InkBounds, InkDocument, InkPreviewCache,
-        InkRenderCache, SurfacePool, VelocityTracker, active_preview_bounds, draw_active_preview,
-        draw_image_rect_logical, preview_replaces_region, preview_tile_size_for_velocity,
-    },
-    settings::InkAntialiasingMode,
-    window::{D3DWindowContext, SWAP_CHAIN_BUFFER_COUNT},
 };
 
 const MAX_IDLE_PREVIEW_SURFACES: usize = 5;
@@ -38,7 +39,7 @@ struct SwapChainSurface {
 
 /// 在同一 D3D12 back buffer 中按 Skia 墨迹后 egui 的顺序合成一帧。
 pub struct Compositor {
-    egui: EguiSkiaRenderer,
+    egui: EguiSkiaPainter,
     ink_cache: InkRenderCache,
     ink_mode: InkAntialiasingMode,
     annotation_resources_enabled: bool,
@@ -72,16 +73,16 @@ struct PreviewComposite {
 }
 
 impl Compositor {
-    /// 从 D3D12 device/queue 创建 Skia DirectContext、交换链 surface 和 egui painter。
+    /// 从渲染线程的 D3D12 device/queue 创建 Skia DirectContext 和交换链 surface。
     pub fn new(
-        event_loop: &ActiveEventLoop,
-        window_context: &D3DWindowContext,
+        window_context: &D3DRenderContext,
+        egui_context: egui::Context,
     ) -> Result<(Self, Option<String>), AppError> {
         let mut gr_context = create_direct_context(window_context)?;
-        let size: [u32; 2] = window_context.window().inner_size().into();
+        let size: [u32; 2] = window_context.swap_chain_size().into();
         let window_surfaces = create_window_surfaces(&mut gr_context, window_context, size)?;
         let resources = create_ink_resources(&mut gr_context, size, InkAntialiasingMode::Off)?;
-        let egui = EguiSkiaRenderer::new(event_loop, window_context.window());
+        let egui = EguiSkiaPainter::new(egui_context);
 
         let error = resources.error.clone();
         Ok((
@@ -107,34 +108,10 @@ impl Compositor {
         ))
     }
 
-    /// 把 winit 事件转交给 egui，并返回该事件是否需要重绘或已被 UI 消费。
-    pub fn on_window_event(
-        &mut self,
-        window: &Window,
-        event: &WindowEvent,
-    ) -> egui_winit::EventResponse {
-        self.egui.on_window_event(window, event)
-    }
-
-    /// 执行本帧 egui 布局，但暂不修改 D3D12 back buffer。
-    pub fn run_ui(&mut self, window: &Window, run_ui: impl FnMut(&mut egui::Ui)) {
-        self.egui.run_ui(window, run_ui);
-    }
-
-    /// 返回 egui 上下文，供等待型事件循环安装按需重绘回调。
-    pub const fn egui_context(&self) -> &egui::Context {
-        self.egui.context()
-    }
-
-    /// 清空 egui 当前指针状态，供原生手掌分类取消已暂存的 UI 接触。
-    pub fn cancel_egui_pointer(&self) {
-        self.egui.cancel_pointer();
-    }
-
     /// 释放旧 back buffer 包装，调整 DXGI swap chain，并重建窗口和墨迹 surface。
     pub fn resize(
         &mut self,
-        window_context: &mut D3DWindowContext,
+        window_context: &mut D3DRenderContext,
         size: [u32; 2],
     ) -> Result<(), AppError> {
         let physical_size = winit::dpi::PhysicalSize::new(size[0].max(1), size[1].max(1));
@@ -223,9 +200,10 @@ impl Compositor {
     /// 完成透明清理、Skia 墨迹、egui、Skia submit 的一帧 D3D12 合成。
     pub fn paint(
         &mut self,
-        window_context: &D3DWindowContext,
+        window_context: &D3DRenderContext,
         document: &InkDocument,
         active_preview: Option<ActiveInkPreview<'_>>,
+        egui_frame: EguiFrame,
     ) -> Result<(), AppError> {
         let preview_frame_started = active_preview
             .is_some_and(|preview| self.adaptive_aa.preview_quality(preview).is_some())
@@ -322,7 +300,7 @@ impl Compositor {
         } else if let Some(preview) = active_preview {
             draw_active_preview(canvas, preview);
         }
-        self.egui.paint(canvas)?;
+        self.egui.paint(canvas, egui_frame)?;
         self.gr_context
             .flush_and_submit_surface(&mut target.surface, None);
         if let Some(started_at) = preview_frame_started
@@ -506,7 +484,7 @@ fn can_reuse_annotation_capacity(
 }
 
 /// 从窗口当前 D3D12 设备创建 Skia DirectContext。
-fn create_direct_context(window_context: &D3DWindowContext) -> Result<DirectContext, AppError> {
+fn create_direct_context(window_context: &D3DRenderContext) -> Result<DirectContext, AppError> {
     let backend_context = BackendContext {
         adapter: window_context.adapter().clone(),
         device: window_context.device().clone(),
@@ -562,7 +540,7 @@ const fn desired_ink_mode(annotation_resources_enabled: bool) -> InkAntialiasing
 /// 为双缓冲 DXGI swap chain 的每个 D3D12 resource 创建 Skia surface。
 fn create_window_surfaces(
     context: &mut DirectContext,
-    window_context: &D3DWindowContext,
+    window_context: &D3DRenderContext,
     size: [u32; 2],
 ) -> Result<Vec<SwapChainSurface>, AppError> {
     let dimensions = (

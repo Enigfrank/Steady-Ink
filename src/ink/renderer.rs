@@ -35,6 +35,90 @@ pub enum ActiveInkPreview<'a> {
     },
 }
 
+/// 可安全移交渲染线程的 owned 活动墨迹预览。
+#[derive(Debug, Clone, PartialEq)]
+pub enum OwnedActiveInkPreview {
+    Tool {
+        points: Vec<CanvasPoint>,
+        tool: InkTool,
+        color: InkColor,
+        pen_width: PenWidth,
+        eraser_size: EraserSize,
+    },
+    VariableTool {
+        points: Vec<VariableStrokePoint>,
+        color: InkColor,
+        eraser_size: EraserSize,
+    },
+    PalmErase {
+        samples: Vec<EraseSample>,
+    },
+}
+
+impl OwnedActiveInkPreview {
+    /// 返回借用当前 owned 数据的渲染预览描述。
+    pub fn as_borrowed(&self) -> ActiveInkPreview<'_> {
+        match self {
+            Self::Tool {
+                points,
+                tool,
+                color,
+                pen_width,
+                eraser_size,
+            } => ActiveInkPreview::Tool {
+                points,
+                tool: *tool,
+                color: *color,
+                pen_width: *pen_width,
+                eraser_size: *eraser_size,
+            },
+            Self::VariableTool {
+                points,
+                color,
+                eraser_size,
+            } => ActiveInkPreview::VariableTool {
+                points,
+                color: *color,
+                eraser_size: *eraser_size,
+            },
+            Self::PalmErase { samples } => ActiveInkPreview::PalmErase { samples },
+        }
+    }
+}
+
+impl From<ActiveInkPreview<'_>> for OwnedActiveInkPreview {
+    /// 复制活动手势的当前采样，形成与 UI 状态解耦的帧快照。
+    fn from(preview: ActiveInkPreview<'_>) -> Self {
+        match preview {
+            ActiveInkPreview::Tool {
+                points,
+                tool,
+                color,
+                pen_width,
+                eraser_size,
+            } => Self::Tool {
+                points: points.to_vec(),
+                tool,
+                color,
+                pen_width,
+                eraser_size,
+            },
+            ActiveInkPreview::VariableTool {
+                points,
+                color,
+                eraser_size,
+            } => Self::VariableTool {
+                points: points.to_vec(),
+                color,
+                eraser_size,
+            },
+            ActiveInkPreview::PalmErase { samples } => Self::PalmErase {
+                samples: samples.to_vec(),
+            },
+        }
+    }
+}
+
 impl ActiveInkPreview<'_> {
     /// 返回活动手势最新的物理像素位置，供预览资源策略采样。
     pub(crate) fn latest_position(self) -> Option<CanvasPoint> {

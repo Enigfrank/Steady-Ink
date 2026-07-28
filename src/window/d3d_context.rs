@@ -1,4 +1,4 @@
-use std::cell::Cell;
+use std::{cell::Cell, sync::Arc};
 
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows::{
@@ -72,6 +72,20 @@ pub struct GraphicsDiagnostics {
     pub software_fallback: bool,
 }
 
+/// 事件线程提取并交给渲染线程的 Win32 合成目标快照。
+#[derive(Debug, Clone, Copy)]
+pub struct D3DRenderTarget {
+    hwnd: isize,
+    initial_size: PhysicalSize<u32>,
+}
+
+impl D3DRenderTarget {
+    /// 将可跨线程传递的整数句柄恢复为 Windows API 使用的 HWND。
+    fn hwnd(self) -> HWND {
+        HWND(self.hwnd as *mut std::ffi::c_void)
+    }
+}
+
 /// 单显示器窗口在悬浮和全屏批注模式下的物理几何。
 #[derive(Debug, Clone, Copy)]
 struct WindowGeometry {
@@ -133,13 +147,18 @@ impl WindowGeometry {
     }
 }
 
-/// 持有透明 winit 窗口、D3D12 设备和 DirectComposition 交换链。
+/// 持有事件线程使用的透明 winit 窗口和窗口几何状态。
 pub struct D3DWindowContext {
-    window: Window,
+    window: Arc<Window>,
+    render_target: D3DRenderTarget,
     geometry: WindowGeometry,
-    diagnostics: GraphicsDiagnostics,
     dock_side: Cell<DockSide>,
     floating_top: Cell<i32>,
+}
+
+/// 持有渲染线程独占的 D3D12 设备和 DirectComposition 交换链。
+pub struct D3DRenderContext {
+    diagnostics: GraphicsDiagnostics,
     adapter: IDXGIAdapter1,
     device: ID3D12Device,
     queue: ID3D12CommandQueue,
@@ -152,7 +171,7 @@ pub struct D3DWindowContext {
 }
 
 impl D3DWindowContext {
-    /// 创建无边框置顶窗口，并把预乘 alpha DXGI 交换链接入 DirectComposition。
+    /// 在事件线程创建无边框置顶窗口，GPU 后端稍后由渲染线程初始化。
     pub fn new(event_loop: &ActiveEventLoop) -> Result<Self, AppError> {
         let monitor = event_loop
             .primary_monitor()
@@ -178,26 +197,68 @@ impl D3DWindowContext {
             .with_skip_taskbar(true)
             .with_taskbar_icon(Some(window_icon))
             .with_no_redirection_bitmap(true);
-        let window = event_loop
-            .create_window(attributes)
-            .map_err(|error| AppError::Graphics(format!("窗口创建失败: {error}")))?;
+        let window = Arc::new(
+            event_loop
+                .create_window(attributes)
+                .map_err(|error| AppError::Graphics(format!("窗口创建失败: {error}")))?,
+        );
 
         // 先把创建期默认尺寸压回目标值，再重放最小尺寸约束，避免异步窗口状态恢复到系统默认宽度。
         window.set_outer_position(geometry.idle_position);
         let _ = window.request_inner_size(geometry.idle_size);
         window.set_min_inner_size(Some(geometry.idle_size));
         let _ = window.request_inner_size(geometry.idle_size);
+        let hwnd = window_hwnd(&window)?;
+        let render_target = D3DRenderTarget {
+            hwnd: hwnd.0 as isize,
+            initial_size: window.inner_size(),
+        };
 
+        Ok(Self {
+            window,
+            render_target,
+            geometry,
+            dock_side: Cell::new(DockSide::Right),
+            floating_top: Cell::new(geometry.idle_position.y),
+        })
+    }
+
+    /// 返回 winit 窗口引用。
+    pub fn window(&self) -> &Window {
+        self.window.as_ref()
+    }
+
+    /// 返回在事件线程提取的 Win32 合成目标，避免跨线程调用 winit 句柄 API。
+    pub const fn render_target(&self) -> D3DRenderTarget {
+        self.render_target
+    }
+
+    /// 显示已经连接 DirectComposition visual tree 的窗口，并从 Windows shell 隐藏该工具窗口。
+    pub fn show(&self) -> Result<(), AppError> {
+        self.window.set_visible(true);
+        self.window
+            .set_min_inner_size(Some(self.geometry.idle_size));
+        self.window
+            .set_outer_position(self.idle_position(IdleWindowView::Toolbar));
+        let _ = self.window.request_inner_size(self.geometry.idle_size);
+        apply_tool_window_style(self.render_target.hwnd())?;
+        self.window.set_skip_taskbar(true);
+        Ok(())
+    }
+}
+
+impl D3DRenderContext {
+    /// 在调用线程创建 D3D12、swap chain 和 DirectComposition visual tree。
+    pub fn new(target: D3DRenderTarget) -> Result<Self, AppError> {
         let factory: IDXGIFactory4 = unsafe { CreateDXGIFactory1() }
             .map_err(|error| graphics_error("无法创建 DXGI factory", error))?;
         let (adapter, device, software_fallback) = create_device(&factory)?;
         let queue = unsafe { device.CreateCommandQueue(&Default::default()) }
             .map_err(|error| graphics_error("无法创建 D3D12 command queue", error))?;
-        let size = window.inner_size();
+        let size = target.initial_size;
         let swap_chain = create_swap_chain(&factory, &queue, size)?;
-        let hwnd = window_hwnd(&window)?;
         let (composition_device, composition_target, composition_visual) =
-            attach_direct_composition(hwnd, &swap_chain)?;
+            attach_direct_composition(target.hwnd(), &swap_chain)?;
         let diagnostics = read_graphics_diagnostics(&adapter, software_fallback)?;
 
         tracing::info!(
@@ -214,11 +275,7 @@ impl D3DWindowContext {
         }
 
         Ok(Self {
-            window,
-            geometry,
             diagnostics,
-            dock_side: Cell::new(DockSide::Right),
-            floating_top: Cell::new(geometry.idle_position.y),
             adapter,
             device,
             queue,
@@ -229,24 +286,6 @@ impl D3DWindowContext {
             _composition_target: composition_target,
             composition_visual,
         })
-    }
-
-    /// 返回 winit 窗口引用。
-    pub const fn window(&self) -> &Window {
-        &self.window
-    }
-
-    /// 显示已经连接 DirectComposition visual tree 的窗口，并从 Windows shell 隐藏该工具窗口。
-    pub fn show(&self) -> Result<(), AppError> {
-        self.window.set_visible(true);
-        self.window
-            .set_min_inner_size(Some(self.geometry.idle_size));
-        self.window
-            .set_outer_position(self.idle_position(IdleWindowView::Toolbar));
-        let _ = self.window.request_inner_size(self.geometry.idle_size);
-        apply_tool_window_style(&self.window)?;
-        self.window.set_skip_taskbar(true);
-        Ok(())
     }
 
     /// 返回 Skia D3D backend context 使用的 DXGI adapter。
@@ -332,6 +371,13 @@ impl D3DWindowContext {
             .map_err(|error| graphics_error("DXGI Present 失败", error))
     }
 
+    /// 返回一份供事件线程展示的图形设备诊断快照。
+    pub fn diagnostics_snapshot(&self) -> GraphicsDiagnostics {
+        self.diagnostics.clone()
+    }
+}
+
+impl D3DWindowContext {
     /// 将窗口切换到主显示器全屏批注几何或悬浮工具栏几何。
     pub fn set_annotation_mode(&self, annotation_enabled: bool) {
         let (position, size) = if annotation_enabled {
@@ -554,8 +600,7 @@ fn window_hwnd(window: &Window) -> Result<HWND, AppError> {
 }
 
 /// 在窗口显示后应用工具窗口扩展样式，避免 shell 根据 `WS_EX_APPWINDOW` 重建任务栏按钮。
-fn apply_tool_window_style(window: &Window) -> Result<(), AppError> {
-    let hwnd = window_hwnd(window)?;
+fn apply_tool_window_style(hwnd: HWND) -> Result<(), AppError> {
     let current_style = unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) };
     let expected_style = tool_window_ex_style(current_style);
     unsafe { SetWindowLongW(hwnd, GWL_EXSTYLE, expected_style) };

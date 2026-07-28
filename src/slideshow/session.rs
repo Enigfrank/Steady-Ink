@@ -1,16 +1,18 @@
 use std::mem;
 
+use serde::{Deserialize, Serialize};
+
 use crate::ink::{InkDocument, PageInkEntry, PageInkStore, PageKey};
 
 /// 支持联动的演示应用类型。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PresentationApplication {
     PowerPoint,
     Wps,
 }
 
 /// 唯一标识一次活动放映，用于断线恢复和手动退出抑制。
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SlideShowKey {
     pub application: PresentationApplication,
     pub presentation_id: String,
@@ -33,7 +35,7 @@ impl SlideShowKey {
 }
 
 /// COM 报告的当前放映位置和可选可靠页数信息。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SlidePage {
     pub key: PageKey,
     pub stable_slide_id: Option<i64>,
@@ -61,7 +63,7 @@ impl SlidePage {
 }
 
 /// 一次 PowerPoint/WPS 放映的内存墨迹会话。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SlideShowSession {
     key: SlideShowKey,
     current_page: SlidePage,
@@ -124,5 +126,36 @@ impl SlideShowSession {
     /// 返回当前保存在非活动位置上的文档数量。
     pub fn saved_page_count(&self) -> usize {
         self.page_store.saved_page_count()
+    }
+
+    /// 校验活动页、活动文档和全部非活动页的恢复约束。
+    pub(crate) fn validate_recovery(&self) -> Result<(), String> {
+        if !self.current_page.key.is_valid() {
+            return Err("活动放映页键必须大于零".to_owned());
+        }
+        if self.page_store.contains(self.current_page.key) {
+            return Err("活动放映页不能同时存在于非活动页存储".to_owned());
+        }
+        self.current_document.validate_recovery()?;
+        self.page_store.validate_recovery()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 验证恢复数据不能为同一页同时保存活动和非活动文档。
+    #[test]
+    fn recovery_rejects_duplicate_active_page() {
+        let key = PageKey::new(1).expect("测试页键有效");
+        let page = SlidePage::new(key, Some(10), Some(2));
+        let mut session = SlideShowSession::new(
+            SlideShowKey::new(PresentationApplication::PowerPoint, "deck", 1),
+            page,
+        );
+        session.page_store.save(key, PageInkEntry::default());
+
+        assert!(session.validate_recovery().is_err());
     }
 }

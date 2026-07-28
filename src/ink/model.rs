@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 /// 画布中的物理像素坐标。
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct CanvasPoint {
     pub x: f32,
     pub y: f32,
@@ -15,7 +15,7 @@ impl CanvasPoint {
 }
 
 /// 一个墨迹操作影响到的轴对齐包围框。
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct InkBounds {
     pub left: f32,
     pub top: f32,
@@ -90,6 +90,16 @@ impl InkBounds {
     /// 返回包围框的高度。
     pub const fn height(&self) -> f32 {
         self.bottom - self.top
+    }
+
+    /// 返回边界是否由有限数值组成且没有轴向倒置。
+    pub(crate) fn is_valid(self) -> bool {
+        self.left.is_finite()
+            && self.top.is_finite()
+            && self.right.is_finite()
+            && self.bottom.is_finite()
+            && self.left <= self.right
+            && self.top <= self.bottom
     }
 }
 
@@ -198,7 +208,7 @@ impl Default for InkTool {
 }
 
 /// 文档内单调递增的墨迹操作标识。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct OperationId(u64);
 
 impl OperationId {
@@ -214,14 +224,14 @@ impl OperationId {
 }
 
 /// 一条速度笔锋笔画中的确定位置和物理像素宽度。
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct VariableStrokePoint {
     pub point: CanvasPoint,
     pub width: f32,
 }
 
 /// 画笔笔画的固定宽度或逐点宽度几何形状。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum DrawStrokeShape {
     Fixed {
         points: Vec<CanvasPoint>,
@@ -233,7 +243,7 @@ pub enum DrawStrokeShape {
 }
 
 /// 一条固定颜色并保存确定几何形状的画笔笔画。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DrawStroke {
     pub id: OperationId,
     pub color: InkColor,
@@ -291,7 +301,7 @@ impl DrawStroke {
 }
 
 /// 区域橡皮擦的一次椭圆采样。
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct EraseSample {
     pub center: CanvasPoint,
     pub radius_x: f32,
@@ -327,7 +337,7 @@ impl EraseSample {
 }
 
 /// 一次完整普通或手掌区域擦除会话。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EraseStroke {
     pub id: OperationId,
     pub samples: Vec<EraseSample>,
@@ -351,14 +361,14 @@ impl EraseStroke {
 }
 
 /// 清屏操作及其清屏前可见内容范围。
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct ClearOperation {
     pub id: OperationId,
     pub affected_bounds: Option<InkBounds>,
 }
 
 /// 墨迹文档中的可撤销操作。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum InkOperation {
     DrawStroke(DrawStroke),
     EraseStroke(EraseStroke),

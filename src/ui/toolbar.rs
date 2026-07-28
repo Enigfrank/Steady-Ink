@@ -82,6 +82,7 @@ pub struct UiViewState<'a> {
     pub slideshow_connection_error: Option<&'a str>,
     pub slideshow_control_error: Option<&'a str>,
     pub settings_error: Option<&'a str>,
+    pub recovery_error: Option<&'a str>,
     pub settings_directory_error: Option<&'a str>,
     pub machine_autostart_state: Option<MachineAutostartState>,
     pub machine_autostart_error: Option<&'a str>,

@@ -21,14 +21,15 @@ use crate::{
     error::AppError,
     ink::{
         ActiveInkPreview, CanvasPoint, EraseSample, InkDocument, InkOperation, InkTool,
-        SpeedStrokeBuilder, VariableStrokePoint,
+        OwnedActiveInkPreview, SpeedStrokeBuilder, VariableStrokePoint,
     },
     input::{
         InputRouter, PointerAction, PointerSample, SharedPalmSizePreset, WindowsPointerEvent,
         WindowsPointerTracker,
     },
     logging,
-    render::Compositor,
+    recovery::{RecoveryEvent, RecoveryManager, RecoveryStartup},
+    render::{EguiUiState, RenderEvent, RenderFrame, RenderThread},
     settings::{SettingsStore, UserSettings},
     slideshow::{
         ComDetector, ComDetectorEvent, ComDiagnostics, SlideShowControlAction, SlideShowSession,
@@ -43,6 +44,8 @@ enum UserEvent {
     RequestRepaint(Duration),
     ExternalEvent,
     WindowsPointer,
+    Render,
+    Recovery,
 }
 
 /// 当前尚未提交为墨迹 operation 的单次指针手势。
@@ -176,18 +179,22 @@ impl ActiveGesture {
     }
 
     /// 把完整手势提交为一次画笔或区域擦除 operation。
-    fn commit(self, document: &mut InkDocument) {
+    fn commit(self, document: &mut InkDocument) -> bool {
         let speed_builder = self.speed_builder;
         match self.samples {
             ActiveGestureSamples::Tool { points, .. } => match self.tool {
                 InkTool::Pen => {
                     if let Some(builder) = speed_builder {
-                        document.append_variable_draw_stroke(
-                            builder.finalized_points(),
-                            self.tools.color,
-                        );
+                        document
+                            .append_variable_draw_stroke(
+                                builder.finalized_points(),
+                                self.tools.color,
+                            )
+                            .is_some()
                     } else {
-                        document.append_draw_stroke(points, self.tools.color, self.tools.pen_width);
+                        document
+                            .append_draw_stroke(points, self.tools.color, self.tools.pen_width)
+                            .is_some()
                     }
                 }
                 InkTool::RegionEraser => {
@@ -195,11 +202,11 @@ impl ActiveGesture {
                         .into_iter()
                         .map(|point| EraseSample::circle(point, self.tools.eraser_size.pixels()))
                         .collect();
-                    document.append_erase_stroke(samples);
+                    document.append_erase_stroke(samples).is_some()
                 }
             },
             ActiveGestureSamples::PalmErase(samples) => {
-                document.append_erase_stroke(samples);
+                document.append_erase_stroke(samples).is_some()
             }
         }
     }
@@ -207,7 +214,9 @@ impl ActiveGesture {
 
 /// 组合窗口、渲染器、状态机和输入路由的单窗口运行时。
 struct DesktopRuntime {
-    compositor: Compositor,
+    render_thread: RenderThread,
+    recovery: RecoveryManager,
+    egui: EguiUiState,
     window_context: D3DWindowContext,
     state: AppState,
     empty_document: InkDocument,
@@ -221,6 +230,7 @@ struct DesktopRuntime {
     settings_store: SettingsStore,
     settings: UserSettings,
     settings_error: Option<String>,
+    recovery_error: Option<String>,
     settings_directory_error: Option<String>,
     machine_autostart_state: Option<MachineAutostartState>,
     machine_autostart_error: Option<String>,
@@ -232,6 +242,7 @@ struct DesktopRuntime {
     dismiss_slideshow_confirmation: bool,
     idle_window_dragging: bool,
     slideshow_session_generation: u64,
+    render_generation: u64,
 }
 
 impl DesktopRuntime {
@@ -252,6 +263,17 @@ impl DesktopRuntime {
             }
         };
         let (machine_autostart_state, machine_autostart_error) = load_machine_autostart_state();
+        let recovery_wake_proxy = event_proxy.clone();
+        let RecoveryStartup {
+            manager: recovery,
+            recovered_state,
+            diagnostic: recovery_error,
+        } = RecoveryManager::start(settings_store.recovery_directory()?, move || {
+            let _ = recovery_wake_proxy.send_event(UserEvent::Recovery);
+        })?;
+        if let Some(detail) = &recovery_error {
+            tracing::warn!(%detail, "启动时处理墨迹恢复数据");
+        }
         palm_size_preset.store(settings.palm_size_preset);
         let tools = ToolState {
             tool: InkTool::Pen,
@@ -261,15 +283,28 @@ impl DesktopRuntime {
             speed_taper_enabled: settings.tools.speed_taper_enabled,
         };
         let window_context = D3DWindowContext::new(event_loop)?;
-        let (compositor, ink_rendering_error) = Compositor::new(event_loop, &window_context)?;
+        let egui = EguiUiState::new(event_loop, window_context.window());
+        let render_wake_proxy = event_proxy.clone();
+        let render_thread = RenderThread::spawn(
+            window_context.render_target(),
+            egui.context().clone(),
+            move || {
+                let _ = render_wake_proxy.send_event(UserEvent::Render);
+            },
+        )?;
+        let ink_rendering_error = render_thread.initial_ink_error().map(str::to_owned);
         let wake_proxy = event_proxy;
         let slideshow_detector = ComDetector::spawn(move || {
             let _ = wake_proxy.send_event(UserEvent::ExternalEvent);
         });
-        Ok(Self {
-            compositor,
+        let state = recovered_state.unwrap_or_default();
+        let recovered_annotation = state.mode().accepts_ink_input();
+        let mut runtime = Self {
+            render_thread,
+            recovery,
+            egui,
             window_context,
-            state: AppState::default(),
+            state,
             empty_document: InkDocument::new(),
             tools,
             input_router: InputRouter::default(),
@@ -281,6 +316,7 @@ impl DesktopRuntime {
             settings_store,
             settings,
             settings_error,
+            recovery_error,
             settings_directory_error: None,
             machine_autostart_state,
             machine_autostart_error,
@@ -292,7 +328,13 @@ impl DesktopRuntime {
             dismiss_slideshow_confirmation: false,
             idle_window_dragging: false,
             slideshow_session_generation: 0,
-        })
+            render_generation: 0,
+        };
+        if recovered_annotation {
+            tracing::info!(mode = ?runtime.state.mode(), "已恢复未正常退出的墨迹会话");
+            runtime.prepare_annotation_transition(true);
+        }
+        Ok(runtime)
     }
 
     /// 返回当前运行时窗口标识。
@@ -303,9 +345,7 @@ impl DesktopRuntime {
     /// 处理非重绘窗口事件，并返回 egui 是否请求重绘。
     fn handle_window_event(&mut self, event: &WindowEvent) -> Result<bool, AppError> {
         let surface_rebuilt = if let WindowEvent::Resized(size) = event {
-            self.compositor
-                .resize(&mut self.window_context, (*size).into())?;
-            self.sync_ink_rendering_state();
+            self.render_thread.resize(*size);
             if self.state.mode() == AppMode::IdleFloatingToolbar {
                 self.window_context
                     .correct_idle_size(self.current_idle_window_view(), *size);
@@ -321,7 +361,7 @@ impl DesktopRuntime {
         }
 
         let event_response = self
-            .compositor
+            .egui
             .on_window_event(self.window_context.window(), event);
         if let Some(pointer_action) = self.input_router.route(
             event,
@@ -329,73 +369,86 @@ impl DesktopRuntime {
             self.state.mode().accepts_ink_input(),
             self.pen_contact_active.load(Ordering::Acquire),
         ) {
-            self.apply_pointer_action(pointer_action);
+            if self.apply_pointer_action(pointer_action) {
+                self.queue_recovery();
+            }
             self.request_redraw();
         }
         Ok(surface_rebuilt || event_response.repaint)
     }
 
     /// 将统一指针动作应用到当前活动手势或普通批注文档。
-    fn apply_pointer_action(&mut self, action: PointerAction) {
+    fn apply_pointer_action(&mut self, action: PointerAction) -> bool {
         let dpi_scale = self.window_context.window().scale_factor() as f32;
         match action {
             PointerAction::Begin(point) => {
                 self.active_gesture = Some(ActiveGesture::new(point, self.tools, dpi_scale));
+                false
             }
             PointerAction::Move(point) => {
                 if let Some(gesture) = self.active_gesture.as_mut() {
                     gesture.push_point(point);
                 }
+                false
             }
             PointerAction::End(point) => {
                 if let Some(mut gesture) = self.active_gesture.take() {
                     gesture.push_point(point);
                     if let Some(document) = self.state.active_document_mut() {
-                        gesture.commit(document);
+                        return gesture.commit(document);
                     }
                 }
+                false
             }
             PointerAction::BeginBatch(points) => {
                 self.active_gesture = ActiveGesture::from_points(points, self.tools, dpi_scale);
+                false
             }
             PointerAction::MoveBatch(points) => {
                 if let Some(gesture) = self.active_gesture.as_mut() {
                     gesture.extend(points);
                 }
+                false
             }
             PointerAction::EndBatch(points) => {
                 if let Some(mut gesture) = self.active_gesture.take() {
                     gesture.extend(points);
                     if let Some(document) = self.state.active_document_mut() {
-                        gesture.commit(document);
+                        return gesture.commit(document);
                     }
                 }
+                false
             }
             PointerAction::BeginPalmErase(sample) => {
                 self.active_gesture = Some(ActiveGesture::new_palm_erase(sample, self.tools));
+                false
             }
             PointerAction::MovePalmErase(sample) => {
                 if let Some(gesture) = self.active_gesture.as_mut() {
                     gesture.push_palm_erase(sample);
                 }
+                false
             }
             PointerAction::EndPalmErase(sample) => {
                 if let Some(mut gesture) = self.active_gesture.take() {
                     gesture.push_palm_erase(sample);
                     if let Some(document) = self.state.active_document_mut() {
-                        gesture.commit(document);
+                        return gesture.commit(document);
                     }
                 }
+                false
             }
             PointerAction::CommitBuffered(points) => {
                 if let Some(gesture) = ActiveGesture::from_points(points, self.tools, dpi_scale)
                     && let Some(document) = self.state.active_document_mut()
                 {
-                    gesture.commit(document);
+                    return gesture.commit(document);
                 }
+                false
             }
             PointerAction::Cancel => {
                 self.active_gesture = None;
+                false
             }
         }
     }
@@ -433,25 +486,39 @@ impl DesktopRuntime {
             slideshow_connection_error: self.slideshow_connection_error.as_deref(),
             slideshow_control_error: self.slideshow_control_error.as_deref(),
             settings_error: self.settings_error.as_deref(),
+            recovery_error: self.recovery_error.as_deref(),
             settings_directory_error: self.settings_directory_error.as_deref(),
             machine_autostart_state: self.machine_autostart_state,
             machine_autostart_error: self.machine_autostart_error.as_deref(),
             settings_path: self.settings_store.path(),
-            graphics_diagnostics: self.window_context.diagnostics(),
+            graphics_diagnostics: self.render_thread.diagnostics(),
         };
         let mut ui_command = None;
-        self.compositor.run_ui(self.window_context.window(), |ui| {
+        let egui_frame = self.egui.run_ui(self.window_context.window(), |ui| {
             ui_command = ui::render(ui, view)
         });
 
         let document = self.state.active_document().unwrap_or(&self.empty_document);
         let preview = self.active_gesture.as_mut().map(ActiveGesture::preview);
-        self.compositor
-            .paint(&self.window_context, document, preview)?;
-        self.sync_ink_rendering_state();
-        self.window_context.present()?;
+        self.render_generation = self.render_generation.wrapping_add(1);
+        self.render_thread.submit_frame(RenderFrame {
+            generation: self.render_generation,
+            document: document.clone(),
+            active_preview: preview.map(OwnedActiveInkPreview::from),
+            egui: egui_frame,
+        });
 
-        Ok(ui_command.is_some_and(|command| self.apply_ui_command(command)))
+        let exit_requested = if let Some(command) = ui_command {
+            let previous_state = self.state.clone();
+            let exit_requested = self.apply_ui_command(command);
+            if self.state != previous_state {
+                self.queue_recovery();
+            }
+            exit_requested
+        } else {
+            false
+        };
+        Ok(exit_requested)
     }
 
     /// 执行工具栏命令，并返回该命令是否要求事件循环退出。
@@ -504,9 +571,9 @@ impl DesktopRuntime {
                 let undone = self.state.active_document_mut().and_then(InkDocument::undo);
                 if let Some(operation) = undone {
                     if matches!(operation, InkOperation::Clear(_)) {
-                        self.compositor.invalidate_ink_cache();
+                        self.render_thread.invalidate_ink_cache();
                     } else if let Some(bounds) = operation.bounds() {
-                        self.compositor.invalidate_ink_region(bounds);
+                        self.render_thread.invalidate_ink_region(bounds);
                     }
                 }
             }
@@ -664,11 +731,6 @@ impl DesktopRuntime {
         }
     }
 
-    /// 同步固定抗锯齿路径最近一次非阻塞错误诊断。
-    fn sync_ink_rendering_state(&mut self) {
-        self.ink_rendering_error = self.compositor.ink_rendering_error().map(str::to_owned);
-    }
-
     /// 把当前 idle 面板映射为原生窗口几何类型。
     fn current_idle_window_view(&self) -> IdleWindowView {
         match self.idle_panel {
@@ -685,7 +747,7 @@ impl DesktopRuntime {
         } else {
             design_tokens::TOOLBAR_ZOOM_FACTOR
         };
-        self.compositor.egui_context().set_zoom_factor(zoom);
+        self.egui.context().set_zoom_factor(zoom);
     }
 
     /// 仅在状态机仍有可控放映会话时向 COM STA 发送带会话标识的动作。
@@ -708,9 +770,13 @@ impl DesktopRuntime {
 
     /// 排空 COM detector 事件，并把统一事件应用到状态机和窗口生命周期。
     fn process_slideshow_events(&mut self) -> bool {
+        let previous_state = self.state.clone();
         let mut changed = false;
         while let Ok(event) = self.slideshow_detector.try_recv() {
             changed |= self.apply_slideshow_event(event);
+        }
+        if self.state != previous_state {
+            self.queue_recovery();
         }
         changed
     }
@@ -720,10 +786,10 @@ impl DesktopRuntime {
         let mut changed = false;
         while let Ok(event) = self.windows_pointer_receiver.try_recv() {
             if event.cancels_ui_pointer() {
-                self.compositor.cancel_egui_pointer();
+                self.egui.cancel_pointer();
             }
             let ui_hit = {
-                let egui_context = self.compositor.egui_context();
+                let egui_context = self.egui.context();
                 event
                     .position()
                     .and_then(|position| {
@@ -736,7 +802,9 @@ impl DesktopRuntime {
                 ui_hit,
                 self.state.mode().accepts_ink_input(),
             ) {
-                self.apply_pointer_action(action);
+                if self.apply_pointer_action(action) {
+                    self.queue_recovery();
+                }
                 changed = true;
             }
         }
@@ -783,7 +851,7 @@ impl DesktopRuntime {
                 if changed {
                     self.active_gesture = None;
                     self.input_router.cancel();
-                    self.compositor.invalidate_ink_cache();
+                    self.render_thread.invalidate_ink_cache();
                 }
                 changed
             }
@@ -807,7 +875,7 @@ impl DesktopRuntime {
                     self.input_router.cancel();
                     self.slideshow_connection_error = Some(detail);
                     self.dismiss_slideshow_confirmation = false;
-                    self.compositor.invalidate_ink_cache();
+                    self.render_thread.invalidate_ink_cache();
                 }
                 changed
             }
@@ -830,15 +898,55 @@ impl DesktopRuntime {
         self.input_router.cancel();
         self.idle_panel = IdlePanel::Toolbar;
         self.update_interface_zoom();
-        if let Err(error) = self
-            .compositor
-            .set_annotation_resources_enabled(annotation_enabled)
-        {
-            tracing::warn!(%error, annotation_enabled, "切换墨迹资源驻留模式失败");
-            self.ink_rendering_error = Some(error.to_string());
-        }
+        self.render_thread
+            .set_annotation_resources_enabled(annotation_enabled);
         self.window_context.set_annotation_mode(annotation_enabled);
-        self.compositor.invalidate_ink_cache();
+        self.render_thread.invalidate_ink_cache();
+    }
+
+    /// 排空渲染线程结果，并在 fatal error 时恢复统一 AppError 传播。
+    fn process_render_events(&mut self) -> Result<bool, AppError> {
+        let mut changed = false;
+        while let Some(event) = self.render_thread.try_recv_event() {
+            match event {
+                RenderEvent::InkRenderingError(error) => {
+                    changed |= self.ink_rendering_error != error;
+                    self.ink_rendering_error = error;
+                }
+                RenderEvent::GraphicsDiagnostics(_) => changed = true,
+                RenderEvent::Fatal(detail) => return Err(AppError::Graphics(detail)),
+            }
+        }
+        Ok(changed)
+    }
+
+    /// 排空恢复 worker 错误并更新设置诊断。
+    fn process_recovery_events(&mut self) -> bool {
+        let mut changed = false;
+        while let Some(RecoveryEvent::Error(detail)) = self.recovery.try_recv_event() {
+            tracing::warn!(%detail, "墨迹后台保存失败");
+            changed |= self.recovery_error.as_deref() != Some(detail.as_str());
+            self.recovery_error = Some(detail);
+        }
+        changed
+    }
+
+    /// 把当前完整状态 cheap-clone 提交给 latest-state 恢复邮箱。
+    fn queue_recovery(&mut self) {
+        if !self.recovery.submit(self.state.clone()) && self.recovery_error.is_none() {
+            self.recovery_error = Some("墨迹恢复线程已停止，无法继续自动保存".to_owned());
+        }
+    }
+
+    /// 按退出原因清理或保留恢复文件，并始终停止渲染线程。
+    fn shutdown(&mut self, clean_exit: bool) -> Result<(), AppError> {
+        let recovery_result = if clean_exit {
+            self.recovery.shutdown_clean()
+        } else {
+            self.recovery.shutdown_preserve()
+        };
+        let render_result = self.render_thread.shutdown();
+        recovery_result.and(render_result)
     }
 
     /// 向唯一窗口请求一次按需重绘。
@@ -891,6 +999,7 @@ struct DesktopApplication {
     runtime: Option<DesktopRuntime>,
     startup_error: Option<AppError>,
     next_repaint: Option<Instant>,
+    clean_exit_requested: bool,
 }
 
 impl DesktopApplication {
@@ -909,6 +1018,7 @@ impl DesktopApplication {
             runtime: None,
             startup_error: None,
             next_repaint: None,
+            clean_exit_requested: false,
         }
     }
 
@@ -916,8 +1026,8 @@ impl DesktopApplication {
     fn install_repaint_callback(&self, runtime: &DesktopRuntime) {
         let proxy = self.proxy.clone();
         runtime
-            .compositor
-            .egui_context()
+            .egui
+            .context()
             .set_request_repaint_callback(move |info| {
                 let _ = proxy.send_event(UserEvent::RequestRepaint(info.delay));
             });
@@ -986,7 +1096,12 @@ impl ApplicationHandler<UserEvent> for DesktopApplication {
         if window_id != runtime.window_id() {
             return;
         }
-        if matches!(event, WindowEvent::CloseRequested | WindowEvent::Destroyed) {
+        if matches!(event, WindowEvent::CloseRequested) {
+            self.clean_exit_requested = true;
+            event_loop.exit();
+            return;
+        }
+        if matches!(event, WindowEvent::Destroyed) {
             event_loop.exit();
             return;
         }
@@ -994,7 +1109,10 @@ impl ApplicationHandler<UserEvent> for DesktopApplication {
         if matches!(event, WindowEvent::RedrawRequested) {
             self.next_repaint = None;
             match runtime.render() {
-                Ok(true) => event_loop.exit(),
+                Ok(true) => {
+                    self.clean_exit_requested = true;
+                    event_loop.exit();
+                }
                 Ok(false) => self.update_control_flow(event_loop),
                 Err(error) => {
                     self.startup_error = Some(error);
@@ -1036,6 +1154,23 @@ impl ApplicationHandler<UserEvent> for DesktopApplication {
                 }
                 self.update_control_flow(event_loop);
             }
+            UserEvent::Render => {
+                match runtime.process_render_events() {
+                    Ok(true) => runtime.request_redraw(),
+                    Ok(false) => {}
+                    Err(error) => {
+                        self.startup_error = Some(error);
+                        event_loop.exit();
+                    }
+                }
+                self.update_control_flow(event_loop);
+            }
+            UserEvent::Recovery => {
+                if runtime.process_recovery_events() {
+                    runtime.request_redraw();
+                }
+                self.update_control_flow(event_loop);
+            }
             UserEvent::RequestRepaint(delay) => {
                 let requested_time = Instant::now() + delay;
                 self.next_repaint = Some(
@@ -1059,6 +1194,15 @@ impl ApplicationHandler<UserEvent> for DesktopApplication {
                 }
             }
             self.update_control_flow(event_loop);
+        }
+    }
+
+    /// 退出事件循环时按退出原因处理恢复文件并停止渲染线程。
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        if let Some(runtime) = self.runtime.as_mut()
+            && let Err(error) = runtime.shutdown(self.clean_exit_requested)
+        {
+            self.startup_error = Some(error);
         }
     }
 }

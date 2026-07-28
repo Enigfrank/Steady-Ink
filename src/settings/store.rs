@@ -13,6 +13,7 @@ use super::UserSettings;
 const SETTINGS_DIRECTORY: &str = "Steady-Ink";
 const SETTINGS_FILE: &str = "settings.toml";
 const LOGS_DIRECTORY: &str = "logs";
+const RECOVERY_DIRECTORY: &str = "recovery";
 
 /// 管理当前 Windows 用户的 TOML 偏好文件，不接触任何墨迹数据。
 pub struct SettingsStore {
@@ -89,6 +90,15 @@ impl SettingsStore {
             ))
         })?;
         Ok(logs_directory)
+    }
+
+    /// 返回与 settings.toml 分离的墨迹崩溃恢复目录路径。
+    pub fn recovery_directory(&self) -> Result<PathBuf, AppError> {
+        let directory = self
+            .path
+            .parent()
+            .ok_or_else(|| AppError::Settings("设置文件路径缺少父目录".to_owned()))?;
+        Ok(directory.join(RECOVERY_DIRECTORY))
     }
 
     /// 确保配置目录存在后，通过 Windows 文件资源管理器打开该目录。

@@ -1,9 +1,11 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
+
+use serde::{Deserialize, Serialize};
 
 use super::InkDocument;
 
 /// 单次放映中的位置键；同一幻灯片在自定义放映中重复出现时位置不同。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct PageKey(u32);
 
 impl PageKey {
@@ -20,19 +22,24 @@ impl PageKey {
     pub const fn show_position(self) -> u32 {
         self.0
     }
+
+    /// 返回反序列化页键是否仍满足非零约束。
+    pub(crate) const fn is_valid(self) -> bool {
+        self.0 > 0
+    }
 }
 
 /// 某个放映位置的墨迹文档和辅助幻灯片标识。
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PageInkEntry {
     pub stable_slide_id: Option<i64>,
     pub document: InkDocument,
 }
 
 /// 仅在一次放映会话内存在的逐页墨迹存储。
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PageInkStore {
-    pages: HashMap<PageKey, PageInkEntry>,
+    pages: BTreeMap<PageKey, PageInkEntry>,
 }
 
 impl PageInkStore {
@@ -51,6 +58,11 @@ impl PageInkStore {
         self.pages.remove(&key).unwrap_or_default()
     }
 
+    /// 返回指定页键是否已作为非活动页保存。
+    pub(crate) fn contains(&self, key: PageKey) -> bool {
+        self.pages.contains_key(&key)
+    }
+
     /// 返回当前已保存的非活动放映位置数量。
     pub fn saved_page_count(&self) -> usize {
         self.pages.len()
@@ -59,5 +71,16 @@ impl PageInkStore {
     /// 清空本次放映的全部逐页墨迹。
     pub fn clear(&mut self) {
         self.pages.clear();
+    }
+
+    /// 校验所有非活动页键和墨迹文档的恢复约束。
+    pub(crate) fn validate_recovery(&self) -> Result<(), String> {
+        for (key, entry) in &self.pages {
+            if !key.is_valid() {
+                return Err("放映页键必须大于零".to_owned());
+            }
+            entry.document.validate_recovery()?;
+        }
+        Ok(())
     }
 }

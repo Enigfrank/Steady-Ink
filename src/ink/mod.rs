@@ -16,7 +16,7 @@ pub use model::{
     InkBounds, InkColor, InkOperation, InkTool, OperationId, PenWidth, VariableStrokePoint,
 };
 pub use page_store::{PageInkEntry, PageInkStore, PageKey};
-pub use renderer::{ActiveInkPreview, InkRenderCache};
+pub use renderer::{ActiveInkPreview, InkRenderCache, OwnedActiveInkPreview};
 pub(crate) use renderer::{
     InkPreviewCache, InkSurfaceConfig, active_preview_bounds, draw_active_preview,
     draw_image_rect_logical, preview_replaces_region,

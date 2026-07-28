@@ -45,20 +45,29 @@ impl RetainedUiFrame {
     }
 }
 
-/// 使用 egui-winit 收集输入，并把 egui mesh 绘制到任意 Skia canvas。
-pub struct EguiSkiaRenderer {
+/// UI 线程交给 Skia painter 的单帧 owned 输出。
+pub struct EguiFrame {
+    pub shapes: Vec<egui::epaint::ClippedShape>,
+    pub pixels_per_point: f32,
+    pub texture_deltas: Vec<TexturesDelta>,
+}
+
+/// 在事件线程使用 egui-winit 收集输入并执行 UI 布局。
+pub struct EguiUiState {
     context: egui::Context,
     state: egui_winit::State,
     viewport_info: egui::ViewportInfo,
-    shapes: Vec<egui::epaint::ClippedShape>,
-    pixels_per_point: f32,
-    textures_delta: TexturesDelta,
+}
+
+/// 在渲染线程把 egui mesh 和纹理绘制到 Skia canvas。
+pub struct EguiSkiaPainter {
+    context: egui::Context,
     textures: HashMap<TextureId, TexturePaint>,
     retained_frame: Option<RetainedUiFrame>,
 }
 
-impl EguiSkiaRenderer {
-    /// 创建与唯一 winit 根 viewport 绑定的 egui 输入和 Skia 绘制状态。
+impl EguiUiState {
+    /// 创建与唯一 winit 根 viewport 绑定的 egui 输入和布局状态。
     pub fn new(event_loop: &ActiveEventLoop, window: &Window) -> Self {
         let context = egui::Context::default();
         let state = egui_winit::State::new(
@@ -74,11 +83,6 @@ impl EguiSkiaRenderer {
             context,
             state,
             viewport_info: egui::ViewportInfo::default(),
-            shapes: Vec::new(),
-            pixels_per_point: window.scale_factor() as f32,
-            textures_delta: TexturesDelta::default(),
-            textures: HashMap::new(),
-            retained_frame: None,
         }
     }
 
@@ -87,8 +91,8 @@ impl EguiSkiaRenderer {
         self.state.on_window_event(window, event)
     }
 
-    /// 执行本帧 egui 布局并保存稍后绘制所需的 mesh 和纹理增量。
-    pub fn run_ui(&mut self, window: &Window, run_ui: impl FnMut(&mut egui::Ui)) {
+    /// 执行本帧 egui 布局并返回渲染线程需要的 owned frame。
+    pub fn run_ui(&mut self, window: &Window, run_ui: impl FnMut(&mut egui::Ui)) -> EguiFrame {
         let raw_input = self.state.take_egui_input(window);
         let egui::FullOutput {
             platform_output,
@@ -119,30 +123,61 @@ impl EguiSkiaRenderer {
         }
 
         self.state.handle_platform_output(window, platform_output);
-        self.shapes = shapes;
-        self.pixels_per_point = pixels_per_point;
-        self.textures_delta.append(textures_delta);
+        EguiFrame {
+            shapes,
+            pixels_per_point,
+            texture_deltas: vec![textures_delta],
+        }
     }
 
-    /// 把上次布局产生的纹理和 mesh 绘制到当前 Skia canvas。
-    pub fn paint(&mut self, canvas: &Canvas) -> Result<(), AppError> {
-        let mut textures_delta = std::mem::take(&mut self.textures_delta);
-        let can_reuse_retained = texture_delta_allows_reuse(&textures_delta);
-        let can_retain_recording = texture_delta_allows_retention(&textures_delta);
+    /// 返回 egui 上下文，供等待型事件循环和 painter 共享。
+    pub const fn context(&self) -> &egui::Context {
+        &self.context
+    }
+
+    /// 清空 egui 当前指针状态，供原生手掌分类取消已暂存的 UI 接触。
+    pub fn cancel_pointer(&self) {
+        self.context
+            .input_mut(|input| input.pointer = egui::PointerState::default());
+    }
+}
+
+impl EguiSkiaPainter {
+    /// 创建只持有 Skia 绘制资源的 egui painter。
+    pub fn new(context: egui::Context) -> Self {
+        Self {
+            context,
+            textures: HashMap::new(),
+            retained_frame: None,
+        }
+    }
+
+    /// 把一个 owned egui frame 的纹理和 mesh 绘制到当前 Skia canvas。
+    pub fn paint(&mut self, canvas: &Canvas, frame: EguiFrame) -> Result<(), AppError> {
+        let EguiFrame {
+            shapes,
+            pixels_per_point,
+            mut texture_deltas,
+        } = frame;
+        let can_reuse_retained = texture_deltas.iter().all(texture_delta_allows_reuse);
+        let can_retain_recording = texture_deltas.iter().all(texture_delta_allows_retention);
         if !can_reuse_retained {
             self.retained_frame = None;
         }
-        for (id, image_delta) in textures_delta.set.drain(..) {
-            self.update_texture(id, image_delta)?;
+        let mut textures_delta = texture_deltas.pop().unwrap_or_default();
+        for mut skipped_delta in texture_deltas {
+            self.apply_texture_sets(&mut skipped_delta)?;
+            self.apply_texture_frees(&mut skipped_delta);
         }
+        self.apply_texture_sets(&mut textures_delta)?;
 
-        let shapes = std::mem::take(&mut self.shapes);
         let target = canvas.base_layer_size();
         let target_size = [target.width, target.height];
         let cache_hit = can_reuse_retained
-            && self.retained_frame.as_ref().is_some_and(|retained| {
-                retained.matches(&shapes, self.pixels_per_point, target_size)
-            });
+            && self
+                .retained_frame
+                .as_ref()
+                .is_some_and(|retained| retained.matches(&shapes, pixels_per_point, target_size));
 
         if cache_hit {
             self.retained_frame
@@ -152,15 +187,14 @@ impl EguiSkiaRenderer {
                 .playback(canvas);
         } else {
             self.retained_frame = None;
-            let primitives = self
-                .context
-                .tessellate(shapes.clone(), self.pixels_per_point);
+            let primitives = self.context.tessellate(shapes.clone(), pixels_per_point);
             let recording_bounds =
                 Rect::from_xywh(0.0, 0.0, target_size[0] as f32, target_size[1] as f32);
             let mut recorder = PictureRecorder::new();
             self.paint_primitives(
                 recorder.begin_recording(recording_bounds, false),
                 primitives,
+                pixels_per_point,
             )?;
             let picture = recorder
                 .finish_recording_as_picture(None)
@@ -170,28 +204,30 @@ impl EguiSkiaRenderer {
             if can_retain_recording && retained_picture_fits_budget(picture_bytes) {
                 self.retained_frame = Some(RetainedUiFrame {
                     shapes,
-                    pixels_per_point: self.pixels_per_point,
+                    pixels_per_point,
                     target_size,
                     picture,
                 });
             }
         }
 
-        for id in textures_delta.free.drain(..) {
-            self.textures.remove(&id);
+        self.apply_texture_frees(&mut textures_delta);
+        Ok(())
+    }
+
+    /// 按 egui 产生顺序应用一个纹理 delta 的 set 阶段。
+    fn apply_texture_sets(&mut self, textures_delta: &mut TexturesDelta) -> Result<(), AppError> {
+        for (id, image_delta) in textures_delta.set.drain(..) {
+            self.update_texture(id, image_delta)?;
         }
         Ok(())
     }
 
-    /// 返回 egui 上下文，供等待型事件循环安装按需重绘回调。
-    pub const fn context(&self) -> &egui::Context {
-        &self.context
-    }
-
-    /// 清空 egui 当前指针状态，供原生手掌分类取消已暂存的 UI 接触。
-    pub fn cancel_pointer(&self) {
-        self.context
-            .input_mut(|input| input.pointer = egui::PointerState::default());
+    /// 在对应帧完成后应用一个纹理 delta 的 free 阶段。
+    fn apply_texture_frees(&mut self, textures_delta: &mut TexturesDelta) {
+        for id in textures_delta.free.drain(..) {
+            self.textures.remove(&id);
+        }
     }
 
     /// 创建或局部更新一个 egui 纹理，并重建对应的 Skia shader。
@@ -232,6 +268,7 @@ impl EguiSkiaRenderer {
         &self,
         canvas: &Canvas,
         primitives: Vec<ClippedPrimitive>,
+        pixels_per_point: f32,
     ) -> Result<(), AppError> {
         let mut white_paint = Paint::default();
         white_paint.set_color(Color::WHITE);
@@ -253,8 +290,8 @@ impl EguiSkiaRenderer {
             );
             let clipped_canvas = skia_safe::AutoCanvasRestore::guard(canvas, true);
             clipped_canvas.set_matrix(M44::new_identity().set_scale(
-                self.pixels_per_point,
-                self.pixels_per_point,
+                pixels_per_point,
+                pixels_per_point,
                 1.0,
             ));
             clipped_canvas.clip_rect(clip_rect, ClipOp::Intersect, true);

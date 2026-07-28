@@ -8,11 +8,13 @@ description = "Windows-only teaching screen annotation software"
 license = "GPL-3.0-or-later"
 
 [dependencies]
+bincode = { version = "2.0.1", features = ["serde"] }
+crc32fast = "1.5.0"
 directories = "6.0.0"
 egui = "0.35.0"
 egui-winit = { version = "0.35.0", default-features = false }
 raw-window-handle = "0.6.2"
-serde = { version = "1.0.228", features = ["derive"] }
+serde = { version = "1.0.228", features = ["derive", "rc"] }
 skia-safe = { version = "0.99.0", features = ["d3d"] }
 thiserror = "2.0.18"
 time = { version = "0.3.53", features = ["formatting", "local-offset"] }
@@ -20,6 +22,7 @@ toml = "0.9.8"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter", "fmt", "time"] }
 winit = "0.30"
+zstd = "0.13.3"
 
 [build-dependencies]
 image = { version = "0.25.9", default-features = false, features = ["png"] }

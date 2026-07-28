@@ -285,7 +285,10 @@ function Wait-WindowMode {
             $size.Width -ge 800 -and $size.Height -ge 600
         }
         else {
-            $size.Width -lt 500 -and $size.Height -lt 500
+            $size.Width -gt 0 -and
+                $size.Height -gt 0 -and
+                $size.Width -lt 500 -and
+                $size.Height -lt 500
         }
         if ($matches) {
             return $size
@@ -299,10 +302,19 @@ function Wait-WindowMode {
 function Enter-Annotation {
     param([IntPtr]$WindowHandle)
 
-    $size = Get-ClientSize $WindowHandle
-    $scale = [RenderingAcceptanceNative]::GetDpiForWindow($WindowHandle) / 96.0
-    Invoke-ClientClick $WindowHandle ([int]($size.Width / 2)) ([int](32.0 * $scale))
-    Wait-WindowMode $WindowHandle Annotation
+    $deadline = [DateTime]::UtcNow.AddSeconds(15)
+    do {
+        $size = Get-ClientSize $WindowHandle
+        if ($size.Width -ge 800 -and $size.Height -ge 600) {
+            return $size
+        }
+        if ($size.Width -gt 0 -and $size.Height -gt 0) {
+            $scale = [RenderingAcceptanceNative]::GetDpiForWindow($WindowHandle) / 96.0
+            Invoke-ClientClick $WindowHandle ([int]($size.Width / 2)) ([int](32.0 * $scale))
+        }
+        Start-Sleep -Milliseconds 300
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw "窗口未在 15s 内进入批注模式，最终尺寸为 $($size.Width)x$($size.Height)"
 }
 
 # 根据当前窗口 DPI 返回普通批注工具栏指定按钮中心。
@@ -531,6 +543,7 @@ function Start-AcceptanceProcess {
         RUST_LOG = 'steady_ink=debug'
     }
     $windowHandle = Wait-MainWindow $process
+    [void](Wait-WindowMode $windowHandle Idle)
     [pscustomobject]@{
         Process = $process
         WindowHandle = $windowHandle

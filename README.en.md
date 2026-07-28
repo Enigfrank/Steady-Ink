@@ -20,14 +20,20 @@
 
 ## Features
 
-- The standard features expected of a screen annotation tool.
+- Six pen colors, `4/6/8/16px` widths, optional speed tapering, three eraser sizes, undo, and clear.
+- Windows Pointer pen, touch, palm rejection, and palm erasing input.
+- PowerPoint and WPS presentation detection, navigation, and annotation integration.
+- Local crash recovery, readable mode, machine-wide startup, and in-app restart.
+- Optional live performance monitoring, slow-frame logs, and local JSON performance-data export.
 
 ## Status
 
 | Area | Status |
 | --- | --- |
-| Standard annotation, toolbars, and settings | Implemented |
+| Ink annotation, smooth antialiasing, erasing, and settings | Implemented |
 | Windows touch, palm rejection, and palm erasing | Implemented; target hardware tuning remains |
+| GPU render thread, resource reuse, and crash recovery | Implemented; broader GPU and device validation remains |
+| Performance monitoring and JSON export | Implemented; disabled by default |
 | PowerPoint presentation integration | Basic validation completed |
 | WPS presentation integration | Adapted; more real environments required |
 
@@ -65,13 +71,15 @@ cargo build --release
 
 Core technologies: Rust, winit, egui, rust-skia, DirectComposition, D3D12, and Windows COM.
 
-The source is organized into `app`, `window`, `render`, `ui`, `ink`, `input`, `slideshow`, and `settings` feature modules.
+The source is organized into `app`, `window`, `render`, `ui`, `ink`, `input`, `slideshow`, `settings`, `recovery`, and `performance` feature modules.
 
 ## Scope and Privacy
 
 Steady Ink currently supports Windows and a single monitor. It does not include any network features.
 
-Ink remains in memory for the current run. Preferences are stored in `%APPDATA%\Steady-Ink\settings.toml`. The project contains no telemetry or online services.
+Ink state primarily remains in memory while drawing. To support recovery after an abnormal exit, the app writes compressed and validated recovery data to `%APPDATA%\Steady-Ink\recovery`, then removes active recovery files after a clean exit or restart.
+
+Preferences are stored in `%APPDATA%\Steady-Ink\settings.toml`. Logs and performance data explicitly exported by the user stay under the same local application directory. The project contains no telemetry or online services; all of this data remains on the device.
 
 ## License
 

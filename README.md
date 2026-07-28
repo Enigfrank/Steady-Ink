@@ -20,16 +20,23 @@
 
 ## 功能
 
-- 一般屏幕批注工具应有的功能
+- 六种画笔颜色、`4/6/8/16px` 画笔、可选速度笔锋、三档橡皮擦、撤销和清屏。
+- 面向 Windows Pointer 的画笔、触控、防误触和手掌橡皮擦输入。
+- PowerPoint 与 WPS 放映检测、翻页和批注联动。
+- 本地崩溃恢复、易读模式、所有用户开机自启动和应用内重启。
+- 可选实时性能监控、慢帧日志和本地 JSON 性能数据导出。
 
 ## 当前状态
 
 | 项目 | 状态 |
 | --- | --- |
-| 普通批注、工具栏和设置 | 已实现 |
+| 墨迹批注、平滑抗锯齿、橡皮擦和设置 | 已实现 |
 | Windows 触控、防误触和手掌橡皮擦 | 已实现，目标触摸设备仍需调校 |
+| GPU 渲染线程、资源复用和崩溃恢复 | 已实现，仍需扩大显卡与设备覆盖验证 |
+| 性能监控和 JSON 导出 | 已实现，默认关闭 |
 | PowerPoint 放映联动 | 已完成基础验证 |
 | WPS 放映联动 | 已适配，仍需更多真实环境验证 |
+
 ## 安装
 
 从 [GitHub Releases](https://github.com/Enigfrank/Steady-Ink/releases) 下载唯一的 Windows x64 Inno Setup 安装包和 SHA-256 校验文件.
@@ -64,13 +71,15 @@ cargo build --release
 
 主要技术栈：Rust、winit、egui、rust-skia、DirectComposition、D3D12 和 Windows COM.
 
-代码按 `app`、`window`、`render`、`ui`、`ink`、`input`、`slideshow` 和 `settings` 功能模块组织.
+代码按 `app`、`window`、`render`、`ui`、`ink`、`input`、`slideshow`、`settings`、`recovery` 和 `performance` 功能模块组织.
 
 ## 范围与隐私
 
 Steady Ink 当前仅支持 Windows 和单显示器，不包含任何联网功能.
 
-墨迹只保存在本次运行的内存中.用户偏好保存在 `%APPDATA%\Steady-Ink\settings.toml`，项目不包含遥测或在线服务.
+绘制时的墨迹状态主要保存在内存中.为支持异常退出恢复，应用会把经过压缩和校验的恢复数据写入 `%APPDATA%\Steady-Ink\recovery`，并在正常退出或重启后清理活动恢复文件.
+
+用户偏好保存在 `%APPDATA%\Steady-Ink\settings.toml`，日志和用户主动导出的性能数据保存在同一应用目录下.项目不包含遥测或在线服务，所有这些数据都留在本机.
 
 ## 许可证
 

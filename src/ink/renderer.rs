@@ -7,9 +7,9 @@ use skia_safe::{
 };
 
 use super::{
-    BASE_PREVIEW_TILE_SIZE, BatchDrawer, CanvasPoint, EraseSample, EraserSize, InkBounds, InkColor,
-    InkDocument, InkOperation, InkSpatialIndex, InkTool, OperationId, PenWidth, SurfacePool,
-    VariableStrokePoint,
+    BASE_PREVIEW_TILE_SIZE, BatchDrawer, CanvasPoint, EraseSample, EraseStroke, EraserSize,
+    InkBounds, InkColor, InkDocument, InkOperation, InkSpatialIndex, InkTool, OperationId,
+    PenWidth, SurfacePool, VariableStrokePoint,
     stroke_geometry::{StrokeSegment, variable_outline, visit_smoothed_segments},
 };
 use crate::error::AppError;
@@ -43,6 +43,28 @@ impl ActiveInkPreview<'_> {
             Self::VariableTool { points, .. } => points.last().map(|sample| sample.point),
             Self::PalmErase { samples } => samples.last().map(|sample| sample.center),
         }
+    }
+}
+
+/// 返回活动预览是否仍是刚刚提交为待定擦除的同一手势。
+fn active_preview_matches_erase(preview: ActiveInkPreview<'_>, stroke: &EraseStroke) -> bool {
+    match preview {
+        ActiveInkPreview::Tool {
+            points,
+            tool: InkTool::RegionEraser,
+            eraser_size,
+            ..
+        } => {
+            stroke.samples.len() == points.len()
+                && stroke.samples.iter().zip(points).all(|(sample, point)| {
+                    *sample == EraseSample::circle(*point, eraser_size.pixels())
+                })
+        }
+        ActiveInkPreview::PalmErase { samples } => stroke.samples.as_slice() == samples,
+        ActiveInkPreview::Tool {
+            tool: InkTool::Pen, ..
+        }
+        | ActiveInkPreview::VariableTool { .. } => false,
     }
 }
 
@@ -125,6 +147,7 @@ pub struct InkRenderCache {
     batch_drawer: BatchDrawer,
     pending_region_rebuild: Option<InkBounds>,
     full_rebuild_requested: bool,
+    deferred_erase: Option<EraseStroke>,
 }
 
 impl InkRenderCache {
@@ -152,6 +175,7 @@ impl InkRenderCache {
             batch_drawer: BatchDrawer::new(),
             pending_region_rebuild: None,
             full_rebuild_requested: false,
+            deferred_erase: None,
         })
     }
 
@@ -180,14 +204,27 @@ impl InkRenderCache {
         }
 
         let new_operations = &history[self.applied_operation_count..];
-        let started_at = (!new_operations.is_empty() && tracing::enabled!(tracing::Level::DEBUG))
-            .then(std::time::Instant::now);
+        if new_operations.is_empty() {
+            return;
+        }
+        let started_at = tracing::enabled!(tracing::Level::DEBUG).then(std::time::Instant::now);
+        self.commit_deferred_erase();
+        let deferred_erase = new_operations.last().and_then(|operation| match operation {
+            InkOperation::EraseStroke(stroke) => Some(stroke.clone()),
+            _ => None,
+        });
+        let operations_to_draw = if deferred_erase.is_some() {
+            &new_operations[..new_operations.len() - 1]
+        } else {
+            new_operations
+        };
         let draw_calls = draw_operations_with_config(
             self.surface.canvas(),
-            new_operations.iter(),
+            operations_to_draw.iter(),
             self.config,
             &mut self.batch_drawer,
         );
+        self.deferred_erase = deferred_erase;
         for operation in new_operations {
             self.index_operation(operation);
         }
@@ -208,6 +245,35 @@ impl InkRenderCache {
             gpu::surfaces::resolve_msaa(&mut self.surface);
         }
         self.surface.image_snapshot()
+    }
+
+    /// 把最后一次待定擦除绘制到窗口墨迹层之上，但不修改持久 GPU surface。
+    pub(crate) fn draw_deferred_erase(&self, canvas: &Canvas) {
+        if let Some(stroke) = self.deferred_erase.as_ref() {
+            draw_erase_samples(canvas, &stroke.samples);
+        }
+    }
+
+    /// 新手势开始前固化待定擦除；刚提交手势的残留预览不会提前固化。
+    pub(crate) fn commit_deferred_erase_before_preview(&mut self, preview: ActiveInkPreview<'_>) {
+        if self
+            .deferred_erase
+            .as_ref()
+            .is_some_and(|stroke| active_preview_matches_erase(preview, stroke))
+        {
+            return;
+        }
+        self.commit_deferred_erase();
+    }
+
+    /// 在后续事实操作开始前，按文档顺序固化待定擦除。
+    fn commit_deferred_erase(&mut self) {
+        let Some(stroke) = self.deferred_erase.take() else {
+            return;
+        };
+        with_logical_canvas(self.surface.canvas(), self.config, |canvas| {
+            draw_erase_samples(canvas, &stroke.samples);
+        });
     }
 
     /// 返回缓存使用的逻辑尺寸。
@@ -248,6 +314,7 @@ impl InkRenderCache {
 
     /// 从最近一次清屏后的可见操作重建整个活动页 GPU surface。
     fn rebuild(&mut self, document: &InkDocument) {
+        self.deferred_erase = None;
         self.surface.canvas().clear(Color::TRANSPARENT);
         let operations = document.replay_operations();
         let started_at = tracing::enabled!(tracing::Level::DEBUG).then(std::time::Instant::now);
@@ -273,6 +340,19 @@ impl InkRenderCache {
 
     /// 清理指定矩形并按事实历史顺序重放所有与该矩形相交的可见操作。
     fn rebuild_region(&mut self, document: &InkDocument, bounds: InkBounds) {
+        let started_at = tracing::enabled!(tracing::Level::DEBUG).then(std::time::Instant::now);
+        if self.discard_undone_deferred_erase(document) {
+            if let Some(started_at) = started_at {
+                tracing::debug!(
+                    operations = 0,
+                    draw_calls = 0,
+                    elapsed_micros = started_at.elapsed().as_micros(),
+                    "局部墨迹重建完成"
+                );
+            }
+            self.mark_document_applied(document);
+            return;
+        }
         self.prepare_spatial_index_for_region(document);
         let mut operation_ids = self.spatial_index.query(bounds);
         operation_ids.sort_unstable_by_key(|id| id.get());
@@ -281,7 +361,6 @@ impl InkRenderCache {
             .filter_map(|id| document.operation(id))
             .collect();
         let clip_rect = Rect::new(bounds.left, bounds.top, bounds.right, bounds.bottom);
-        let started_at = tracing::enabled!(tracing::Level::DEBUG).then(std::time::Instant::now);
         let draw_calls = with_logical_canvas(self.surface.canvas(), self.config, |canvas| {
             let save_count = canvas.save();
             canvas.clip_rect(clip_rect, ClipOp::Intersect, false);
@@ -345,8 +424,31 @@ impl InkRenderCache {
         if single_tail_removal && let Some(removed_id) = self.last_operation_id {
             self.spatial_index.remove(removed_id);
         } else {
+            self.deferred_erase = None;
             self.rebuild_spatial_index(document);
         }
+    }
+
+    /// 丢弃尚未写入持久 surface 的尾部擦除，并同步移除空间索引项。
+    fn discard_undone_deferred_erase(&mut self, document: &InkDocument) -> bool {
+        let history = document.operations();
+        let Some(deferred) = self.deferred_erase.as_ref() else {
+            return false;
+        };
+        let deferred_id = deferred.id;
+        let current_tail_precedes_deferred = history
+            .last()
+            .is_none_or(|operation| operation.id().get() < deferred_id.get());
+        let single_tail_removal = self.applied_operation_count == history.len() + 1
+            && self.last_operation_id == Some(deferred_id)
+            && current_tail_precedes_deferred;
+        if !single_tail_removal {
+            return false;
+        }
+
+        self.deferred_erase = None;
+        self.spatial_index.remove(deferred_id);
+        true
     }
 
     /// 记录缓存和索引已经同步到文档事实历史末尾。
@@ -1072,6 +1174,30 @@ fn draw_erase_sample_outline(canvas: &Canvas, sample: EraseSample) {
 mod tests {
     use super::*;
 
+    /// 创建不依赖 GPU 的最小墨迹缓存，供状态机回归测试使用。
+    fn raster_cache(logical_size: [u32; 2]) -> InkRenderCache {
+        let mut surface = skia_safe::surfaces::raster_n32_premul((
+            logical_size[0] as i32,
+            logical_size[1] as i32,
+        ))
+        .expect("测试 raster surface 应创建成功");
+        surface.canvas().clear(Color::TRANSPARENT);
+        InkRenderCache {
+            surface,
+            logical_size,
+            render_size: logical_size,
+            config: InkSurfaceConfig::for_mode(InkAntialiasingMode::Off),
+            applied_operation_count: 0,
+            last_operation_id: None,
+            last_operation_was_clear: false,
+            spatial_index: InkSpatialIndex::new(logical_size),
+            batch_drawer: BatchDrawer::new(),
+            pending_region_rebuild: None,
+            full_rebuild_requested: false,
+            deferred_erase: None,
+        }
+    }
+
     /// 验证三类活动预览都暴露最新物理位置供速度策略采样。
     #[test]
     fn active_preview_reports_latest_position() {
@@ -1109,6 +1235,104 @@ mod tests {
             .latest_position(),
             Some(CanvasPoint::new(7.0, 8.0))
         );
+    }
+
+    /// 验证刚提交的普通与手掌擦除预览不会被误判为后续新手势。
+    #[test]
+    fn active_preview_matches_only_the_committed_erase() {
+        let points = [CanvasPoint::new(8.0, 12.0), CanvasPoint::new(16.0, 12.0)];
+        let circle_samples: Vec<_> = points
+            .iter()
+            .copied()
+            .map(|point| EraseSample::circle(point, EraserSize::Px24.pixels()))
+            .collect();
+        let circle_stroke = EraseStroke::new(OperationId::new(1), circle_samples)
+            .expect("有效圆形擦除应创建事实操作");
+        let circle_preview = ActiveInkPreview::Tool {
+            points: &points,
+            tool: InkTool::RegionEraser,
+            color: InkColor::Red,
+            pen_width: PenWidth::Px4,
+            eraser_size: EraserSize::Px24,
+        };
+        assert!(active_preview_matches_erase(circle_preview, &circle_stroke));
+
+        let palm_samples = [EraseSample {
+            center: CanvasPoint::new(24.0, 20.0),
+            radius_x: 12.0,
+            radius_y: 8.0,
+            rotation_radians: 0.25,
+        }];
+        let palm_stroke = EraseStroke::new(OperationId::new(2), palm_samples.to_vec())
+            .expect("有效手掌擦除应创建事实操作");
+        assert!(active_preview_matches_erase(
+            ActiveInkPreview::PalmErase {
+                samples: &palm_samples,
+            },
+            &palm_stroke
+        ));
+        assert!(!active_preview_matches_erase(
+            ActiveInkPreview::Tool {
+                points: &points[..1],
+                tool: InkTool::RegionEraser,
+                color: InkColor::Red,
+                pen_width: PenWidth::Px4,
+                eraser_size: EraserSize::Px24,
+            },
+            &circle_stroke
+        ));
+    }
+
+    /// 验证空帧保留待定擦除，立即撤销只丢弃状态而不触发区域重放。
+    #[test]
+    fn deferred_erase_survives_empty_sync_and_discards_on_undo() {
+        let mut document = InkDocument::new();
+        document.append_draw_stroke(
+            vec![CanvasPoint::new(4.0, 16.0), CanvasPoint::new(52.0, 16.0)],
+            InkColor::Red,
+            PenWidth::Px4,
+        );
+        let mut cache = raster_cache([64, 64]);
+        cache.sync(&document);
+        let erase_id = document
+            .append_erase_stroke(vec![EraseSample::circle(
+                CanvasPoint::new(16.0, 16.0),
+                EraserSize::Px24.pixels(),
+            )])
+            .expect("有效擦除应创建事实操作");
+        let erase_bounds = document
+            .operation(erase_id)
+            .and_then(InkOperation::bounds)
+            .expect("擦除操作应有有效边界");
+
+        cache.sync(&document);
+        assert_eq!(
+            cache.deferred_erase.as_ref().map(|stroke| stroke.id),
+            Some(erase_id)
+        );
+        cache.sync(&document);
+        assert_eq!(
+            cache.deferred_erase.as_ref().map(|stroke| stroke.id),
+            Some(erase_id)
+        );
+        let committed_points = [CanvasPoint::new(16.0, 16.0)];
+        cache.commit_deferred_erase_before_preview(ActiveInkPreview::Tool {
+            points: &committed_points,
+            tool: InkTool::RegionEraser,
+            color: InkColor::Red,
+            pen_width: PenWidth::Px4,
+            eraser_size: EraserSize::Px24,
+        });
+        assert_eq!(
+            cache.deferred_erase.as_ref().map(|stroke| stroke.id),
+            Some(erase_id)
+        );
+
+        document.undo();
+        cache.invalidate_region(erase_bounds);
+        cache.sync(&document);
+        assert!(cache.deferred_erase.is_none());
+        assert_eq!(cache.applied_operation_count, document.operations().len());
     }
 
     /// 创建仅旋转角不同的椭圆采样。

@@ -301,6 +301,30 @@ impl D3DWindowContext {
             })
     }
 
+    /// 为 idle 模式重建完整 D3D12 设备栈，使旧设备资源可以在驱动稳定期释放。
+    pub fn recreate_graphics_device(&mut self, size: PhysicalSize<u32>) -> Result<(), AppError> {
+        let factory: IDXGIFactory4 = unsafe { CreateDXGIFactory1() }
+            .map_err(|error| graphics_error("无法重建 DXGI factory", error))?;
+        let (adapter, device, software_fallback) = create_device(&factory)?;
+        let queue = unsafe { device.CreateCommandQueue(&Default::default()) }
+            .map_err(|error| graphics_error("无法重建 D3D12 command queue", error))?;
+        let swap_chain = create_swap_chain(&factory, &queue, size)?;
+        unsafe { self.composition_visual.SetContent(&swap_chain) }
+            .map_err(|error| graphics_error("无法绑定重建的 composition swap chain", error))?;
+        unsafe { self.composition_device.Commit() }
+            .map_err(|error| graphics_error("无法提交重建的图形设备", error))?;
+        let diagnostics = read_graphics_diagnostics(&adapter, software_fallback)?;
+
+        self.factory = factory;
+        self.adapter = adapter;
+        self.device = device;
+        self.queue = queue;
+        self.swap_chain = swap_chain;
+        self.swap_chain_size = PhysicalSize::new(size.width.max(1), size.height.max(1));
+        self.diagnostics = diagnostics;
+        Ok(())
+    }
+
     /// 提交当前 back buffer，透明像素由 DirectComposition 按预乘 alpha 合成。
     pub fn present(&self) -> Result<(), AppError> {
         unsafe { self.swap_chain.Present(1, DXGI_PRESENT::default()) }

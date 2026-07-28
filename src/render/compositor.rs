@@ -42,6 +42,7 @@ pub struct Compositor {
     ink_cache: InkRenderCache,
     ink_mode: InkAntialiasingMode,
     annotation_resources_enabled: bool,
+    reset_graphics_on_next_resize: bool,
     ink_rendering_error: Option<String>,
     preview_cache: Option<InkPreviewCache>,
     preview_surface_pool: SurfacePool,
@@ -76,15 +77,7 @@ impl Compositor {
         event_loop: &ActiveEventLoop,
         window_context: &D3DWindowContext,
     ) -> Result<(Self, Option<String>), AppError> {
-        let backend_context = BackendContext {
-            adapter: window_context.adapter().clone(),
-            device: window_context.device().clone(),
-            queue: window_context.queue().clone(),
-            memory_allocator: None,
-            protected_context: Protected::No,
-        };
-        let mut gr_context = unsafe { gpu::direct_contexts::make_d3d(&backend_context, None) }
-            .ok_or_else(|| AppError::Graphics("无法创建 Skia D3D12 DirectContext".to_owned()))?;
+        let mut gr_context = create_direct_context(window_context)?;
         let size: [u32; 2] = window_context.window().inner_size().into();
         let window_surfaces = create_window_surfaces(&mut gr_context, window_context, size)?;
         let resources = create_ink_resources(&mut gr_context, size, InkAntialiasingMode::Off)?;
@@ -97,6 +90,7 @@ impl Compositor {
                 ink_cache: resources.cache,
                 ink_mode: resources.mode,
                 annotation_resources_enabled: false,
+                reset_graphics_on_next_resize: false,
                 ink_rendering_error: resources.error,
                 preview_cache: resources.preview_cache,
                 preview_surface_pool: SurfacePool::new(
@@ -144,12 +138,45 @@ impl Compositor {
         size: [u32; 2],
     ) -> Result<(), AppError> {
         let physical_size = winit::dpi::PhysicalSize::new(size[0].max(1), size[1].max(1));
-        if window_context.swap_chain_size() == physical_size {
+        let reset_graphics =
+            self.reset_graphics_on_next_resize && !self.annotation_resources_enabled;
+        if window_context.swap_chain_size() == physical_size && !reset_graphics {
+            return Ok(());
+        }
+        if can_reuse_annotation_capacity(
+            self.annotation_resources_enabled,
+            window_context.swap_chain_size(),
+            physical_size,
+        ) {
+            self.preview_surface_pool.gc(PREVIEW_POOL_GC_TIMEOUT);
+            self.log_surface_pool_stats("窗口 resize 复用现有批注 surface");
             return Ok(());
         }
         self.gr_context.flush_and_submit();
         self.release_preview_cache();
         self.window_surfaces.clear();
+        if reset_graphics {
+            self.preview_surface_pool.clear();
+            self.gr_context.free_gpu_resources();
+            window_context.recreate_graphics_device(physical_size)?;
+            let mut replacement_context = create_direct_context(window_context)?;
+            let window_surfaces =
+                create_window_surfaces(&mut replacement_context, window_context, size)?;
+            let resources =
+                create_ink_resources(&mut replacement_context, [1, 1], InkAntialiasingMode::Off)?;
+            self.window_surfaces = window_surfaces;
+            self.ink_cache = resources.cache;
+            self.ink_mode = resources.mode;
+            self.ink_rendering_error = resources.error;
+            self.preview_cache = resources.preview_cache;
+            self.gr_context.release_resources_and_abandon();
+            self.gr_context = replacement_context;
+            self.reset_graphics_on_next_resize = false;
+            self.log_surface_pool_stats("idle 图形设备重建后预览资源池状态");
+            return Ok(());
+        }
+        self.gr_context
+            .purge_unlocked_resources(gpu::PurgeResourceOptions::AllResources);
         window_context.recreate_swap_chain(physical_size)?;
         self.window_surfaces = create_window_surfaces(&mut self.gr_context, window_context, size)?;
         let target_mode = desired_ink_mode(self.annotation_resources_enabled);
@@ -169,6 +196,7 @@ impl Compositor {
             return Ok(());
         }
         self.annotation_resources_enabled = enabled;
+        self.reset_graphics_on_next_resize = !enabled;
         self.release_preview_cache();
         self.preview_velocity.reset();
         self.preview_tile_size = BASE_PREVIEW_TILE_SIZE;
@@ -217,6 +245,9 @@ impl Compositor {
             self.preview_tile_size = BASE_PREVIEW_TILE_SIZE;
         }
 
+        if let Some(preview) = active_preview {
+            self.ink_cache.commit_deferred_erase_before_preview(preview);
+        }
         let mut ink_image = self.ink_cache.snapshot();
         let mut preview_composite = None;
         if active_preview.is_none() && self.ink_mode != InkAntialiasingMode::Off {
@@ -272,6 +303,7 @@ impl Compositor {
                 BlendMode::SrcOver,
             );
         }
+        self.ink_cache.draw_deferred_erase(canvas);
         if let Some(composite) = preview_composite {
             let origin = composite.origin;
             let size = composite.logical_size;
@@ -355,7 +387,17 @@ impl Compositor {
             .as_ref()
             .is_some_and(|cache| cache.config() != preview_config)
         {
-            self.release_preview_cache();
+            let replacement = InkPreviewCache::for_bounds(
+                &mut self.gr_context,
+                bounds,
+                logical_size,
+                self.preview_tile_size,
+                preview_config,
+                &mut self.preview_surface_pool,
+            )?;
+            if let Some(previous) = self.preview_cache.replace(replacement) {
+                previous.release(&mut self.preview_surface_pool);
+            }
         }
         if self.preview_cache.is_none() {
             self.preview_cache = Some(InkPreviewCache::for_bounds(
@@ -450,6 +492,30 @@ impl Compositor {
     pub fn invalidate_ink_region(&mut self, bounds: InkBounds) {
         self.ink_cache.invalidate_region(bounds);
     }
+}
+
+/// 返回现有批注 swap chain 是否足以覆盖新的可见客户区。
+fn can_reuse_annotation_capacity(
+    annotation_resources_enabled: bool,
+    current: winit::dpi::PhysicalSize<u32>,
+    requested: winit::dpi::PhysicalSize<u32>,
+) -> bool {
+    annotation_resources_enabled
+        && requested.width <= current.width
+        && requested.height <= current.height
+}
+
+/// 从窗口当前 D3D12 设备创建 Skia DirectContext。
+fn create_direct_context(window_context: &D3DWindowContext) -> Result<DirectContext, AppError> {
+    let backend_context = BackendContext {
+        adapter: window_context.adapter().clone(),
+        device: window_context.device().clone(),
+        queue: window_context.queue().clone(),
+        memory_allocator: None,
+        protected_context: Protected::No,
+    };
+    unsafe { gpu::direct_contexts::make_d3d(&backend_context, None) }
+        .ok_or_else(|| AppError::Graphics("无法创建 Skia D3D12 DirectContext".to_owned()))
 }
 
 /// 按请求模式创建持久墨迹和基础活动预览资源，增强失败时只回退到关闭模式。
@@ -552,5 +618,27 @@ mod tests {
     #[test]
     fn annotation_resource_mode_uses_fixed_supersample_quality() {
         assert_eq!(desired_ink_mode(true), InkAntialiasingMode::Supersample);
+    }
+
+    /// 验证批注 resize 只在两个维度都不超过当前容量时复用现有 surface。
+    #[test]
+    fn annotation_resize_reuses_only_sufficient_capacity() {
+        let current = winit::dpi::PhysicalSize::new(1920, 1080);
+
+        assert!(can_reuse_annotation_capacity(
+            true,
+            current,
+            winit::dpi::PhysicalSize::new(1600, 900),
+        ));
+        assert!(!can_reuse_annotation_capacity(
+            true,
+            current,
+            winit::dpi::PhysicalSize::new(2560, 1080),
+        ));
+        assert!(!can_reuse_annotation_capacity(
+            false,
+            current,
+            winit::dpi::PhysicalSize::new(1600, 900),
+        ));
     }
 }

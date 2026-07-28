@@ -17,4 +17,7 @@ pub enum AppError {
 
     #[error("系统级开机启动操作失败: {0}")]
     Autostart(String),
+
+    #[error("应用进程操作失败: {0}")]
+    Application(String),
 }

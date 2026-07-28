@@ -88,6 +88,11 @@ pub fn render_tool_preferences(
         readable_mode,
     );
     let mut command = color_command.or(pen_width_command);
+    let eraser_size_command =
+        render_eraser_size_selector(ui, tools.eraser_size, metrics, readable_mode);
+    if command.is_none() {
+        command = eraser_size_command;
+    }
     if show_speed_taper {
         ui.add_space(metrics.space_2);
         let mut speed_taper_enabled = tools.speed_taper_enabled;
@@ -101,11 +106,6 @@ pub fn render_tool_preferences(
         {
             command = Some(UiCommand::SetSpeedTaperEnabled(speed_taper_enabled));
         }
-    }
-    let eraser_size_command =
-        render_eraser_size_selector(ui, tools.eraser_size, metrics, readable_mode);
-    if command.is_none() {
-        command = eraser_size_command;
     }
     command
 }
@@ -248,7 +248,7 @@ fn render_eraser_size_selector(
 fn section_label(ui: &mut Ui, label: &str, metrics: InterfaceMetrics) {
     ui.label(
         egui::RichText::new(label)
-            .size(metrics.text_sm)
+            .size(metrics.option_text)
             .color(tokens::COLOR_TEXT_SECONDARY),
     );
 }
@@ -286,7 +286,7 @@ fn selection_button(
         Pos2::new(rect.center().x, rect.bottom() - metrics.space_3),
         Align2::CENTER_BOTTOM,
         label,
-        FontId::proportional(metrics.text_sm),
+        FontId::proportional(metrics.option_text),
         tokens::COLOR_TEXT_PRIMARY,
     );
     response

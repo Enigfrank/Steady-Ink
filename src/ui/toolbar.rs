@@ -37,6 +37,7 @@ pub enum UiCommand {
     Clear,
     OpenSettings,
     OpenSettingsDirectory,
+    RestartApplication,
     CloseSettings,
     ExitApplication,
     ToggleQuickSettings,
@@ -88,12 +89,8 @@ pub struct UiViewState<'a> {
     pub com_diagnostics: Option<&'a ComDiagnostics>,
     pub slideshow_connection_error: Option<&'a str>,
     pub slideshow_control_error: Option<&'a str>,
-    pub settings_error: Option<&'a str>,
-    pub recovery_error: Option<&'a str>,
-    pub settings_directory_error: Option<&'a str>,
     pub machine_autostart_state: Option<MachineAutostartState>,
     pub machine_autostart_error: Option<&'a str>,
-    pub settings_path: &'a std::path::Path,
     pub graphics_diagnostics: &'a GraphicsDiagnostics,
 }
 
@@ -692,6 +689,21 @@ fn draw_icon(
     );
 }
 
+/// 返回标准顺时针重启图标使用的开放圆弧采样点。
+fn restart_icon_arc(center: Pos2, half: f32) -> Vec<Pos2> {
+    const SEGMENT_COUNT: usize = 20;
+    let radius = half * 0.72;
+    let start_angle = 0.5_f32;
+    let sweep = std::f32::consts::TAU - 1.0;
+    (0..=SEGMENT_COUNT)
+        .map(|step| {
+            let progress = step as f32 / SEGMENT_COUNT as f32;
+            let angle = start_angle + sweep * progress;
+            center + egui::vec2(angle.cos() * radius, angle.sin() * radius)
+        })
+        .collect()
+}
+
 /// 按指定页面尺寸 profile 绘制共享线性图标。
 pub(super) fn paint_icon(
     ui: &Ui,
@@ -804,6 +816,19 @@ pub(super) fn paint_icon(
                 foreground,
                 Stroke::NONE,
             ));
+        }
+        Icon::Restart => {
+            let arc = restart_icon_arc(center, half);
+            let arrow_corner = *arc.last().expect("重启图标圆弧至少包含一个点");
+            painter.add(Shape::line(arc, stroke));
+            paint_line(
+                [arrow_corner + egui::vec2(0.0, -half * 0.45), arrow_corner],
+                stroke,
+            );
+            paint_line(
+                [arrow_corner, arrow_corner + egui::vec2(-half * 0.45, 0.0)],
+                stroke,
+            );
         }
         Icon::Clear => {
             let rect = Rect::from_center_size(
@@ -1063,6 +1088,7 @@ pub(super) enum Icon {
     Eraser,
     EraserSize,
     Undo,
+    Restart,
     Clear,
     Exit,
     Previous,
@@ -1074,4 +1100,26 @@ pub(super) enum Icon {
     Folder,
     Download,
     Power,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 验证重启图标保留明显缺口，不会退化为封闭圆圈。
+    #[test]
+    fn restart_icon_arc_remains_open() {
+        let arc = restart_icon_arc(Pos2::ZERO, 10.0);
+        let gap = arc
+            .first()
+            .expect("圆弧应有起点")
+            .distance(*arc.last().expect("圆弧应有终点"));
+
+        assert_eq!(arc.len(), 21);
+        assert!(gap > 5.0);
+        assert!(
+            arc.iter()
+                .all(|point| point.x.is_finite() && point.y.is_finite())
+        );
+    }
 }

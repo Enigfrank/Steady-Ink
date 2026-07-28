@@ -32,6 +32,11 @@ pub fn render(ui: &mut Ui, view: UiViewState<'_>) -> Option<UiCommand> {
 
             let mut command = render_header(ui, metrics, view.readable_mode);
             ui.add_space(metrics.space_3);
+            let action_command = render_action_bar(ui, metrics, view.readable_mode);
+            if command.is_none() {
+                command = action_command;
+            }
+            ui.add_space(metrics.space_3);
             ui.separator();
             ui.add_space(metrics.space_2);
 
@@ -52,41 +57,9 @@ pub fn render(ui: &mut Ui, view: UiViewState<'_>) -> Option<UiCommand> {
                     }
 
                     section_break(ui, metrics);
-                    section_heading(ui, "显示", metrics);
-                    let mut readable_mode = view.readable_mode;
-                    if ui
-                        .add_sized(
-                            [ui.available_width(), metrics.touch_target],
-                            egui::Checkbox::new(&mut readable_mode, "易读模式"),
-                        )
-                        .changed()
-                        && command.is_none()
-                    {
-                        command = Some(UiCommand::SetReadableMode(readable_mode));
-                    }
-                    let mut performance_monitoring_enabled =
-                        view.performance_monitoring_enabled;
-                    if ui
-                        .add_sized(
-                            [ui.available_width(), metrics.touch_target],
-                            egui::Checkbox::new(
-                                &mut performance_monitoring_enabled,
-                                "显示性能监控",
-                            ),
-                        )
-                        .changed()
-                        && command.is_none()
-                    {
-                        command = Some(UiCommand::SetPerformanceMonitoringEnabled(
-                            performance_monitoring_enabled,
-                        ));
-                    }
-                    if let Some(error) = view.ink_rendering_error {
-                        ui.label(
-                            egui::RichText::new(error)
-                                .size(metrics.text_xs)
-                                .color(tokens::COLOR_ERROR),
-                        );
+                    let display_command = render_display_settings(ui, view, metrics);
+                    if command.is_none() {
+                        command = display_command;
                     }
 
                     section_break(ui, metrics);
@@ -144,29 +117,10 @@ pub fn render(ui: &mut Ui, view: UiViewState<'_>) -> Option<UiCommand> {
                             if command.is_none() {
                                 command = diagnostics_command;
                             }
-                            ui.add_space(metrics.space_4);
-                            diagnostic_row(
-                                ui,
-                                "版本",
-                                env!("CARGO_PKG_VERSION"),
-                                tokens::COLOR_TEXT_PRIMARY,
-                                metrics,
-                            );
-                            diagnostic_row(
-                                ui,
-                                "应用",
-                                "Steady Ink",
-                                tokens::COLOR_TEXT_PRIMARY,
-                                metrics,
-                            );
                         });
 
                     section_break(ui, metrics);
-                    section_heading(ui, "应用操作", metrics);
-                    let action_command = render_action_bar(ui, metrics, view.readable_mode);
-                    if command.is_none() {
-                        command = action_command;
-                    }
+                    render_settings_footer(ui, metrics);
                     ui.add_space(metrics.space_2);
                 });
             command
@@ -194,7 +148,54 @@ fn render_header(ui: &mut Ui, metrics: InterfaceMetrics, readable_mode: bool) ->
     command
 }
 
-/// 绘制配置目录和退出软件组成的顶部等宽操作栏。
+/// 绘制同一行内两个等宽显示开关，并仅在异常时追加错误信息。
+fn render_display_settings(
+    ui: &mut Ui,
+    view: UiViewState<'_>,
+    metrics: InterfaceMetrics,
+) -> Option<UiCommand> {
+    section_heading(ui, "显示", metrics);
+    let mut readable_mode = view.readable_mode;
+    let mut performance_monitoring_enabled = view.performance_monitoring_enabled;
+    let mut command = None;
+    ui.scope(|ui| {
+        ui.spacing_mut().interact_size.y = metrics.touch_target;
+        ui.horizontal(|ui| {
+            let option_width = equal_row_item_width(ui.available_width(), 2, metrics.space_2);
+            if ui
+                .add_sized(
+                    [option_width, metrics.touch_target],
+                    egui::Checkbox::new(&mut readable_mode, "易读模式"),
+                )
+                .changed()
+            {
+                command = Some(UiCommand::SetReadableMode(readable_mode));
+            }
+            if ui
+                .add_sized(
+                    [option_width, metrics.touch_target],
+                    egui::Checkbox::new(&mut performance_monitoring_enabled, "显示性能监控"),
+                )
+                .changed()
+                && command.is_none()
+            {
+                command = Some(UiCommand::SetPerformanceMonitoringEnabled(
+                    performance_monitoring_enabled,
+                ));
+            }
+        });
+    });
+    if let Some(error) = view.ink_rendering_error {
+        ui.label(
+            egui::RichText::new(error)
+                .size(metrics.text_xs)
+                .color(tokens::COLOR_ERROR),
+        );
+    }
+    command
+}
+
+/// 绘制配置目录、重启和退出组成的顶部等宽操作栏。
 fn render_action_bar(
     ui: &mut Ui,
     metrics: InterfaceMetrics,
@@ -202,41 +203,38 @@ fn render_action_bar(
 ) -> Option<UiCommand> {
     let mut command = None;
     ui.horizontal(|ui| {
-        let button_width = equal_action_button_width(ui.available_width(), metrics);
-        if settings_action_button(
-            ui,
-            "打开配置文件",
-            Icon::Folder,
-            SettingsActionStyle::Neutral,
-            button_width,
-            metrics,
-            readable_mode,
-        )
-        .clicked()
-        {
-            command = Some(UiCommand::OpenSettingsDirectory);
-        }
-        if settings_action_button(
-            ui,
-            "退出软件",
-            Icon::Power,
-            SettingsActionStyle::Danger,
-            button_width,
-            metrics,
-            readable_mode,
-        )
-        .clicked()
-            && command.is_none()
-        {
-            command = Some(UiCommand::ExitApplication);
+        let button_width = equal_row_item_width(
+            ui.available_width(),
+            SETTINGS_ACTIONS.len(),
+            metrics.space_2,
+        );
+        for action in SETTINGS_ACTIONS {
+            if settings_action_button(
+                ui,
+                action.label,
+                action.icon,
+                action.style,
+                button_width,
+                metrics,
+                readable_mode,
+            )
+            .clicked()
+                && command.is_none()
+            {
+                command = Some(action.command);
+            }
         }
     });
     command
 }
 
-/// 计算同一行两个设置操作按钮平分空间后的稳定宽度。
-fn equal_action_button_width(available_width: f32, metrics: InterfaceMetrics) -> f32 {
-    ((available_width - metrics.space_2) / 2.0).max(0.0)
+/// 计算固定数量控件扣除统一间距后平分一行的稳定宽度。
+fn equal_row_item_width(available_width: f32, item_count: usize, gap: f32) -> f32 {
+    if item_count == 0 {
+        return 0.0;
+    }
+    let gap_width = item_count.saturating_sub(1) as f32 * gap;
+    ((available_width - gap_width) / item_count as f32).max(0.0)
 }
 
 /// 绘制图标和文字横向排列的设置页长条操作按钮。
@@ -334,44 +332,61 @@ fn render_machine_autostart_setting(
     section_heading(ui, "启动", metrics);
     let Some(state) = view.machine_autostart_state else {
         let mut disabled = false;
-        ui.add_enabled(
-            false,
-            egui::Checkbox::new(&mut disabled, "为所有用户开机启动"),
-        );
+        ui.scope(|ui| {
+            ui.spacing_mut().interact_size.y = metrics.touch_target;
+            ui.horizontal(|ui| {
+                ui.add_enabled(
+                    false,
+                    egui::Checkbox::new(&mut disabled, "为所有用户开机启动"),
+                );
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.label(
+                        egui::RichText::new("无法读取")
+                            .size(metrics.text_xs)
+                            .color(tokens::COLOR_ERROR),
+                    );
+                });
+            });
+        });
+        ui.add_space(metrics.space_1);
         ui.label(
-            egui::RichText::new("无法读取系统级启动状态，请重新打开设置后重试。")
-                .size(metrics.text_xs)
-                .color(tokens::COLOR_ERROR),
+            egui::RichText::new(
+                view.machine_autostart_error
+                    .unwrap_or("无法读取系统级启动状态，请重新打开设置后重试。"),
+            )
+            .size(metrics.text_xs)
+            .color(tokens::COLOR_ERROR),
         );
-        if let Some(error) = view.machine_autostart_error {
-            ui.label(
-                egui::RichText::new(error)
-                    .size(metrics.text_xs)
-                    .color(tokens::COLOR_ERROR),
-            );
-        }
         return None;
     };
 
     let mut enabled = state.enabled();
+    let status_color = if matches!(state, MachineAutostartState::EnabledPathMismatch) {
+        tokens::COLOR_ERROR
+    } else {
+        tokens::COLOR_TEXT_SECONDARY
+    };
     let changed = ui
-        .add_sized(
-            [ui.available_width(), metrics.touch_target],
-            egui::Checkbox::new(&mut enabled, "为所有用户开机启动"),
-        )
-        .changed();
-    ui.label(
-        egui::RichText::new(state.label())
-            .size(metrics.text_xs)
-            .color(
-                if matches!(state, MachineAutostartState::EnabledPathMismatch) {
-                    tokens::COLOR_ERROR
-                } else {
-                    tokens::COLOR_TEXT_SECONDARY
-                },
-            ),
-    );
+        .scope(|ui| {
+            ui.spacing_mut().interact_size.y = metrics.touch_target;
+            ui.horizontal(|ui| {
+                let changed = ui
+                    .add(egui::Checkbox::new(&mut enabled, "为所有用户开机启动"))
+                    .changed();
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.label(
+                        egui::RichText::new(state.label())
+                            .size(metrics.text_xs)
+                            .color(status_color),
+                    );
+                });
+                changed
+            })
+            .inner
+        })
+        .inner;
     if let Some(error) = view.machine_autostart_error {
+        ui.add_space(metrics.space_1);
         ui.label(
             egui::RichText::new(error)
                 .size(metrics.text_xs)
@@ -379,6 +394,27 @@ fn render_machine_autostart_setting(
         );
     }
     changed.then_some(UiCommand::SetMachineAutostart(enabled))
+}
+
+/// 绘制由 Cargo 包元数据生成的设置页版权信息。
+fn render_settings_footer(ui: &mut Ui, metrics: InterfaceMetrics) {
+    ui.with_layout(Layout::top_down(Align::Center), |ui| {
+        ui.label(
+            egui::RichText::new(settings_footer_text())
+                .size(metrics.text_xs)
+                .color(tokens::COLOR_TEXT_TERTIARY),
+        );
+    });
+}
+
+/// 返回不重复维护版本、作者和许可证的版权文案。
+fn settings_footer_text() -> String {
+    format!(
+        "Steady Ink v{} · © 2026 {} · {}",
+        env!("CARGO_PKG_VERSION"),
+        env!("CARGO_PKG_AUTHORS"),
+        env!("CARGO_PKG_LICENSE")
+    )
 }
 
 /// 绘制设置页各部分的层级标题并保留舒适的标题后间距。
@@ -452,46 +488,6 @@ fn render_diagnostics(
         },
         metrics,
     );
-    diagnostic_row(
-        ui,
-        "设置文件",
-        &view.settings_path.display().to_string(),
-        tokens::COLOR_TEXT_PRIMARY,
-        metrics,
-    );
-    diagnostic_row(
-        ui,
-        "设置保存",
-        view.settings_error.unwrap_or("正常"),
-        if view.settings_error.is_some() {
-            tokens::COLOR_ERROR
-        } else {
-            tokens::COLOR_TEXT_PRIMARY
-        },
-        metrics,
-    );
-    diagnostic_row(
-        ui,
-        "墨迹恢复",
-        view.recovery_error.unwrap_or("正常"),
-        if view.recovery_error.is_some() {
-            tokens::COLOR_ERROR
-        } else {
-            tokens::COLOR_TEXT_PRIMARY
-        },
-        metrics,
-    );
-    diagnostic_row(
-        ui,
-        "目录操作",
-        view.settings_directory_error.unwrap_or("正常"),
-        if view.settings_directory_error.is_some() {
-            tokens::COLOR_ERROR
-        } else {
-            tokens::COLOR_TEXT_PRIMARY
-        },
-        metrics,
-    );
     let (autostart_status, autostart_color) = match view.machine_autostart_state {
         Some(state) => (
             state.label(),
@@ -504,17 +500,6 @@ fn render_diagnostics(
         None => ("无法读取", tokens::COLOR_ERROR),
     };
     diagnostic_row(ui, "系统自启动", autostart_status, autostart_color, metrics);
-    diagnostic_row(
-        ui,
-        "自启动诊断",
-        view.machine_autostart_error.unwrap_or("正常"),
-        if view.machine_autostart_error.is_some() {
-            tokens::COLOR_ERROR
-        } else {
-            tokens::COLOR_TEXT_PRIMARY
-        },
-        metrics,
-    );
     let performance_summary = if view.performance_snapshot.frame_count() == 0 {
         "等待样本".to_owned()
     } else {
@@ -641,4 +626,94 @@ fn diagnostic_row(
 enum SettingsActionStyle {
     Neutral,
     Danger,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SettingsAction {
+    label: &'static str,
+    icon: Icon,
+    style: SettingsActionStyle,
+    command: UiCommand,
+}
+
+const SETTINGS_ACTIONS: [SettingsAction; 3] = [
+    SettingsAction {
+        label: "打开配置文件",
+        icon: Icon::Folder,
+        style: SettingsActionStyle::Neutral,
+        command: UiCommand::OpenSettingsDirectory,
+    },
+    SettingsAction {
+        label: "重启应用",
+        icon: Icon::Restart,
+        style: SettingsActionStyle::Neutral,
+        command: UiCommand::RestartApplication,
+    },
+    SettingsAction {
+        label: "退出应用",
+        icon: Icon::Power,
+        style: SettingsActionStyle::Danger,
+        command: UiCommand::ExitApplication,
+    },
+];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 验证顶部操作栏的顺序和命令映射保持稳定。
+    #[test]
+    fn settings_actions_have_expected_order_and_commands() {
+        let labels = SETTINGS_ACTIONS.map(|action| action.label);
+        let commands = SETTINGS_ACTIONS.map(|action| action.command);
+
+        assert_eq!(labels, ["打开配置文件", "重启应用", "退出应用"]);
+        assert_eq!(
+            commands,
+            [
+                UiCommand::OpenSettingsDirectory,
+                UiCommand::RestartApplication,
+                UiCommand::ExitApplication,
+            ]
+        );
+    }
+
+    /// 验证三个操作按钮扣除两段网格间距后恰好填满可用宽度。
+    #[test]
+    fn three_action_buttons_fill_available_width() {
+        let available_width = 528.0;
+        let gap = tokens::SETTINGS_METRICS.space_2;
+        let width = equal_row_item_width(available_width, SETTINGS_ACTIONS.len(), gap);
+
+        assert_eq!(
+            width * SETTINGS_ACTIONS.len() as f32 + gap * 2.0,
+            available_width
+        );
+    }
+
+    /// 验证设置选项行使用完整触摸高度且双列仍精确填满可用宽度。
+    #[test]
+    fn setting_option_rows_use_full_touch_target() {
+        let metrics = tokens::SETTINGS_METRICS;
+        let option_width = equal_row_item_width(528.0, 2, metrics.space_2);
+
+        assert_eq!(metrics.action_button_height, 48.0);
+        assert_eq!(metrics.touch_target, 64.0);
+        assert!(metrics.touch_target > metrics.action_button_height);
+        assert_eq!(option_width * 2.0 + metrics.space_2, 528.0);
+    }
+
+    /// 验证页尾从 Cargo 元数据生成已确认的完整版权文案。
+    #[test]
+    fn footer_uses_package_metadata() {
+        assert_eq!(
+            settings_footer_text(),
+            format!(
+                "Steady Ink v{} · © 2026 {} · {}",
+                env!("CARGO_PKG_VERSION"),
+                env!("CARGO_PKG_AUTHORS"),
+                env!("CARGO_PKG_LICENSE")
+            )
+        );
+    }
 }

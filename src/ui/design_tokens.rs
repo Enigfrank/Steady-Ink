@@ -1,4 +1,4 @@
-use egui::{Color32, CornerRadius, Frame, Margin, Response, Stroke, Ui};
+use egui::{Color32, CornerRadius, FontId, Frame, Margin, Response, Stroke, TextStyle, Ui};
 
 pub const INTERFACE_SCALE: f64 = 0.8;
 pub const TOOLBAR_ZOOM_FACTOR: f32 = INTERFACE_SCALE as f32;
@@ -33,6 +33,7 @@ pub struct InterfaceMetrics {
     pub text_xs: f32,
     pub text_sm: f32,
     pub text_base: f32,
+    pub option_text: f32,
     pub text_lg: f32,
     pub text_xl: f32,
     pub space_1: f32,
@@ -58,6 +59,7 @@ impl InterfaceMetrics {
             text_xs: 12.0 * scale,
             text_sm: 14.0 * scale,
             text_base: 16.0 * scale,
+            option_text: 14.0 * scale,
             text_lg: 20.0 * scale,
             text_xl: 24.0 * scale,
             space_1: 4.0 * scale,
@@ -83,7 +85,10 @@ impl InterfaceMetrics {
 }
 
 pub const TOOL_METRICS: InterfaceMetrics = InterfaceMetrics::from_scale(1.0);
-pub const SETTINGS_METRICS: InterfaceMetrics = InterfaceMetrics::from_scale(1.0);
+pub const SETTINGS_METRICS: InterfaceMetrics = InterfaceMetrics {
+    option_text: 16.0,
+    ..InterfaceMetrics::from_scale(1.0)
+};
 
 pub const COLOR_TEXT_PRIMARY: Color32 = Color32::from_rgb(17, 24, 39);
 pub const COLOR_TEXT_SECONDARY: Color32 = Color32::from_rgb(107, 114, 128);
@@ -241,14 +246,35 @@ pub fn apply_widget_style(ui: &mut Ui, readable_mode: bool, role: MaterialRole) 
     visuals.widgets.open.bg_fill = palette.selected;
 }
 
-/// 应用设置页的未缩放布局间距和当前外观模式的控件表面。
+/// 应用设置页的放大选项尺寸、布局间距和当前外观模式控件表面。
 pub fn apply_settings_widget_style(ui: &mut Ui, readable_mode: bool) {
-    let spacing = &mut ui.style_mut().spacing;
+    let style = ui.style_mut();
+    let spacing = &mut style.spacing;
     spacing.window_margin = egui::Margin::same(SETTINGS_METRICS.margin_space_2);
     spacing.menu_margin = egui::Margin::same(SETTINGS_METRICS.margin_space_2);
     spacing.item_spacing = egui::vec2(SETTINGS_METRICS.space_2, SETTINGS_METRICS.space_2);
     spacing.button_padding = egui::vec2(SETTINGS_METRICS.space_2, SETTINGS_METRICS.space_1);
+    spacing.interact_size.y = SETTINGS_METRICS.touch_target;
+    spacing.icon_width = SETTINGS_METRICS.icon_size;
+    spacing.icon_width_inner = SETTINGS_METRICS.space_3;
+    spacing.icon_spacing = SETTINGS_METRICS.space_2;
+    for text_style in [TextStyle::Body, TextStyle::Button] {
+        style.text_styles.insert(
+            text_style,
+            FontId::proportional(SETTINGS_METRICS.option_text),
+        );
+    }
     apply_widget_style(ui, readable_mode, MaterialRole::Page);
+    let control_border = Stroke::new(
+        1.0,
+        material_palette(readable_mode, MaterialRole::Control).border,
+    );
+    let widgets = &mut ui.style_mut().visuals.widgets;
+    widgets.noninteractive.bg_stroke = control_border;
+    widgets.inactive.bg_stroke = control_border;
+    widgets.hovered.bg_stroke = control_border;
+    widgets.active.bg_stroke = control_border;
+    widgets.open.bg_stroke = control_border;
 }
 
 /// 返回工具界面的原始 egui 逻辑点；显示缩放由 Context zoom 统一处理。
@@ -268,7 +294,7 @@ const fn scaled_integer(value: u8, scale: f32) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use super::{MaterialRole, material_palette};
+    use super::{MaterialRole, SETTINGS_METRICS, TOOL_METRICS, material_palette};
 
     #[test]
     fn readable_mode_uses_opaque_surfaces() {
@@ -284,5 +310,14 @@ mod tests {
 
         assert!(palette.fill.a() < u8::MAX);
         assert_ne!(palette.selected, palette.fill);
+    }
+
+    /// 验证只放大设置页选项文字，不改变工具界面的共享尺寸。
+    #[test]
+    fn settings_options_use_larger_text_than_tool_options() {
+        assert_eq!(TOOL_METRICS.option_text, 14.0);
+        assert_eq!(SETTINGS_METRICS.option_text, 16.0);
+        assert_eq!(SETTINGS_METRICS.icon_size, 20.0);
+        assert_eq!(SETTINGS_METRICS.touch_target, 64.0);
     }
 }

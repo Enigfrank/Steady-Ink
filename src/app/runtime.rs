@@ -1,4 +1,5 @@
 use std::{
+    process::Command,
     sync::{
         Arc, OnceLock,
         atomic::{AtomicBool, Ordering},
@@ -47,6 +48,13 @@ enum UserEvent {
     WindowsPointer,
     Render,
     Recovery,
+}
+
+/// 区分用户请求的普通退出和完成清理后重启。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApplicationExitAction {
+    Exit,
+    Restart,
 }
 
 /// 当前尚未提交为墨迹 operation 的单次指针手势。
@@ -230,9 +238,7 @@ struct DesktopRuntime {
     slideshow_detector: ComDetector,
     settings_store: SettingsStore,
     settings: UserSettings,
-    settings_error: Option<String>,
     recovery_error: Option<String>,
-    settings_directory_error: Option<String>,
     performance_export_status: Option<String>,
     performance_export_failed: bool,
     pending_performance_input: Option<Instant>,
@@ -259,11 +265,11 @@ impl DesktopRuntime {
         palm_size_preset: SharedPalmSizePreset,
     ) -> Result<Self, AppError> {
         let settings_store = SettingsStore::new()?;
-        let (settings, settings_error) = match settings_store.load() {
-            Ok(settings) => (settings, None),
+        let settings = match settings_store.load() {
+            Ok(settings) => settings,
             Err(error) => {
                 tracing::warn!(%error, "读取设置失败，使用默认值");
-                (UserSettings::default(), Some(error.to_string()))
+                UserSettings::default()
             }
         };
         let (machine_autostart_state, machine_autostart_error) = load_machine_autostart_state();
@@ -319,9 +325,7 @@ impl DesktopRuntime {
             slideshow_detector,
             settings_store,
             settings,
-            settings_error,
             recovery_error,
-            settings_directory_error: None,
             performance_export_status: None,
             performance_export_failed: false,
             pending_performance_input: None,
@@ -461,8 +465,8 @@ impl DesktopRuntime {
         }
     }
 
-    /// 运行 UI、合成 Skia 与 egui，并返回本帧是否请求退出应用。
-    fn render(&mut self) -> Result<bool, AppError> {
+    /// 运行 UI、合成 Skia 与 egui，并返回本帧产生的应用退出动作。
+    fn render(&mut self) -> Result<Option<ApplicationExitAction>, AppError> {
         let mode = self.state.mode();
         let tools = self.tools;
         let slideshow_controls_enabled = self.state.slideshow_controls_enabled();
@@ -504,12 +508,8 @@ impl DesktopRuntime {
             com_diagnostics: self.com_diagnostics.as_ref(),
             slideshow_connection_error: self.slideshow_connection_error.as_deref(),
             slideshow_control_error: self.slideshow_control_error.as_deref(),
-            settings_error: self.settings_error.as_deref(),
-            recovery_error: self.recovery_error.as_deref(),
-            settings_directory_error: self.settings_directory_error.as_deref(),
             machine_autostart_state: self.machine_autostart_state,
             machine_autostart_error: self.machine_autostart_error.as_deref(),
-            settings_path: self.settings_store.path(),
             graphics_diagnostics: self.render_thread.diagnostics(),
         };
         let mut ui_command = None;
@@ -538,23 +538,24 @@ impl DesktopRuntime {
             performance,
         });
 
-        let exit_requested = if let Some(command) = ui_command {
+        let exit_action = if let Some(command) = ui_command {
             let previous_state = self.state.clone();
-            let exit_requested = self.apply_ui_command(command);
+            let exit_action = self.apply_ui_command(command);
             if self.state != previous_state {
                 self.queue_recovery();
             }
-            exit_requested
+            exit_action
         } else {
-            false
+            None
         };
-        Ok(exit_requested)
+        Ok(exit_action)
     }
 
-    /// 执行工具栏命令，并返回该命令是否要求事件循环退出。
-    fn apply_ui_command(&mut self, command: UiCommand) -> bool {
+    /// 执行工具栏命令，并返回普通退出或重启动作。
+    fn apply_ui_command(&mut self, command: UiCommand) -> Option<ApplicationExitAction> {
         match command {
-            UiCommand::ExitApplication => return true,
+            UiCommand::ExitApplication => return Some(ApplicationExitAction::Exit),
+            UiCommand::RestartApplication => return Some(ApplicationExitAction::Restart),
             UiCommand::EnterAnnotation => {
                 if self.state.enter_normal_annotation() {
                     self.prepare_annotation_transition(true);
@@ -621,13 +622,11 @@ impl DesktopRuntime {
                     self.update_interface_zoom();
                 }
             }
-            UiCommand::OpenSettingsDirectory => match self.settings_store.open_directory() {
-                Ok(()) => self.settings_directory_error = None,
-                Err(error) => {
+            UiCommand::OpenSettingsDirectory => {
+                if let Err(error) = self.settings_store.open_directory() {
                     tracing::warn!(%error, "打开配置目录失败");
-                    self.settings_directory_error = Some(error.to_string());
                 }
-            },
+            }
             UiCommand::SetMachineAutostart(enabled) => {
                 self.set_machine_autostart(enabled);
             }
@@ -725,17 +724,13 @@ impl DesktopRuntime {
             }
         }
         self.request_redraw();
-        false
+        None
     }
 
-    /// 保存当前用户偏好，并把失败信息留给设置诊断界面。
+    /// 保存当前用户偏好，并把失败记录到应用日志。
     fn save_settings(&mut self) {
-        match self.settings_store.save(&self.settings) {
-            Ok(()) => self.settings_error = None,
-            Err(error) => {
-                tracing::warn!(%error, "保存设置失败");
-                self.settings_error = Some(error.to_string());
-            }
+        if let Err(error) = self.settings_store.save(&self.settings) {
+            tracing::warn!(%error, "保存设置失败");
         }
     }
 
@@ -1066,7 +1061,7 @@ struct DesktopApplication {
     runtime: Option<DesktopRuntime>,
     startup_error: Option<AppError>,
     next_repaint: Option<Instant>,
-    clean_exit_requested: bool,
+    exit_action: Option<ApplicationExitAction>,
 }
 
 impl DesktopApplication {
@@ -1085,7 +1080,7 @@ impl DesktopApplication {
             runtime: None,
             startup_error: None,
             next_repaint: None,
-            clean_exit_requested: false,
+            exit_action: None,
         }
     }
 
@@ -1164,7 +1159,7 @@ impl ApplicationHandler<UserEvent> for DesktopApplication {
             return;
         }
         if matches!(event, WindowEvent::CloseRequested) {
-            self.clean_exit_requested = true;
+            self.exit_action = Some(ApplicationExitAction::Exit);
             event_loop.exit();
             return;
         }
@@ -1176,11 +1171,11 @@ impl ApplicationHandler<UserEvent> for DesktopApplication {
         if matches!(event, WindowEvent::RedrawRequested) {
             self.next_repaint = None;
             match runtime.render() {
-                Ok(true) => {
-                    self.clean_exit_requested = true;
+                Ok(Some(exit_action)) => {
+                    self.exit_action = Some(exit_action);
                     event_loop.exit();
                 }
-                Ok(false) => self.update_control_flow(event_loop),
+                Ok(None) => self.update_control_flow(event_loop),
                 Err(error) => {
                     self.startup_error = Some(error);
                     event_loop.exit();
@@ -1267,11 +1262,41 @@ impl ApplicationHandler<UserEvent> for DesktopApplication {
     /// 退出事件循环时按退出原因处理恢复文件并停止渲染线程。
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
         if let Some(runtime) = self.runtime.as_mut()
-            && let Err(error) = runtime.shutdown(self.clean_exit_requested)
+            && let Err(error) = runtime.shutdown(self.exit_action.is_some())
         {
             self.startup_error = Some(error);
         }
     }
+}
+
+/// 启动当前可执行文件的新实例，并转发原始命令行参数。
+fn restart_current_executable() -> Result<(), AppError> {
+    let executable = std::env::current_exe().map_err(|error| {
+        AppError::Application(format!("无法定位当前可执行文件，不能重启: {error}"))
+    })?;
+    let child = Command::new(&executable)
+        .args(std::env::args_os().skip(1))
+        .spawn()
+        .map_err(|error| {
+            AppError::Application(format!("启动 {} 失败: {error}", executable.display()))
+        })?;
+    tracing::info!(
+        path = %executable.display(),
+        process_id = child.id(),
+        "已启动 Steady Ink 重启实例"
+    );
+    Ok(())
+}
+
+/// 在运行或关闭无错误时判断是否需要启动重启实例。
+fn restart_required_after_run(
+    exit_action: Option<ApplicationExitAction>,
+    runtime_error: Option<AppError>,
+) -> Result<bool, AppError> {
+    if let Some(error) = runtime_error {
+        return Err(error);
+    }
+    Ok(exit_action == Some(ApplicationExitAction::Restart))
 }
 
 /// 创建 Windows 用户事件循环并运行单窗口应用。
@@ -1308,7 +1333,13 @@ pub fn run() -> Result<(), AppError> {
         palm_size_preset,
     );
     event_loop.run_app(&mut application)?;
-    application.startup_error.map_or(Ok(()), Err)
+    let exit_action = application.exit_action;
+    let runtime_error = application.startup_error.take();
+    drop(application);
+    if restart_required_after_run(exit_action, runtime_error)? {
+        restart_current_executable()?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1329,6 +1360,32 @@ mod tests {
     fn invalid_pixels_per_point_has_no_egui_position() {
         assert!(egui_position_from_physical(CanvasPoint::new(1.0, 1.0), 0.0).is_none());
         assert!(egui_position_from_physical(CanvasPoint::new(1.0, 1.0), f32::NAN).is_none());
+    }
+
+    /// 验证只有显式重启动作会在成功关闭后请求拉起新实例。
+    #[test]
+    fn restart_requires_explicit_restart_action() {
+        assert!(
+            restart_required_after_run(Some(ApplicationExitAction::Restart), None)
+                .expect("成功关闭后应接受重启动作")
+        );
+        assert!(
+            !restart_required_after_run(Some(ApplicationExitAction::Exit), None)
+                .expect("普通退出应保持成功")
+        );
+        assert!(!restart_required_after_run(None, None).expect("异常退出路径不应伪造重启"));
+    }
+
+    /// 验证运行或关闭错误优先返回并阻止已经记录的重启动作。
+    #[test]
+    fn runtime_error_prevents_restart() {
+        let error = restart_required_after_run(
+            Some(ApplicationExitAction::Restart),
+            Some(AppError::Application("关闭失败".to_owned())),
+        )
+        .expect_err("关闭失败时不得启动新实例");
+
+        assert_eq!(error.to_string(), "应用进程操作失败: 关闭失败");
     }
 
     /// 验证批量追加复用最小距离去重，不保留驱动重叠点。

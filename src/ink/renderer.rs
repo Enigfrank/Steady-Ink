@@ -50,7 +50,7 @@ const ERASE_RADIUS_EPSILON: f32 = 0.01;
 const PALM_INTERPOLATION_STEP_FRACTION: f32 = 0.75;
 const PALM_INTERPOLATION_MIN_STEP: f32 = 4.0;
 const PALM_INTERPOLATION_MAX_STEP: f32 = 24.0;
-const SUPER_SAMPLE_SCALE: f32 = 1.5;
+const SUPER_SAMPLE_SCALE: f32 = 2.0;
 const MAX_INCREMENTAL_REBUILD_AREA_RATIO: f32 = 0.1;
 
 /// 描述墨迹离屏 surface 的逻辑尺寸、渲染尺寸和实际多采样配置。
@@ -81,6 +81,20 @@ impl InkSurfaceConfig {
                 sample_count: 0,
             },
         }
+    }
+
+    /// 创建仅供活动预览使用的 MSAA 配置，支持内部 2x/4x 动态采样。
+    pub(crate) const fn for_msaa_samples(sample_count: usize) -> Self {
+        Self {
+            mode: InkAntialiasingMode::Msaa,
+            render_scale: 1.0,
+            sample_count,
+        }
+    }
+
+    /// 返回合成到逻辑画布时是否必须线性缩小高分辨率图像。
+    pub(crate) const fn requires_linear_sampling(self) -> bool {
+        self.render_scale > 1.0
     }
 
     /// 计算向上取整后的实际 GPU 尺寸，拒绝超出 Skia `i32` 范围的请求。
@@ -785,6 +799,11 @@ impl InkPreviewCache {
     pub(crate) const fn render_size(&self) -> [u32; 2] {
         self.render_size
     }
+
+    /// 返回预览 surface 的精确池化配置。
+    pub(crate) const fn config(&self) -> InkSurfaceConfig {
+        self.config
+    }
 }
 
 /// 计算覆盖活动 bounds 的自适应分块区域，并裁剪到窗口尺寸内。
@@ -1120,7 +1139,7 @@ mod tests {
         assert!((0.0..std::f32::consts::PI).contains(&interpolated.rotation_radians));
     }
 
-    /// 验证三档设置映射到固定倍率和 sample count。
+    /// 验证内部 surface 模式映射到固定倍率和 sample count。
     #[test]
     fn surface_config_keeps_the_requested_quality_contract() {
         let off = InkSurfaceConfig::for_mode(InkAntialiasingMode::Off);
@@ -1132,7 +1151,18 @@ mod tests {
         assert_eq!(msaa.sample_count, 4);
 
         let supersample = InkSurfaceConfig::for_mode(InkAntialiasingMode::Supersample);
-        assert_eq!(supersample.render_size([1919, 1079]), Some([2879, 1619]));
+        assert_eq!(supersample.render_size([1919, 1079]), Some([3838, 2158]));
+        assert!(supersample.requires_linear_sampling());
+    }
+
+    /// 验证内部 MSAA 2x 只改变样本数，不改变逻辑渲染倍率。
+    #[test]
+    fn preview_msaa_two_uses_exact_sample_count() {
+        let config = InkSurfaceConfig::for_msaa_samples(2);
+
+        assert_eq!(config.mode, InkAntialiasingMode::Msaa);
+        assert_eq!(config.sample_count, 2);
+        assert_eq!(config.render_size([512, 512]), Some([512, 512]));
     }
 
     /// 验证超采样尺寸始终向上取整且不接受无法表示的尺寸。

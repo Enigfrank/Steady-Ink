@@ -14,7 +14,7 @@ use crate::{
     app::AppMode,
     autostart::MachineAutostartState,
     ink::{EraserSize, InkColor, InkTool, PenWidth},
-    settings::{InkAntialiasingMode, LogLevel},
+    settings::LogLevel,
     slideshow::ComDiagnostics,
     window::{DockSide, GraphicsDiagnostics},
 };
@@ -31,7 +31,6 @@ pub enum UiCommand {
     SetPenWidth(PenWidth),
     SetEraserSize(EraserSize),
     SetSpeedTaperEnabled(bool),
-    SetInkAntialiasing(InkAntialiasingMode),
     Undo,
     Clear,
     OpenSettings,
@@ -72,7 +71,6 @@ pub struct UiViewState<'a> {
     pub slideshow_integration_enabled: bool,
     pub log_level: LogLevel,
     pub readable_mode: bool,
-    pub ink_antialiasing: InkAntialiasingMode,
     pub ink_rendering_error: Option<&'a str>,
     pub slideshow_session_generation: Option<u64>,
     pub slide_page_numbers: Option<(u32, u32)>,
@@ -126,7 +124,7 @@ impl ToolbarInteraction {
 }
 
 impl Default for ToolState {
-    /// 返回已确认的默认画笔、红色、4pt 和 48px 配置。
+    /// 返回已确认的默认画笔、红色、4px 和 48px 配置。
     fn default() -> Self {
         Self {
             tool: InkTool::default(),
@@ -994,10 +992,10 @@ pub(super) fn paint_icon(
 /// 返回画笔粗细按钮使用的紧凑标签。
 pub(super) const fn pen_width_label(width: PenWidth) -> &'static str {
     match width {
-        PenWidth::Px4 => "4pt",
-        PenWidth::Px8 => "8pt",
-        PenWidth::Px16 => "16pt",
-        PenWidth::Px24 => "24pt",
+        PenWidth::Px4 => "4px",
+        PenWidth::Px6 => "6px",
+        PenWidth::Px8 => "8px",
+        PenWidth::Px16 => "16px",
     }
 }
 

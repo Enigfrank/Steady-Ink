@@ -7,7 +7,7 @@ use super::{
 };
 use crate::{
     ink::{EraserSize, InkColor, PenWidth},
-    settings::{InkAntialiasingMode, LogLevel},
+    settings::LogLevel,
 };
 
 const COLORS: [InkColor; 6] = [
@@ -18,7 +18,7 @@ const COLORS: [InkColor; 6] = [
     InkColor::Black,
     InkColor::White,
 ];
-const PEN_WIDTHS: [PenWidth; 4] = [PenWidth::Px4, PenWidth::Px8, PenWidth::Px16, PenWidth::Px24];
+const PEN_WIDTHS: [PenWidth; 4] = [PenWidth::Px4, PenWidth::Px6, PenWidth::Px8, PenWidth::Px16];
 const ERASER_SIZES: [EraserSize; 3] = [EraserSize::Px24, EraserSize::Px48, EraserSize::Px72];
 
 /// 颜色和画笔粗细选择项在不同界面中的排列方向。
@@ -107,30 +107,6 @@ pub fn render_tool_preferences(
     if command.is_none() {
         command = eraser_size_command;
     }
-    command
-}
-
-/// 绘制完整设置页的三档墨迹抗锯齿选择，并返回当前帧的模式命令。
-pub(super) fn render_ink_antialiasing_selector(
-    ui: &mut Ui,
-    selected: InkAntialiasingMode,
-    metrics: InterfaceMetrics,
-) -> Option<UiCommand> {
-    section_label(ui, "墨迹抗锯齿", metrics);
-    let mut command = None;
-    ui.horizontal(|ui| {
-        for mode in InkAntialiasingMode::ALL {
-            if ui
-                .add_sized(
-                    Vec2::splat(metrics.touch_target),
-                    egui::Button::selectable(selected == mode, mode.label()),
-                )
-                .clicked()
-            {
-                command = Some(UiCommand::SetInkAntialiasing(mode));
-            }
-        }
-    });
     command
 }
 
@@ -316,9 +292,9 @@ fn draw_selection_visual(
         SelectionVisual::PenWidth(width) => {
             let visual_width = match width {
                 PenWidth::Px4 => 1.0,
+                PenWidth::Px6 => 1.5,
                 PenWidth::Px8 => 2.0,
                 PenWidth::Px16 => 4.0,
-                PenWidth::Px24 => 6.0,
             };
             pixel_snap::paint_pixel_aligned_line(
                 ui.painter(),
@@ -359,10 +335,10 @@ const fn color_label(color: InkColor) -> &'static str {
 /// 返回画笔粗细档位标签。
 const fn pen_width_label(width: PenWidth) -> &'static str {
     match width {
-        PenWidth::Px4 => "4pt",
-        PenWidth::Px8 => "8pt",
-        PenWidth::Px16 => "16pt",
-        PenWidth::Px24 => "24pt",
+        PenWidth::Px4 => "4px",
+        PenWidth::Px6 => "6px",
+        PenWidth::Px8 => "8px",
+        PenWidth::Px16 => "16px",
     }
 }
 

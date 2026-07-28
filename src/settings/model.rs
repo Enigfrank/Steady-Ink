@@ -44,9 +44,8 @@ impl Default for LogLevel {
     }
 }
 
-/// 墨迹层使用的可选增强抗锯齿模式。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+/// 渲染器内部使用的墨迹 surface 抗锯齿配置。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InkAntialiasingMode {
     Off,
     Msaa,
@@ -54,23 +53,13 @@ pub enum InkAntialiasingMode {
 }
 
 impl InkAntialiasingMode {
-    /// 返回设置页按稳定顺序展示的全部墨迹抗锯齿模式。
-    pub const ALL: [Self; 3] = [Self::Off, Self::Msaa, Self::Supersample];
-
-    /// 返回设置页使用的中文模式名称。
+    /// 返回图形错误诊断使用的中文模式名称。
     pub const fn label(self) -> &'static str {
         match self {
             Self::Off => "关闭",
             Self::Msaa => "MSAA 4x",
-            Self::Supersample => "超采样 1.5x",
+            Self::Supersample => "超采样 2x",
         }
-    }
-}
-
-impl Default for InkAntialiasingMode {
-    /// 默认保持当前单采样墨迹路径，避免旧配置产生额外 GPU 开销。
-    fn default() -> Self {
-        Self::Off
     }
 }
 
@@ -85,7 +74,7 @@ pub struct ToolPreferences {
 }
 
 impl Default for ToolPreferences {
-    /// 返回产品确认的红色、4pt 画笔和 48px 橡皮擦默认值。
+    /// 返回产品确认的红色、4px 画笔和 48px 橡皮擦默认值。
     fn default() -> Self {
         Self {
             color: InkColor::default(),
@@ -104,7 +93,6 @@ pub struct UserSettings {
     pub slideshow_integration_enabled: bool,
     pub log_level: LogLevel,
     pub readable_mode: bool,
-    pub ink_antialiasing: InkAntialiasingMode,
 }
 
 impl Default for UserSettings {
@@ -115,14 +103,14 @@ impl Default for UserSettings {
             slideshow_integration_enabled: true,
             log_level: LogLevel::default(),
             readable_mode: false,
-            ink_antialiasing: InkAntialiasingMode::default(),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{InkAntialiasingMode, UserSettings};
+    use super::UserSettings;
+    use crate::ink::PenWidth;
 
     #[test]
     fn missing_readable_mode_uses_the_default() {
@@ -146,7 +134,6 @@ mod tests {
         .expect("旧版设置应能反序列化");
 
         assert!(!settings.tools.speed_taper_enabled);
-        assert_eq!(settings.ink_antialiasing, InkAntialiasingMode::Off);
     }
 
     #[test]
@@ -162,19 +149,72 @@ mod tests {
     }
 
     #[test]
-    fn new_ink_preferences_survive_a_toml_round_trip() {
+    fn speed_taper_preference_survives_a_toml_round_trip() {
         let settings = UserSettings {
             tools: super::ToolPreferences {
                 speed_taper_enabled: true,
                 ..super::ToolPreferences::default()
             },
-            ink_antialiasing: InkAntialiasingMode::Supersample,
             ..UserSettings::default()
         };
         let serialized = toml::to_string(&settings).expect("设置应能序列化");
         let reloaded: UserSettings = toml::from_str(&serialized).expect("设置应能反序列化");
 
         assert!(reloaded.tools.speed_taper_enabled);
-        assert_eq!(reloaded.ink_antialiasing, InkAntialiasingMode::Supersample);
+    }
+
+    /// 验证新增 6px 档位保持准确像素宽度和稳定的 TOML 名称。
+    #[test]
+    fn six_pixel_pen_width_survives_a_toml_round_trip() {
+        let settings = UserSettings {
+            tools: super::ToolPreferences {
+                pen_width: PenWidth::Px6,
+                ..super::ToolPreferences::default()
+            },
+            ..UserSettings::default()
+        };
+
+        assert_eq!(settings.tools.pen_width.pixels(), 6.0);
+
+        let serialized = toml::to_string(&settings).expect("设置应能序列化");
+        assert!(serialized.contains("pen_width = \"px6\""));
+
+        let reloaded: UserSettings = toml::from_str(&serialized).expect("设置应能反序列化");
+        assert_eq!(reloaded.tools.pen_width, PenWidth::Px6);
+    }
+
+    /// 验证旧版 24px 画笔档位迁移到最接近的保留档位，并在保存时清除旧值。
+    #[test]
+    fn legacy_24px_pen_width_migrates_to_16px_on_save() {
+        let settings: UserSettings = toml::from_str(
+            r#"
+                [tools]
+                pen_width = "px24"
+            "#,
+        )
+        .expect("旧版 24px 画笔档位应能反序列化");
+
+        assert_eq!(settings.tools.pen_width, PenWidth::Px16);
+
+        let serialized = toml::to_string(&settings).expect("设置应能序列化");
+        assert!(serialized.contains("pen_width = \"px16\""));
+        assert!(!serialized.contains("px24"));
+    }
+
+    /// 验证旧版抗锯齿字段可被兼容忽略，保存时不再写回可变档位。
+    #[test]
+    fn legacy_antialiasing_preferences_are_removed_on_save() {
+        let settings: UserSettings = toml::from_str(
+            r#"
+                slideshow_integration_enabled = true
+                ink_antialiasing = "supersample"
+                ink_quality_priority = "high_quality"
+            "#,
+        )
+        .expect("旧版抗锯齿字段应被兼容忽略");
+
+        let serialized = toml::to_string(&settings).expect("设置应能序列化");
+        assert!(!serialized.contains("ink_antialiasing"));
+        assert!(!serialized.contains("ink_quality_priority"));
     }
 }

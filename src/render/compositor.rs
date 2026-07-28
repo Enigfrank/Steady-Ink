@@ -13,7 +13,7 @@ use windows::Win32::Graphics::{
 };
 use winit::{event::WindowEvent, event_loop::ActiveEventLoop, window::Window};
 
-use super::egui_skia::EguiSkiaRenderer;
+use super::{adaptive_aa::AdaptiveAaPolicy, egui_skia::EguiSkiaRenderer};
 use crate::{
     error::AppError,
     ink::{
@@ -28,6 +28,7 @@ use crate::{
 const MAX_IDLE_PREVIEW_SURFACES: usize = 5;
 const MAX_PREVIEW_POOL_BYTES: usize = 5 * 1024 * 1024;
 const PREVIEW_POOL_GC_TIMEOUT: Duration = Duration::from_secs(30);
+const FIXED_COMMITTED_INK_MODE: InkAntialiasingMode = InkAntialiasingMode::Supersample;
 
 /// 保持 Skia surface 与其外部 DXGI backend target 的生命周期一致。
 struct SwapChainSurface {
@@ -40,13 +41,13 @@ pub struct Compositor {
     egui: EguiSkiaRenderer,
     ink_cache: InkRenderCache,
     ink_mode: InkAntialiasingMode,
-    preferred_ink_mode: InkAntialiasingMode,
     annotation_resources_enabled: bool,
     ink_rendering_error: Option<String>,
     preview_cache: Option<InkPreviewCache>,
     preview_surface_pool: SurfacePool,
     preview_velocity: VelocityTracker,
     preview_tile_size: u32,
+    adaptive_aa: AdaptiveAaPolicy,
     window_surfaces: Vec<SwapChainSurface>,
     gr_context: DirectContext,
 }
@@ -65,6 +66,7 @@ struct PreviewComposite {
     origin: crate::ink::CanvasPoint,
     logical_size: [u32; 2],
     render_size: [u32; 2],
+    linear_sampling: bool,
     replace_region: bool,
 }
 
@@ -73,8 +75,7 @@ impl Compositor {
     pub fn new(
         event_loop: &ActiveEventLoop,
         window_context: &D3DWindowContext,
-        requested_mode: InkAntialiasingMode,
-    ) -> Result<(Self, InkAntialiasingMode, Option<String>), AppError> {
+    ) -> Result<(Self, Option<String>), AppError> {
         let backend_context = BackendContext {
             adapter: window_context.adapter().clone(),
             device: window_context.device().clone(),
@@ -89,14 +90,12 @@ impl Compositor {
         let resources = create_ink_resources(&mut gr_context, size, InkAntialiasingMode::Off)?;
         let egui = EguiSkiaRenderer::new(event_loop, window_context.window());
 
-        let applied_mode = requested_mode;
         let error = resources.error.clone();
         Ok((
             Self {
                 egui,
                 ink_cache: resources.cache,
                 ink_mode: resources.mode,
-                preferred_ink_mode: requested_mode,
                 annotation_resources_enabled: false,
                 ink_rendering_error: resources.error,
                 preview_cache: resources.preview_cache,
@@ -106,10 +105,10 @@ impl Compositor {
                 ),
                 preview_velocity: VelocityTracker::new(),
                 preview_tile_size: BASE_PREVIEW_TILE_SIZE,
+                adaptive_aa: AdaptiveAaPolicy::new(),
                 window_surfaces,
                 gr_context,
             },
-            applied_mode,
             error,
         ))
     }
@@ -153,49 +152,15 @@ impl Compositor {
         self.window_surfaces.clear();
         window_context.recreate_swap_chain(physical_size)?;
         self.window_surfaces = create_window_surfaces(&mut self.gr_context, window_context, size)?;
-        let target_mode =
-            desired_ink_mode(self.annotation_resources_enabled, self.preferred_ink_mode);
+        let target_mode = desired_ink_mode(self.annotation_resources_enabled);
         let resources = create_ink_resources(&mut self.gr_context, size, target_mode)?;
         self.ink_cache = resources.cache;
         self.ink_mode = resources.mode;
-        if self.annotation_resources_enabled {
-            self.preferred_ink_mode = resources.mode;
-        }
         self.ink_rendering_error = resources.error;
         self.preview_cache = resources.preview_cache;
         self.preview_surface_pool.gc(PREVIEW_POOL_GC_TIMEOUT);
         self.log_surface_pool_stats("窗口 resize 后预览资源池状态");
         Ok(())
-    }
-
-    /// 运行时切换墨迹抗锯齿模式，成功后由下一帧完整重放当前文档。
-    pub fn set_ink_antialiasing(
-        &mut self,
-        window_context: &D3DWindowContext,
-        requested_mode: InkAntialiasingMode,
-    ) -> Result<(), AppError> {
-        if requested_mode == self.preferred_ink_mode && self.ink_rendering_error.is_none() {
-            return Ok(());
-        }
-        self.preferred_ink_mode = requested_mode;
-        if !self.annotation_resources_enabled {
-            self.ink_rendering_error = None;
-            return Ok(());
-        }
-        self.release_preview_cache();
-        let size: [u32; 2] = window_context.window().inner_size().into();
-        let resources = create_ink_resources(&mut self.gr_context, size, requested_mode)?;
-        self.ink_cache = resources.cache;
-        self.ink_mode = resources.mode;
-        self.preferred_ink_mode = resources.mode;
-        self.ink_rendering_error = resources.error;
-        self.preview_cache = resources.preview_cache;
-        Ok(())
-    }
-
-    /// 返回批注资源应恢复的用户首选抗锯齿模式。
-    pub const fn ink_antialiasing_mode(&self) -> InkAntialiasingMode {
-        self.preferred_ink_mode
     }
 
     /// 在批注与 idle 模式之间切换大型墨迹资源的驻留策略。
@@ -207,6 +172,7 @@ impl Compositor {
         self.release_preview_cache();
         self.preview_velocity.reset();
         self.preview_tile_size = BASE_PREVIEW_TILE_SIZE;
+        self.adaptive_aa.reset_runtime_state();
         if enabled {
             return Ok(());
         }
@@ -233,6 +199,9 @@ impl Compositor {
         document: &InkDocument,
         active_preview: Option<ActiveInkPreview<'_>>,
     ) -> Result<(), AppError> {
+        let preview_frame_started = active_preview
+            .is_some_and(|preview| self.adaptive_aa.preview_quality(preview).is_some())
+            .then(Instant::now);
         self.gr_context.reset(None);
         self.ink_cache.sync(document);
 
@@ -299,7 +268,7 @@ impl Compositor {
                 &ink_image,
                 self.ink_cache.render_size(),
                 Rect::from_xywh(0.0, 0.0, logical_size[0] as f32, logical_size[1] as f32),
-                config.mode == InkAntialiasingMode::Supersample,
+                config.requires_linear_sampling(),
                 BlendMode::SrcOver,
             );
         }
@@ -311,7 +280,7 @@ impl Compositor {
                 &composite.image,
                 composite.render_size,
                 Rect::from_xywh(origin.x, origin.y, size[0] as f32, size[1] as f32),
-                config.mode == InkAntialiasingMode::Supersample,
+                composite.linear_sampling,
                 if composite.replace_region {
                     BlendMode::Src
                 } else {
@@ -324,6 +293,17 @@ impl Compositor {
         self.egui.paint(canvas)?;
         self.gr_context
             .flush_and_submit_surface(&mut target.surface, None);
+        if let Some(started_at) = preview_frame_started
+            && self.ink_mode != InkAntialiasingMode::Off
+            && self
+                .adaptive_aa
+                .record_preview_frame(started_at.elapsed(), Instant::now())
+        {
+            tracing::debug!(
+                adaptive_limit = ?self.adaptive_aa.adaptive_limit(),
+                "活动预览抗锯齿质量已按帧时间调整"
+            );
+        }
         Ok(())
     }
 
@@ -333,19 +313,57 @@ impl Compositor {
         preview: ActiveInkPreview<'_>,
         persistent_image: &skia_safe::Image,
     ) -> Result<PreviewComposite, AppError> {
+        let quality = self.adaptive_aa.preview_quality(preview);
+        let config = quality.map_or_else(
+            || crate::ink::InkSurfaceConfig::for_mode(InkAntialiasingMode::Off),
+            super::adaptive_aa::PreviewAaQuality::surface_config,
+        );
+        match self.prepare_preview_with_config(preview, persistent_image, config) {
+            Ok(composite) => Ok(composite),
+            Err(error) if config.mode != InkAntialiasingMode::Off => {
+                tracing::warn!(
+                    ?quality,
+                    %error,
+                    "活动预览目标抗锯齿不可用，回退到 Off 预览"
+                );
+                self.release_preview_cache();
+                self.prepare_preview_with_config(
+                    preview,
+                    persistent_image,
+                    crate::ink::InkSurfaceConfig::for_mode(InkAntialiasingMode::Off),
+                )
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// 使用一个精确配置创建或复用局部活动预览 surface。
+    fn prepare_preview_with_config(
+        &mut self,
+        preview: ActiveInkPreview<'_>,
+        persistent_image: &skia_safe::Image,
+        preview_config: crate::ink::InkSurfaceConfig,
+    ) -> Result<PreviewComposite, AppError> {
         let pool_stats_before = self.preview_surface_pool.stats();
         let bounds = active_preview_bounds(preview)
             .ok_or_else(|| AppError::Graphics("活动墨迹预览没有有效采样".to_owned()))?;
         let logical_size = self.ink_cache.logical_size();
         let source_render_size = self.ink_cache.render_size();
         let source_config = self.ink_cache.config();
+        if self
+            .preview_cache
+            .as_ref()
+            .is_some_and(|cache| cache.config() != preview_config)
+        {
+            self.release_preview_cache();
+        }
         if self.preview_cache.is_none() {
             self.preview_cache = Some(InkPreviewCache::for_bounds(
                 &mut self.gr_context,
                 bounds,
                 logical_size,
                 self.preview_tile_size,
-                source_config,
+                preview_config,
                 &mut self.preview_surface_pool,
             )?);
         }
@@ -365,17 +383,19 @@ impl Compositor {
                 persistent_image,
                 source_render_size,
                 logical_size,
-                source_config.mode == InkAntialiasingMode::Supersample,
+                source_config.requires_linear_sampling(),
             );
         } else {
             preview_cache.clear();
         }
         preview_cache.draw(preview);
+        let linear_sampling = preview_cache.config().requires_linear_sampling();
         let composite = PreviewComposite {
             image: preview_cache.snapshot(),
             origin: preview_cache.origin(),
             logical_size: preview_cache.logical_size(),
             render_size: preview_cache.render_size(),
+            linear_sampling,
             replace_region: preview_replaces_region(preview),
         };
         if self.preview_surface_pool.stats() != pool_stats_before {
@@ -392,7 +412,6 @@ impl Compositor {
         cache.sync(document);
         self.ink_cache = cache;
         self.ink_mode = InkAntialiasingMode::Off;
-        self.preferred_ink_mode = InkAntialiasingMode::Off;
         self.ink_rendering_error = Some(detail);
         Ok(())
     }
@@ -466,12 +485,9 @@ fn create_ink_resources(
 }
 
 /// 返回当前应用资源模式应使用的实际墨迹质量。
-const fn desired_ink_mode(
-    annotation_resources_enabled: bool,
-    preferred_mode: InkAntialiasingMode,
-) -> InkAntialiasingMode {
+const fn desired_ink_mode(annotation_resources_enabled: bool) -> InkAntialiasingMode {
     if annotation_resources_enabled {
-        preferred_mode
+        FIXED_COMMITTED_INK_MODE
     } else {
         InkAntialiasingMode::Off
     }
@@ -526,25 +542,15 @@ fn create_window_surfaces(
 mod tests {
     use super::*;
 
-    /// 验证 idle 模式始终使用最小 Off 资源，同时保留用户首选配置。
+    /// 验证 idle 模式始终使用最小 Off 资源。
     #[test]
     fn idle_resource_mode_uses_off_quality() {
-        assert_eq!(
-            desired_ink_mode(false, InkAntialiasingMode::Supersample),
-            InkAntialiasingMode::Off
-        );
-        assert_eq!(
-            desired_ink_mode(false, InkAntialiasingMode::Msaa),
-            InkAntialiasingMode::Off
-        );
+        assert_eq!(desired_ink_mode(false), InkAntialiasingMode::Off);
     }
 
-    /// 验证批注模式恢复用户首选抗锯齿配置。
+    /// 验证批注模式始终使用固定 2x 超采样持久质量。
     #[test]
-    fn annotation_resource_mode_restores_preferred_quality() {
-        assert_eq!(
-            desired_ink_mode(true, InkAntialiasingMode::Supersample),
-            InkAntialiasingMode::Supersample
-        );
+    fn annotation_resource_mode_uses_fixed_supersample_quality() {
+        assert_eq!(desired_ink_mode(true), InkAntialiasingMode::Supersample);
     }
 }

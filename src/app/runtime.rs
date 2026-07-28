@@ -241,7 +241,7 @@ impl DesktopRuntime {
         pen_contact_active: Arc<AtomicBool>,
     ) -> Result<Self, AppError> {
         let settings_store = SettingsStore::new()?;
-        let (mut settings, mut settings_error) = match settings_store.load() {
+        let (settings, settings_error) = match settings_store.load() {
             Ok(settings) => (settings, None),
             Err(error) => {
                 tracing::warn!(%error, "读取设置失败，使用默认值");
@@ -257,15 +257,7 @@ impl DesktopRuntime {
             speed_taper_enabled: settings.tools.speed_taper_enabled,
         };
         let window_context = D3DWindowContext::new(event_loop)?;
-        let (compositor, applied_ink_mode, ink_rendering_error) =
-            Compositor::new(event_loop, &window_context, settings.ink_antialiasing)?;
-        if applied_ink_mode != settings.ink_antialiasing {
-            settings.ink_antialiasing = applied_ink_mode;
-            if let Err(error) = settings_store.save(&settings) {
-                tracing::warn!(%error, "保存抗锯齿回退设置失败");
-                settings_error = Some(error.to_string());
-            }
-        }
+        let (compositor, ink_rendering_error) = Compositor::new(event_loop, &window_context)?;
         let wake_proxy = event_proxy;
         let slideshow_detector = ComDetector::spawn(move || {
             let _ = wake_proxy.send_event(UserEvent::ExternalEvent);
@@ -423,7 +415,6 @@ impl DesktopRuntime {
             slideshow_integration_enabled: self.settings.slideshow_integration_enabled,
             log_level: self.settings.log_level,
             readable_mode: self.settings.readable_mode,
-            ink_antialiasing: self.settings.ink_antialiasing,
             ink_rendering_error: self.ink_rendering_error.as_deref(),
             slideshow_session_generation: self
                 .state
@@ -497,18 +488,6 @@ impl DesktopRuntime {
                 self.tools.speed_taper_enabled = enabled;
                 self.settings.tools.speed_taper_enabled = enabled;
                 self.save_settings();
-            }
-            UiCommand::SetInkAntialiasing(mode) => {
-                match self
-                    .compositor
-                    .set_ink_antialiasing(&self.window_context, mode)
-                {
-                    Ok(()) => self.sync_ink_rendering_state(),
-                    Err(error) => {
-                        tracing::warn!(%error, "切换墨迹抗锯齿失败");
-                        self.ink_rendering_error = Some(error.to_string());
-                    }
-                }
             }
             UiCommand::Undo => {
                 let undone = self.state.active_document_mut().and_then(InkDocument::undo);
@@ -674,15 +653,9 @@ impl DesktopRuntime {
         }
     }
 
-    /// 同步渲染器实际生效模式、错误诊断和持久化设置。
+    /// 同步固定抗锯齿路径最近一次非阻塞错误诊断。
     fn sync_ink_rendering_state(&mut self) {
-        let applied_mode = self.compositor.ink_antialiasing_mode();
-        let mode_changed = self.settings.ink_antialiasing != applied_mode;
         self.ink_rendering_error = self.compositor.ink_rendering_error().map(str::to_owned);
-        if mode_changed {
-            self.settings.ink_antialiasing = applied_mode;
-            self.save_settings();
-        }
     }
 
     /// 把当前 idle 面板映射为原生窗口几何类型。

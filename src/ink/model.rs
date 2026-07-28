@@ -131,9 +131,10 @@ impl Default for InkColor {
 #[serde(rename_all = "snake_case")]
 pub enum PenWidth {
     Px4,
+    Px6,
     Px8,
+    #[serde(alias = "px24")]
     Px16,
-    Px24,
 }
 
 impl PenWidth {
@@ -141,15 +142,15 @@ impl PenWidth {
     pub const fn pixels(self) -> f32 {
         match self {
             Self::Px4 => 4.0,
+            Self::Px6 => 6.0,
             Self::Px8 => 8.0,
             Self::Px16 => 16.0,
-            Self::Px24 => 24.0,
         }
     }
 }
 
 impl Default for PenWidth {
-    /// 返回产品默认画笔粗细 4pt 对应的最细档位。
+    /// 返回产品默认画笔粗细 4px 对应的最细档位。
     fn default() -> Self {
         Self::Px4
     }

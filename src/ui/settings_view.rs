@@ -6,9 +6,7 @@ use egui::{
 use super::{
     design_tokens::{self as tokens, InterfaceMetrics},
     pixel_snap,
-    settings_controls::{
-        render_ink_antialiasing_selector, render_log_level_selector, render_tool_preferences,
-    },
+    settings_controls::{render_log_level_selector, render_tool_preferences},
     toolbar::{Icon, UiCommand, UiViewState, paint_icon},
 };
 use crate::autostart::MachineAutostartState;
@@ -63,14 +61,6 @@ pub fn render(ui: &mut Ui, view: UiViewState<'_>) -> Option<UiCommand> {
                         && command.is_none()
                     {
                         command = Some(UiCommand::SetReadableMode(readable_mode));
-                    }
-                    let antialiasing_command = render_ink_antialiasing_selector(
-                        ui,
-                        view.ink_antialiasing,
-                        metrics,
-                    );
-                    if command.is_none() {
-                        command = antialiasing_command;
                     }
                     if let Some(error) = view.ink_rendering_error {
                         ui.label(

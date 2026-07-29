@@ -37,7 +37,7 @@ use crate::{
         ComDetector, ComDetectorEvent, ComDiagnostics, SlideShowControlAction, SlideShowSession,
     },
     ui::{self, IdlePanel, ToolState, UiCommand, UiViewState, design_tokens},
-    window::{D3DWindowContext, IdleWindowView},
+    window::{D3DWindowContext, IdleWindowView, WindowPlacement},
 };
 
 /// egui 请求立即或延迟重绘时发送给 winit 的用户事件。
@@ -55,6 +55,13 @@ enum UserEvent {
 enum ApplicationExitAction {
     Exit,
     Restart,
+}
+
+/// 一条 UI 命令产生的退出动作和可选窗口几何切换结果。
+#[derive(Debug, Default)]
+struct UiCommandOutcome {
+    exit_action: Option<ApplicationExitAction>,
+    geometry_placement: Option<WindowPlacement>,
 }
 
 /// 当前尚未提交为墨迹 operation 的单次指针手势。
@@ -223,6 +230,7 @@ impl ActiveGesture {
 
 /// 组合窗口、渲染器、状态机和输入路由的单窗口运行时。
 struct DesktopRuntime {
+    redraw_proxy: EventLoopProxy<UserEvent>,
     render_thread: RenderThread,
     recovery: RecoveryManager,
     egui: EguiUiState,
@@ -303,6 +311,7 @@ impl DesktopRuntime {
             },
         )?;
         let ink_rendering_error = render_thread.initial_ink_error().map(str::to_owned);
+        let redraw_proxy = event_proxy.clone();
         let wake_proxy = event_proxy;
         let slideshow_detector = ComDetector::spawn(move || {
             let _ = wake_proxy.send_event(UserEvent::ExternalEvent);
@@ -310,6 +319,7 @@ impl DesktopRuntime {
         let state = recovered_state.unwrap_or_default();
         let recovered_annotation = state.mode().accepts_ink_input();
         let mut runtime = Self {
+            redraw_proxy,
             render_thread,
             recovery,
             egui,
@@ -343,7 +353,7 @@ impl DesktopRuntime {
         };
         if recovered_annotation {
             tracing::info!(mode = ?runtime.state.mode(), "已恢复未正常退出的墨迹会话");
-            runtime.prepare_annotation_transition(true);
+            runtime.apply_startup_annotation_transition(true);
         }
         Ok(runtime)
     }
@@ -351,6 +361,17 @@ impl DesktopRuntime {
     /// 返回当前运行时窗口标识。
     fn window_id(&self) -> WindowId {
         self.window_context.window().id()
+    }
+
+    /// 使用恢复状态对应的稳定几何显示首次创建的窗口。
+    fn show(&self) -> Result<(), AppError> {
+        let placement = if self.state.mode().accepts_ink_input() {
+            self.window_context.target_annotation_placement(true)
+        } else {
+            self.window_context
+                .target_idle_placement(self.current_idle_window_view())
+        };
+        self.window_context.show(placement)
     }
 
     /// 处理非重绘窗口事件，并返回 egui 是否请求重绘。
@@ -367,8 +388,10 @@ impl DesktopRuntime {
         };
         if self.idle_window_dragging && window_drag_finished(event) {
             self.idle_window_dragging = false;
-            self.window_context
-                .finish_idle_window_drag(self.current_idle_window_view());
+            let view = self.current_idle_window_view();
+            if let Err(error) = self.window_context.finish_idle_window_drag(view) {
+                tracing::warn!(?view, %error, "完成悬浮工具栏拖动后的窗口几何更新失败");
+            }
         }
 
         let event_response = self
@@ -530,40 +553,65 @@ impl DesktopRuntime {
         if performance.is_none() {
             self.pending_performance_input = None;
         }
-        self.render_thread.submit_frame(RenderFrame {
+        let frame = RenderFrame {
             generation: self.render_generation,
             document: document.clone(),
             active_preview: preview.map(OwnedActiveInkPreview::from),
             egui: egui_frame,
             performance,
-        });
+        };
 
         let exit_action = if let Some(command) = ui_command {
-            let previous_state = self.state.clone();
-            let exit_action = self.apply_ui_command(command);
-            if self.state != previous_state {
-                self.queue_recovery();
+            if ui_command_changes_window_geometry(command) {
+                let previous_state = self.state.clone();
+                let outcome = self.apply_ui_command(command);
+                if self.state != previous_state {
+                    self.queue_recovery();
+                }
+                if let Some(placement) = outcome.geometry_placement {
+                    self.commit_window_geometry(placement, Some(frame));
+                } else {
+                    self.render_thread.submit_frame(frame);
+                    self.request_redraw();
+                }
+                outcome.exit_action
+            } else {
+                self.render_thread.submit_frame(frame);
+                let previous_state = self.state.clone();
+                let outcome = self.apply_ui_command(command);
+                debug_assert!(outcome.geometry_placement.is_none());
+                if self.state != previous_state {
+                    self.queue_recovery();
+                }
+                outcome.exit_action
             }
-            exit_action
         } else {
+            self.render_thread.submit_frame(frame);
             None
         };
         Ok(exit_action)
     }
 
-    /// 执行工具栏命令，并返回普通退出或重启动作。
-    fn apply_ui_command(&mut self, command: UiCommand) -> Option<ApplicationExitAction> {
+    /// 执行工具栏命令，并返回退出动作及可选窗口几何切换结果。
+    fn apply_ui_command(&mut self, command: UiCommand) -> UiCommandOutcome {
+        let mut outcome = UiCommandOutcome::default();
         match command {
-            UiCommand::ExitApplication => return Some(ApplicationExitAction::Exit),
-            UiCommand::RestartApplication => return Some(ApplicationExitAction::Restart),
+            UiCommand::ExitApplication => {
+                outcome.exit_action = Some(ApplicationExitAction::Exit);
+                return outcome;
+            }
+            UiCommand::RestartApplication => {
+                outcome.exit_action = Some(ApplicationExitAction::Restart);
+                return outcome;
+            }
             UiCommand::EnterAnnotation => {
                 if self.state.enter_normal_annotation() {
-                    self.prepare_annotation_transition(true);
+                    outcome.geometry_placement = Some(self.prepare_annotation_geometry(true));
                 }
             }
             UiCommand::ExitAnnotation => {
                 if self.state.exit_normal_annotation() {
-                    self.prepare_annotation_transition(false);
+                    outcome.geometry_placement = Some(self.prepare_annotation_geometry(false));
                 }
             }
             UiCommand::SelectPen => self.tools.tool = InkTool::Pen,
@@ -617,8 +665,8 @@ impl DesktopRuntime {
                 if self.state.mode() == AppMode::IdleFloatingToolbar {
                     self.refresh_machine_autostart();
                     self.idle_panel = IdlePanel::Settings;
-                    self.window_context
-                        .set_idle_window_view(IdleWindowView::Settings);
+                    outcome.geometry_placement =
+                        Some(self.target_idle_window_geometry(IdleWindowView::Settings));
                     self.update_interface_zoom();
                 }
             }
@@ -633,8 +681,8 @@ impl DesktopRuntime {
             UiCommand::CloseSettings => {
                 if self.state.mode() == AppMode::IdleFloatingToolbar {
                     self.idle_panel = IdlePanel::Toolbar;
-                    self.window_context
-                        .set_idle_window_view(IdleWindowView::Toolbar);
+                    outcome.geometry_placement =
+                        Some(self.target_idle_window_geometry(IdleWindowView::Toolbar));
                     self.update_interface_zoom();
                 }
             }
@@ -650,7 +698,8 @@ impl DesktopRuntime {
                     } else {
                         IdleWindowView::Toolbar
                     };
-                    self.window_context.set_idle_window_view(window_view);
+                    outcome.geometry_placement =
+                        Some(self.target_idle_window_geometry(window_view));
                     self.update_interface_zoom();
                 }
             }
@@ -716,15 +765,17 @@ impl DesktopRuntime {
                     && self.state.dismiss_disconnected_slideshow()
                 {
                     self.dismiss_slideshow_confirmation = false;
-                    self.prepare_annotation_transition(false);
+                    outcome.geometry_placement = Some(self.prepare_annotation_geometry(false));
                 }
             }
             UiCommand::CancelDismissSlideshow => {
                 self.dismiss_slideshow_confirmation = false;
             }
         }
-        self.request_redraw();
-        None
+        if !ui_command_changes_window_geometry(command) {
+            self.request_redraw();
+        }
+        outcome
     }
 
     /// 保存当前用户偏好，并把失败记录到应用日志。
@@ -800,6 +851,18 @@ impl DesktopRuntime {
             IdlePanel::QuickSettings => IdleWindowView::QuickSettings,
             IdlePanel::Settings => IdleWindowView::Settings,
         }
+    }
+
+    /// 返回非批注视图对应的稳定窗口目标几何，不在命令处理阶段移动 HWND。
+    fn target_idle_window_geometry(&self, view: IdleWindowView) -> WindowPlacement {
+        self.window_context.target_idle_placement(view)
+    }
+
+    /// 在几何切换控制命令和旧帧纹理处理均入队后请求目标视图重绘。
+    fn queue_geometry_redraw(&self) {
+        let _ = self
+            .redraw_proxy
+            .send_event(UserEvent::RequestRepaint(Duration::ZERO));
     }
 
     /// 在工具界面与完整设置页之间切换 egui 的全局显示缩放。
@@ -902,7 +965,7 @@ impl DesktopRuntime {
                     changed
                 };
                 if changed {
-                    self.prepare_annotation_transition(true);
+                    self.apply_annotation_transition(true);
                     self.slideshow_connection_error = None;
                     self.dismiss_slideshow_confirmation = false;
                 }
@@ -920,7 +983,7 @@ impl DesktopRuntime {
             ComDetectorEvent::SlideShowEnded { key } => {
                 let changed = self.state.end_slideshow(&key);
                 if changed {
-                    self.prepare_annotation_transition(false);
+                    self.apply_annotation_transition(false);
                     self.slideshow_connection_error = None;
                     self.dismiss_slideshow_confirmation = false;
                 }
@@ -954,16 +1017,91 @@ impl DesktopRuntime {
         }
     }
 
-    /// 清理活动输入并同步全屏或悬浮窗口几何及墨迹缓存。
-    fn prepare_annotation_transition(&mut self, annotation_enabled: bool) {
+    /// 清理活动输入并恢复普通工具栏视觉状态，不在这里改变窗口或 GPU 资源。
+    fn prepare_annotation_state(&mut self) {
         self.active_gesture = None;
         self.input_router.cancel();
         self.idle_panel = IdlePanel::Toolbar;
         self.update_interface_zoom();
+    }
+
+    /// 清理批注切换状态、更新 GPU 驻留策略并返回稳定目标几何。
+    fn prepare_annotation_geometry(&mut self, annotation_enabled: bool) -> WindowPlacement {
+        self.prepare_annotation_state();
         self.render_thread
             .set_annotation_resources_enabled(annotation_enabled);
-        self.window_context.set_annotation_mode(annotation_enabled);
         self.render_thread.invalidate_ink_cache();
+        self.window_context
+            .target_annotation_placement(annotation_enabled)
+    }
+
+    /// 在窗口尚未显示的恢复阶段直接提交批注几何，无需冻结不可见的旧 visual。
+    fn apply_startup_annotation_transition(&mut self, annotation_enabled: bool) {
+        let placement = self.prepare_annotation_geometry(annotation_enabled);
+        match self.window_context.apply_window_placement(placement) {
+            Ok(()) => self.render_thread.resize(placement.size),
+            Err(error) => {
+                tracing::warn!(
+                    annotation_enabled,
+                    mode = ?self.state.mode(),
+                    ?placement,
+                    %error,
+                    "启动恢复时批注窗口几何切换失败"
+                );
+            }
+        }
+    }
+
+    /// 为非 UI 事件使用与 UI 命令相同的无动画 visual 冻结协议。
+    fn apply_annotation_transition(&mut self, annotation_enabled: bool) {
+        let placement = self.prepare_annotation_geometry(annotation_enabled);
+        self.commit_window_geometry(placement, None);
+    }
+
+    /// 冻结旧 visual、一次提交最终 HWND 几何，并让目标首帧原子替换可见内容。
+    fn commit_window_geometry(
+        &mut self,
+        target: WindowPlacement,
+        source_frame: Option<RenderFrame>,
+    ) {
+        let source = match self.window_context.current_placement() {
+            Ok(placement) => placement,
+            Err(error) => {
+                tracing::warn!(?target, %error, "读取窗口源几何失败，已取消窗口切换");
+                if let Some(frame) = source_frame {
+                    self.render_thread.submit_frame(frame);
+                }
+                self.request_redraw();
+                return;
+            }
+        };
+        let visual_offset = source.visual_offset_to(target);
+        if let Err(error) = self
+            .render_thread
+            .hold_window_visual(visual_offset, source_frame)
+        {
+            tracing::warn!(?source, ?target, %error, "冻结旧窗口画面失败，已取消窗口切换");
+            self.reset_window_visual_after_geometry_failure();
+            self.request_redraw();
+            return;
+        }
+        if let Err(error) = self.window_context.apply_window_placement(target) {
+            tracing::warn!(?source, ?target, %error, "提交最终窗口几何失败");
+            self.reset_window_visual_after_geometry_failure();
+            self.request_redraw();
+            return;
+        }
+
+        self.render_thread.arm_window_visual_reset();
+        self.render_thread.resize(target.size);
+        self.queue_geometry_redraw();
+    }
+
+    /// 几何事务失败后同步清除临时 visual 偏移，并记录无法回滚的渲染错误。
+    fn reset_window_visual_after_geometry_failure(&self) {
+        if let Err(error) = self.render_thread.reset_window_visual() {
+            tracing::warn!(%error, "窗口几何切换失败后无法恢复 DirectComposition visual");
+        }
     }
 
     /// 排空渲染线程结果，并在 fatal error 时恢复统一 AppError 传播。
@@ -1015,6 +1153,19 @@ impl DesktopRuntime {
     fn request_redraw(&self) {
         self.window_context.window().request_redraw();
     }
+}
+
+/// 返回一条 UI 命令是否会改变原生窗口和交换链尺寸。
+const fn ui_command_changes_window_geometry(command: UiCommand) -> bool {
+    matches!(
+        command,
+        UiCommand::EnterAnnotation
+            | UiCommand::ExitAnnotation
+            | UiCommand::OpenSettings
+            | UiCommand::CloseSettings
+            | UiCommand::ToggleQuickSettings
+            | UiCommand::ConfirmDismissSlideshow
+    )
 }
 
 /// 返回原生窗口拖动循环是否已经通过鼠标或触摸抬起结束。
@@ -1129,7 +1280,7 @@ impl ApplicationHandler<UserEvent> for DesktopApplication {
                 self.install_repaint_callback(&runtime);
                 self.runtime = Some(runtime);
                 if let Some(runtime) = self.runtime.as_mut() {
-                    if let Err(error) = runtime.window_context.show() {
+                    if let Err(error) = runtime.show() {
                         self.startup_error = Some(error);
                         event_loop.exit();
                         return;
@@ -1360,6 +1511,29 @@ mod tests {
     fn invalid_pixels_per_point_has_no_egui_position() {
         assert!(egui_position_from_physical(CanvasPoint::new(1.0, 1.0), 0.0).is_none());
         assert!(egui_position_from_physical(CanvasPoint::new(1.0, 1.0), f32::NAN).is_none());
+    }
+
+    /// 验证只有会改变原生窗口尺寸的命令走目标几何重绘路径。
+    #[test]
+    fn geometry_commands_are_classified_for_target_redraw() {
+        for command in [
+            UiCommand::EnterAnnotation,
+            UiCommand::ExitAnnotation,
+            UiCommand::OpenSettings,
+            UiCommand::CloseSettings,
+            UiCommand::ToggleQuickSettings,
+            UiCommand::ConfirmDismissSlideshow,
+        ] {
+            assert!(ui_command_changes_window_geometry(command));
+        }
+        for command in [
+            UiCommand::SelectPen,
+            UiCommand::Undo,
+            UiCommand::ToggleSlideshowToolbar,
+            UiCommand::ExitApplication,
+        ] {
+            assert!(!ui_command_changes_window_geometry(command));
+        }
     }
 
     /// 验证只有显式重启动作会在成功关闭后请求拉起新实例。

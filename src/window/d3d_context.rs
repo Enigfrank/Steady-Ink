@@ -92,8 +92,6 @@ struct WindowGeometry {
     idle_left_position: PhysicalPosition<i32>,
     idle_position: PhysicalPosition<i32>,
     idle_size: PhysicalSize<u32>,
-    quick_settings_left_position: PhysicalPosition<i32>,
-    quick_settings_position: PhysicalPosition<i32>,
     quick_settings_size: PhysicalSize<u32>,
     settings_position: PhysicalPosition<i32>,
     settings_size: PhysicalSize<u32>,
@@ -101,10 +99,35 @@ struct WindowGeometry {
     annotation_size: PhysicalSize<u32>,
 }
 
+/// 一次原生窗口操作需要提交的最终物理位置和客户区尺寸。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WindowPlacement {
+    pub(crate) position: PhysicalPosition<i32>,
+    pub(crate) size: PhysicalSize<u32>,
+}
+
+impl WindowPlacement {
+    /// 返回 HWND 从当前几何移动到目标几何时保持旧 visual 屏幕位置所需的反向偏移。
+    pub(crate) fn visual_offset_to(self, target: Self) -> PhysicalPosition<i32> {
+        PhysicalPosition::new(
+            self.position.x - target.position.x,
+            self.position.y - target.position.y,
+        )
+    }
+}
+
 impl WindowGeometry {
-    /// 根据主显示器和 DPI 缩放计算两个窗口模式的稳定物理尺寸。
+    /// 根据主显示器和 DPI 缩放计算各窗口模式的稳定物理几何。
     fn from_monitor(monitor: &MonitorHandle) -> Self {
-        let scale_factor = monitor.scale_factor();
+        Self::from_monitor_metrics(monitor.position(), monitor.size(), monitor.scale_factor())
+    }
+
+    /// 根据显示器物理边界和缩放因子计算各窗口模式的稳定物理几何。
+    fn from_monitor_metrics(
+        monitor_position: PhysicalPosition<i32>,
+        monitor_size: PhysicalSize<u32>,
+        scale_factor: f64,
+    ) -> Self {
         let idle_size = LogicalSize::new(IDLE_WIDTH_POINTS, IDLE_HEIGHT_POINTS)
             .to_physical::<u32>(scale_factor);
         let quick_settings_size =
@@ -113,36 +136,71 @@ impl WindowGeometry {
         let settings_size = LogicalSize::new(SETTINGS_WIDTH_POINTS, SETTINGS_HEIGHT_POINTS)
             .to_physical::<u32>(scale_factor);
         let edge_margin = (EDGE_MARGIN_POINTS * scale_factor).round() as i32;
-        let monitor_position = monitor.position();
-        let monitor_size = monitor.size();
         let idle_left_position =
             left_centered_position(monitor_position, monitor_size, idle_size, edge_margin);
         let idle_position =
             right_centered_position(monitor_position, monitor_size, idle_size, edge_margin);
-        let quick_settings_left_position = left_centered_position(
-            monitor_position,
-            monitor_size,
-            quick_settings_size,
-            edge_margin,
-        );
-        let quick_settings_position = right_centered_position(
-            monitor_position,
-            monitor_size,
-            quick_settings_size,
-            edge_margin,
-        );
         let settings_position = centered_position(monitor_position, monitor_size, settings_size);
         Self {
             idle_left_position,
             idle_position,
             idle_size,
-            quick_settings_left_position,
-            quick_settings_position,
             quick_settings_size,
             settings_position,
             settings_size,
             annotation_position: monitor_position,
             annotation_size: monitor_size,
+        }
+    }
+
+    /// 返回指定非批注视图、吸附边和目标纵坐标对应的最终几何。
+    fn idle_placement(
+        self,
+        view: IdleWindowView,
+        dock_side: DockSide,
+        floating_top: i32,
+    ) -> WindowPlacement {
+        let size = self.idle_size(view);
+        let base_position = match (view, dock_side) {
+            (IdleWindowView::Toolbar, DockSide::Left) => self.idle_left_position,
+            (IdleWindowView::Toolbar, DockSide::Right) => self.idle_position,
+            (IdleWindowView::QuickSettings, DockSide::Left) => self.idle_left_position,
+            (IdleWindowView::QuickSettings, DockSide::Right) => PhysicalPosition::new(
+                self.idle_position.x + self.idle_size.width as i32 - size.width as i32,
+                self.idle_position.y,
+            ),
+            (IdleWindowView::Settings, _) => self.settings_position,
+        };
+        let position = if view == IdleWindowView::Settings {
+            base_position
+        } else {
+            PhysicalPosition::new(
+                base_position.x,
+                clamp_window_top(
+                    floating_top,
+                    self.annotation_position,
+                    self.annotation_size,
+                    size,
+                ),
+            )
+        };
+        WindowPlacement { position, size }
+    }
+
+    /// 返回全屏批注使用的主显示器最终几何。
+    fn annotation_placement(self) -> WindowPlacement {
+        WindowPlacement {
+            position: self.annotation_position,
+            size: self.annotation_size,
+        }
+    }
+
+    /// 返回指定非批注窗口视图的固定物理尺寸。
+    const fn idle_size(self, view: IdleWindowView) -> PhysicalSize<u32> {
+        match view {
+            IdleWindowView::Toolbar => self.idle_size,
+            IdleWindowView::QuickSettings => self.quick_settings_size,
+            IdleWindowView::Settings => self.settings_size,
         }
     }
 }
@@ -154,6 +212,7 @@ pub struct D3DWindowContext {
     geometry: WindowGeometry,
     dock_side: Cell<DockSide>,
     floating_top: Cell<i32>,
+    idle_size_correction_pending: Cell<bool>,
 }
 
 /// 持有渲染线程独占的 D3D12 设备和 DirectComposition 交换链。
@@ -168,6 +227,8 @@ pub struct D3DRenderContext {
     composition_device: IDCompositionDevice,
     _composition_target: IDCompositionTarget,
     composition_visual: IDCompositionVisual,
+    visual_content_pending: bool,
+    visual_offset_reset_armed: bool,
 }
 
 impl D3DWindowContext {
@@ -220,6 +281,7 @@ impl D3DWindowContext {
             geometry,
             dock_side: Cell::new(DockSide::Right),
             floating_top: Cell::new(geometry.idle_position.y),
+            idle_size_correction_pending: Cell::new(true),
         })
     }
 
@@ -233,14 +295,12 @@ impl D3DWindowContext {
         self.render_target
     }
 
-    /// 显示已经连接 DirectComposition visual tree 的窗口，并从 Windows shell 隐藏该工具窗口。
-    pub fn show(&self) -> Result<(), AppError> {
-        self.window.set_visible(true);
+    /// 以运行时选定的稳定几何显示窗口，并从 Windows shell 隐藏该工具窗口。
+    pub(crate) fn show(&self, placement: WindowPlacement) -> Result<(), AppError> {
         self.window
             .set_min_inner_size(Some(self.geometry.idle_size));
-        self.window
-            .set_outer_position(self.idle_position(IdleWindowView::Toolbar));
-        let _ = self.window.request_inner_size(self.geometry.idle_size);
+        self.apply_window_placement_inner(placement)?;
+        self.window.set_visible(true);
         apply_tool_window_style(self.render_target.hwnd())?;
         self.window.set_skip_taskbar(true);
         Ok(())
@@ -285,6 +345,8 @@ impl D3DRenderContext {
             composition_device,
             _composition_target: composition_target,
             composition_visual,
+            visual_content_pending: false,
+            visual_offset_reset_armed: false,
         })
     }
 
@@ -327,17 +389,13 @@ impl D3DRenderContext {
             .map_err(|error| graphics_error("无法读取 DXGI back buffer", error))
     }
 
-    /// 为新窗口尺寸创建交换链并原子替换 visual content，避免 ResizeBuffers 外部引用限制。
+    /// 为新窗口尺寸准备交换链，等首帧呈现成功后再替换 visual content。
     pub fn recreate_swap_chain(&mut self, size: PhysicalSize<u32>) -> Result<(), AppError> {
         let swap_chain = create_swap_chain(&self.factory, &self.queue, size)?;
-        unsafe { self.composition_visual.SetContent(&swap_chain) }
-            .map_err(|error| graphics_error("无法替换 DirectComposition swap chain", error))?;
-        unsafe { self.composition_device.Commit() }
-            .map_err(|error| graphics_error("无法提交 DirectComposition 尺寸更新", error))
-            .map(|()| {
-                self.swap_chain = swap_chain;
-                self.swap_chain_size = PhysicalSize::new(size.width.max(1), size.height.max(1));
-            })
+        self.swap_chain = swap_chain;
+        self.swap_chain_size = PhysicalSize::new(size.width.max(1), size.height.max(1));
+        self.visual_content_pending = true;
+        Ok(())
     }
 
     /// 为 idle 模式重建完整 D3D12 设备栈，使旧设备资源可以在驱动稳定期释放。
@@ -348,10 +406,6 @@ impl D3DRenderContext {
         let queue = unsafe { device.CreateCommandQueue(&Default::default()) }
             .map_err(|error| graphics_error("无法重建 D3D12 command queue", error))?;
         let swap_chain = create_swap_chain(&factory, &queue, size)?;
-        unsafe { self.composition_visual.SetContent(&swap_chain) }
-            .map_err(|error| graphics_error("无法绑定重建的 composition swap chain", error))?;
-        unsafe { self.composition_device.Commit() }
-            .map_err(|error| graphics_error("无法提交重建的图形设备", error))?;
         let diagnostics = read_graphics_diagnostics(&adapter, software_fallback)?;
 
         self.factory = factory;
@@ -361,14 +415,74 @@ impl D3DRenderContext {
         self.swap_chain = swap_chain;
         self.swap_chain_size = PhysicalSize::new(size.width.max(1), size.height.max(1));
         self.diagnostics = diagnostics;
+        self.visual_content_pending = true;
         Ok(())
     }
 
-    /// 提交当前 back buffer，透明像素由 DirectComposition 按预乘 alpha 合成。
-    pub fn present(&self) -> Result<(), AppError> {
+    /// 同步提交旧 visual 的临时偏移，使 HWND 改位后旧画面仍停留在原屏幕位置。
+    pub fn hold_visual_offset(&mut self, offset: PhysicalPosition<i32>) -> Result<(), AppError> {
+        self.commit_visual_offset(offset, "无法提交 DirectComposition 旧画面冻结")?;
+        self.visual_offset_reset_armed = false;
+        Ok(())
+    }
+
+    /// 标记目标首帧呈现时需要在同一次 composition commit 中清除临时偏移。
+    pub const fn arm_visual_offset_reset(&mut self) {
+        self.visual_offset_reset_armed = true;
+    }
+
+    /// 在窗口几何提交失败时立即把 visual 恢复到 HWND 原点。
+    pub fn reset_visual_offset_immediately(&mut self) -> Result<(), AppError> {
+        self.commit_visual_offset(
+            PhysicalPosition::new(0, 0),
+            "无法回滚 DirectComposition 旧画面冻结",
+        )?;
+        self.visual_offset_reset_armed = false;
+        Ok(())
+    }
+
+    /// 提交当前 back buffer，并原子替换新内容及清除旧 visual 的临时偏移。
+    pub fn present(&mut self) -> Result<(), AppError> {
         unsafe { self.swap_chain.Present(1, DXGI_PRESENT::default()) }
             .ok()
-            .map_err(|error| graphics_error("DXGI Present 失败", error))
+            .map_err(|error| graphics_error("DXGI Present 失败", error))?;
+
+        if self.visual_content_pending {
+            unsafe { self.composition_visual.SetContent(&self.swap_chain) }.map_err(|error| {
+                graphics_error("无法替换已完成首帧的 DirectComposition swap chain", error)
+            })?;
+        }
+        if self.visual_offset_reset_armed {
+            unsafe { self.composition_visual.SetOffsetX2(0.0) }.map_err(|error| {
+                graphics_error("无法清除 DirectComposition visual 横向偏移", error)
+            })?;
+            unsafe { self.composition_visual.SetOffsetY2(0.0) }.map_err(|error| {
+                graphics_error("无法清除 DirectComposition visual 纵向偏移", error)
+            })?;
+        }
+        if self.visual_content_pending || self.visual_offset_reset_armed {
+            unsafe { self.composition_device.Commit() }
+                .map_err(|error| graphics_error("无法提交 DirectComposition 目标首帧", error))?;
+            self.visual_content_pending = false;
+            self.visual_offset_reset_armed = false;
+        }
+        Ok(())
+    }
+
+    /// 设置并同步提交 DirectComposition visual 的物理像素偏移。
+    fn commit_visual_offset(
+        &self,
+        offset: PhysicalPosition<i32>,
+        context: &str,
+    ) -> Result<(), AppError> {
+        unsafe { self.composition_visual.SetOffsetX2(offset.x as f32) }
+            .map_err(|error| graphics_error("无法设置 DirectComposition visual 横向偏移", error))?;
+        unsafe { self.composition_visual.SetOffsetY2(offset.y as f32) }
+            .map_err(|error| graphics_error("无法设置 DirectComposition visual 纵向偏移", error))?;
+        unsafe { self.composition_device.Commit() }
+            .map_err(|error| graphics_error(context, error))?;
+        unsafe { self.composition_device.WaitForCommitCompletion() }
+            .map_err(|error| graphics_error("等待 DirectComposition visual 偏移生效失败", error))
     }
 
     /// 返回一份供事件线程展示的图形设备诊断快照。
@@ -378,36 +492,38 @@ impl D3DRenderContext {
 }
 
 impl D3DWindowContext {
-    /// 将窗口切换到主显示器全屏批注几何或悬浮工具栏几何。
-    pub fn set_annotation_mode(&self, annotation_enabled: bool) {
-        let (position, size) = if annotation_enabled {
-            (
-                self.geometry.annotation_position,
-                self.geometry.annotation_size,
-            )
-        } else {
-            (
-                self.idle_position(IdleWindowView::Toolbar),
-                self.geometry.idle_size,
-            )
-        };
-        self.window.set_outer_position(position);
-        let _ = self.window.request_inner_size(size);
-        self.window.request_redraw();
+    /// 返回窗口当前实际物理位置和客户区尺寸。
+    pub(crate) fn current_placement(&self) -> Result<WindowPlacement, AppError> {
+        let position = self
+            .window
+            .outer_position()
+            .map_err(|error| AppError::Graphics(format!("无法读取当前窗口位置: {error}")))?;
+        Ok(WindowPlacement {
+            position,
+            size: self.window.inner_size(),
+        })
     }
 
-    /// 在非批注模式下切换紧凑工具栏、快捷设置或完整设置窗口几何。
-    pub fn set_idle_window_view(&self, view: IdleWindowView) {
-        let size = self.idle_size(view);
-        let position = self.idle_position(view);
-        self.window.set_outer_position(position);
-        let _ = self.window.request_inner_size(size);
-        self.window.request_redraw();
+    /// 返回主显示器全屏批注或悬浮工具栏的稳定目标几何。
+    pub(crate) fn target_annotation_placement(&self, annotation_enabled: bool) -> WindowPlacement {
+        if annotation_enabled {
+            self.geometry.annotation_placement()
+        } else {
+            self.idle_placement(IdleWindowView::Toolbar)
+        }
+    }
+
+    /// 返回非批注模式指定视图的稳定目标几何。
+    pub(crate) fn target_idle_placement(&self, view: IdleWindowView) -> WindowPlacement {
+        self.idle_placement(view)
     }
 
     /// 在创建期异步 Win32 消息把窄窗恢复到系统最小宽度后重新请求目标尺寸。
     pub fn correct_idle_size(&self, view: IdleWindowView, actual_size: PhysicalSize<u32>) -> bool {
-        let expected_size = self.idle_size(view);
+        if !self.idle_size_correction_pending.replace(false) {
+            return false;
+        }
+        let expected_size = self.geometry.idle_size(view);
         if actual_size == expected_size {
             return false;
         }
@@ -423,11 +539,11 @@ impl D3DWindowContext {
     }
 
     /// 根据窗口中心吸附到主显示器左侧或右侧，并返回新的边缘。
-    pub fn finish_idle_window_drag(&self, view: IdleWindowView) -> DockSide {
+    pub fn finish_idle_window_drag(&self, view: IdleWindowView) -> Result<DockSide, AppError> {
         let window_position = self
             .window
             .outer_position()
-            .unwrap_or_else(|_| self.idle_position(view));
+            .unwrap_or_else(|_| self.idle_placement(view).position);
         let window_size = self.window.inner_size();
         let monitor_center =
             self.geometry.annotation_position.x + self.geometry.annotation_size.width as i32 / 2;
@@ -444,8 +560,8 @@ impl D3DWindowContext {
             window_size,
         ));
         self.dock_side.set(side);
-        self.set_idle_window_view(view);
-        side
+        self.apply_window_placement(self.idle_placement(view))?;
+        Ok(side)
     }
 
     /// 返回当前悬浮工具栏吸附边缘。
@@ -458,40 +574,58 @@ impl D3DWindowContext {
         self.dock_side.set(side);
     }
 
-    /// 返回指定非批注窗口视图在当前吸附边缘的位置。
-    fn idle_position(&self, view: IdleWindowView) -> PhysicalPosition<i32> {
-        let base_position = match (view, self.dock_side.get()) {
-            (IdleWindowView::Toolbar, DockSide::Left) => self.geometry.idle_left_position,
-            (IdleWindowView::Toolbar, DockSide::Right) => self.geometry.idle_position,
-            (IdleWindowView::QuickSettings, DockSide::Left) => {
-                self.geometry.quick_settings_left_position
-            }
-            (IdleWindowView::QuickSettings, DockSide::Right) => {
-                self.geometry.quick_settings_position
-            }
-            (IdleWindowView::Settings, _) => self.geometry.settings_position,
-        };
-        if view == IdleWindowView::Settings {
-            return base_position;
-        }
-        PhysicalPosition::new(
-            base_position.x,
-            clamp_window_top(
-                self.floating_top.get(),
-                self.geometry.annotation_position,
-                self.geometry.annotation_size,
-                self.idle_size(view),
-            ),
-        )
+    /// 返回指定非批注窗口视图在当前吸附状态下的最终几何。
+    fn idle_placement(&self, view: IdleWindowView) -> WindowPlacement {
+        self.geometry
+            .idle_placement(view, self.dock_side.get(), self.floating_top.get())
     }
 
-    /// 返回指定非批注窗口视图的固定物理尺寸。
-    const fn idle_size(&self, view: IdleWindowView) -> PhysicalSize<u32> {
-        match view {
-            IdleWindowView::Toolbar => self.geometry.idle_size,
-            IdleWindowView::QuickSettings => self.geometry.quick_settings_size,
-            IdleWindowView::Settings => self.geometry.settings_size,
+    /// 通过一次 Win32 调用同时提交窗口位置和尺寸，避免暴露中间几何。
+    pub(crate) fn apply_window_placement(
+        &self,
+        placement: WindowPlacement,
+    ) -> Result<(), AppError> {
+        self.idle_size_correction_pending.set(false);
+        self.apply_window_placement_inner(placement)
+    }
+
+    /// 通过一次 Win32 调用提交位置和尺寸，不改变创建期尺寸纠正状态。
+    fn apply_window_placement_inner(&self, placement: WindowPlacement) -> Result<(), AppError> {
+        let width = i32::try_from(placement.size.width).map_err(|_| {
+            AppError::Graphics(format!(
+                "窗口目标宽度超出 Win32 范围: {}",
+                placement.size.width
+            ))
+        })?;
+        let height = i32::try_from(placement.size.height).map_err(|_| {
+            AppError::Graphics(format!(
+                "窗口目标高度超出 Win32 范围: {}",
+                placement.size.height
+            ))
+        })?;
+        unsafe {
+            SetWindowPos(
+                self.render_target.hwnd(),
+                None,
+                placement.position.x,
+                placement.position.y,
+                width,
+                height,
+                SWP_NOACTIVATE | SWP_NOZORDER,
+            )
         }
+        .map_err(|error| {
+            graphics_error(
+                &format!(
+                    "无法更新窗口几何 x={} y={} width={} height={}",
+                    placement.position.x,
+                    placement.position.y,
+                    placement.size.width,
+                    placement.size.height
+                ),
+                error,
+            )
+        })
     }
 }
 
@@ -712,5 +846,145 @@ fn clamp_window_top(
         desired_top.clamp(minimum, maximum)
     } else {
         monitor_position.y + (monitor_size.height as i32 - window_size.height as i32) / 2
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 创建不依赖原生显示器句柄的窗口几何测试样本。
+    fn geometry_fixture() -> WindowGeometry {
+        WindowGeometry {
+            idle_left_position: PhysicalPosition::new(16, 441),
+            idle_position: PhysicalPosition::new(1_834, 441),
+            idle_size: PhysicalSize::new(70, 198),
+            quick_settings_size: PhysicalSize::new(440, 336),
+            settings_position: PhysicalPosition::new(680, 220),
+            settings_size: PhysicalSize::new(560, 640),
+            annotation_position: PhysicalPosition::new(0, 0),
+            annotation_size: PhysicalSize::new(1_920, 1_080),
+        }
+    }
+
+    /// 验证快捷设置复用工具栏锚点，并始终向屏幕内侧展开。
+    #[test]
+    fn quick_settings_expand_inward_from_toolbar_anchor() {
+        let geometry = geometry_fixture();
+
+        assert_eq!(
+            geometry.idle_placement(IdleWindowView::QuickSettings, DockSide::Left, 300),
+            WindowPlacement {
+                position: PhysicalPosition::new(16, 300),
+                size: PhysicalSize::new(440, 336),
+            }
+        );
+        assert_eq!(
+            geometry.idle_placement(IdleWindowView::QuickSettings, DockSide::Right, 300),
+            WindowPlacement {
+                position: PhysicalPosition::new(1_464, 300),
+                size: PhysicalSize::new(440, 336),
+            }
+        );
+    }
+
+    /// 验证工具栏和快捷设置往返时保留纵向位置并按各自高度夹取。
+    #[test]
+    fn idle_view_round_trip_preserves_and_clamps_floating_top() {
+        let geometry = geometry_fixture();
+        let toolbar_before = geometry.idle_placement(IdleWindowView::Toolbar, DockSide::Left, 800);
+        let quick_settings =
+            geometry.idle_placement(IdleWindowView::QuickSettings, DockSide::Left, 800);
+        let toolbar_after = geometry.idle_placement(IdleWindowView::Toolbar, DockSide::Left, 800);
+
+        assert_eq!(toolbar_before.position.y, 800);
+        assert_eq!(quick_settings.position.y, 744);
+        assert_eq!(toolbar_after, toolbar_before);
+        assert_eq!(
+            geometry
+                .idle_placement(IdleWindowView::QuickSettings, DockSide::Right, -100)
+                .position
+                .y,
+            0
+        );
+    }
+
+    /// 验证设置页保持居中且全屏批注完整复用显示器几何。
+    #[test]
+    fn fixed_views_use_stable_geometry() {
+        let geometry = geometry_fixture();
+        assert_eq!(
+            geometry.idle_placement(IdleWindowView::Settings, DockSide::Left, -500),
+            WindowPlacement {
+                position: PhysicalPosition::new(680, 220),
+                size: PhysicalSize::new(560, 640),
+            }
+        );
+        assert_eq!(
+            geometry.annotation_placement(),
+            WindowPlacement {
+                position: PhysicalPosition::new(0, 0),
+                size: PhysicalSize::new(1_920, 1_080),
+            }
+        );
+    }
+
+    /// 验证 HWND 移到目标位置后，反向 visual 偏移会把旧画面固定在原屏幕坐标。
+    #[test]
+    fn visual_offset_preserves_source_screen_position() {
+        let source = WindowPlacement {
+            position: PhysicalPosition::new(1_834, 441),
+            size: PhysicalSize::new(70, 198),
+        };
+        let target = WindowPlacement {
+            position: PhysicalPosition::new(0, 0),
+            size: PhysicalSize::new(1_920, 1_080),
+        };
+
+        let offset = source.visual_offset_to(target);
+
+        assert_eq!(offset, PhysicalPosition::new(1_834, 441));
+        assert_eq!(target.position.x + offset.x, source.position.x);
+        assert_eq!(target.position.y + offset.y, source.position.y);
+    }
+
+    /// 验证三档目标 DPI 下全部非批注视图在左右吸附时保持完整可见。
+    #[test]
+    fn supported_dpi_placements_stay_inside_monitor() {
+        let monitor_position = PhysicalPosition::new(100, -200);
+        let monitor_size = PhysicalSize::new(3_840, 2_160);
+
+        for scale_factor in [1.0, 1.5, 2.0] {
+            let geometry =
+                WindowGeometry::from_monitor_metrics(monitor_position, monitor_size, scale_factor);
+            for view in [
+                IdleWindowView::Toolbar,
+                IdleWindowView::QuickSettings,
+                IdleWindowView::Settings,
+            ] {
+                for side in [DockSide::Left, DockSide::Right] {
+                    let placement = geometry.idle_placement(view, side, i32::MAX);
+                    assert_placement_inside_monitor(placement, monitor_position, monitor_size);
+                }
+            }
+        }
+    }
+
+    /// 断言一个窗口最终几何完整落在指定显示器物理边界内。
+    fn assert_placement_inside_monitor(
+        placement: WindowPlacement,
+        monitor_position: PhysicalPosition<i32>,
+        monitor_size: PhysicalSize<u32>,
+    ) {
+        assert!(placement.position.x >= monitor_position.x);
+        assert!(placement.position.y >= monitor_position.y);
+        assert!(
+            placement.position.x + placement.size.width as i32
+                <= monitor_position.x + monitor_size.width as i32
+        );
+        assert!(
+            placement.position.y + placement.size.height as i32
+                <= monitor_position.y + monitor_size.height as i32
+        );
     }
 }

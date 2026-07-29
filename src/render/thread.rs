@@ -2,10 +2,10 @@ use std::{
     collections::VecDeque,
     sync::{Arc, Condvar, Mutex, mpsc},
     thread::{self, JoinHandle},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
-use winit::dpi::PhysicalSize;
+use winit::dpi::{PhysicalPosition, PhysicalSize};
 
 use super::{Compositor, EguiFrame};
 use crate::{
@@ -17,6 +17,8 @@ use crate::{
     },
     window::{D3DRenderContext, D3DRenderTarget, GraphicsDiagnostics},
 };
+
+const VISUAL_CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// 事件线程仅在用户开启监控时附加的一帧时间事实。
 #[derive(Debug, Clone, Copy)]
@@ -44,6 +46,14 @@ pub enum RenderEvent {
 
 /// 必须按事件线程提交顺序执行的渲染控制命令。
 enum RenderControl {
+    HoldWindowVisual {
+        offset: PhysicalPosition<i32>,
+        completed: mpsc::SyncSender<Result<(), String>>,
+    },
+    ArmWindowVisualReset,
+    ResetWindowVisual {
+        completed: mpsc::SyncSender<Result<(), String>>,
+    },
     Resize(PhysicalSize<u32>),
     SetAnnotationResourcesEnabled(bool),
     InvalidateInk,
@@ -102,10 +112,10 @@ impl RenderMailbox {
     }
 
     /// 追加控制命令；连续 resize 和资源驻留切换只保留最后一次目标。
-    fn submit_control(&self, control: RenderControl) {
+    fn submit_control(&self, control: RenderControl) -> bool {
         let mut state = self.state.lock().expect("渲染邮箱互斥量不应中毒");
         if state.closed {
-            return;
+            return false;
         }
         let coalesced = match (&mut state.controls.back_mut(), &control) {
             (Some(RenderControl::Resize(current)), RenderControl::Resize(next)) => {
@@ -125,6 +135,35 @@ impl RenderMailbox {
             state.controls.push_back(control);
         }
         self.ready.notify_one();
+        true
+    }
+
+    /// 丢弃切换命令产生的旧布局图形、保留全部纹理增量并排队同步 visual 冻结。
+    fn submit_visual_hold(
+        &self,
+        offset: PhysicalPosition<i32>,
+        mut source_frame: Option<RenderFrame>,
+        completed: mpsc::SyncSender<Result<(), String>>,
+    ) -> bool {
+        let mut state = self.state.lock().expect("渲染邮箱互斥量不应中毒");
+        if state.closed {
+            return false;
+        }
+        if let Some(stale) = state.frame.take() {
+            state
+                .skipped_texture_deltas
+                .extend(stale.egui.texture_deltas);
+        }
+        if let Some(source_frame) = source_frame.as_mut() {
+            state
+                .skipped_texture_deltas
+                .append(&mut source_frame.egui.texture_deltas);
+        }
+        state
+            .controls
+            .push_back(RenderControl::HoldWindowVisual { offset, completed });
+        self.ready.notify_one();
+        true
     }
 
     /// 丢弃与新尺寸不匹配的画面并排队最新 resize。
@@ -170,6 +209,7 @@ impl RenderMailbox {
     fn close(&self) {
         let mut state = self.state.lock().expect("渲染邮箱互斥量不应中毒");
         state.closed = true;
+        state.controls.clear();
         self.ready.notify_all();
     }
 }
@@ -243,6 +283,46 @@ impl RenderThread {
     /// 提交最新 owned frame；若旧帧尚未消费则只保留其纹理命令。
     pub fn submit_frame(&self, frame: RenderFrame) {
         self.mailbox.submit_frame(frame);
+    }
+
+    /// 同步冻结当前 visual，并只保留几何命令帧携带的 egui 纹理增量。
+    pub fn hold_window_visual(
+        &self,
+        offset: PhysicalPosition<i32>,
+        source_frame: Option<RenderFrame>,
+    ) -> Result<(), AppError> {
+        let (completed_tx, completed_rx) = mpsc::sync_channel(1);
+        if !self
+            .mailbox
+            .submit_visual_hold(offset, source_frame, completed_tx)
+        {
+            return Err(AppError::Graphics(
+                "渲染线程已退出，无法冻结窗口画面".to_owned(),
+            ));
+        }
+        wait_for_visual_control(completed_rx, "冻结窗口画面")
+    }
+
+    /// 排队在目标首帧呈现时清除旧 visual 的临时偏移。
+    pub fn arm_window_visual_reset(&self) {
+        self.mailbox
+            .submit_control(RenderControl::ArmWindowVisualReset);
+    }
+
+    /// 在 HWND 几何提交失败后同步恢复 visual 的零偏移。
+    pub fn reset_window_visual(&self) -> Result<(), AppError> {
+        let (completed_tx, completed_rx) = mpsc::sync_channel(1);
+        if !self
+            .mailbox
+            .submit_control(RenderControl::ResetWindowVisual {
+                completed: completed_tx,
+            })
+        {
+            return Err(AppError::Graphics(
+                "渲染线程已退出，无法恢复窗口画面".to_owned(),
+            ));
+        }
+        wait_for_visual_control(completed_rx, "恢复窗口画面")
     }
 
     /// 请求在下一帧前调整 swap chain 和全部 Skia surface。
@@ -335,6 +415,22 @@ fn run_render_thread(
         let mut shutdown = false;
         for control in work.controls {
             let result = match control {
+                RenderControl::HoldWindowVisual { offset, completed } => {
+                    let result = window_context.hold_visual_offset(offset);
+                    let completion = result.as_ref().map(|_| ()).map_err(ToString::to_string);
+                    let _ = completed.send(completion);
+                    result
+                }
+                RenderControl::ArmWindowVisualReset => {
+                    window_context.arm_visual_offset_reset();
+                    Ok(())
+                }
+                RenderControl::ResetWindowVisual { completed } => {
+                    let result = window_context.reset_visual_offset_immediately();
+                    let completion = result.as_ref().map(|_| ()).map_err(ToString::to_string);
+                    let _ = completed.send(completion);
+                    result
+                }
                 RenderControl::Resize(size) => compositor.resize(&mut window_context, size.into()),
                 RenderControl::SetAnnotationResourcesEnabled(enabled) => {
                     compositor.set_annotation_resources_enabled(enabled)
@@ -452,6 +548,23 @@ fn run_render_thread(
                     wake_event_loop,
                 );
             }
+        }
+    }
+}
+
+/// 有界等待渲染线程完成一个同步 visual 控制，避免 fatal 退出时永久阻塞事件线程。
+fn wait_for_visual_control(
+    completed: mpsc::Receiver<Result<(), String>>,
+    action: &str,
+) -> Result<(), AppError> {
+    match completed.recv_timeout(VISUAL_CONTROL_TIMEOUT) {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(detail)) => Err(AppError::Graphics(detail)),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            Err(AppError::Graphics(format!("等待渲染线程{action}超时")))
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err(AppError::Graphics(format!("渲染线程在{action}完成前退出")))
         }
     }
 }
@@ -602,6 +715,85 @@ mod tests {
         ));
         let frame = work.frame.expect("resize 后的新画面应保留");
         assert_eq!(frame.egui.texture_deltas.len(), 2);
+    }
+
+    /// 验证 visual 冻结丢弃所有旧布局图形，但把待处理帧和命令帧纹理增量交给目标帧。
+    #[test]
+    fn visual_hold_discards_old_frames_without_losing_texture_deltas() {
+        let mailbox = RenderMailbox::default();
+        mailbox.submit_frame(test_frame(1, 11));
+        let (completed, _receiver) = mpsc::sync_channel(1);
+        assert!(mailbox.submit_visual_hold(
+            PhysicalPosition::new(320, 180),
+            Some(test_frame(2, 22)),
+            completed,
+        ));
+
+        let hold_work = mailbox.wait_for_work();
+        assert!(hold_work.frame.is_none());
+        assert!(matches!(
+            hold_work.controls.front(),
+            Some(RenderControl::HoldWindowVisual { offset, .. })
+                if *offset == PhysicalPosition::new(320, 180)
+        ));
+
+        mailbox.submit_frame(test_frame(3, 33));
+        let target_frame = mailbox
+            .wait_for_work()
+            .frame
+            .expect("冻结后的目标帧应可消费");
+        let textures: Vec<_> = target_frame
+            .egui
+            .texture_deltas
+            .iter()
+            .flat_map(|delta| delta.free.iter())
+            .copied()
+            .collect();
+        assert_eq!(
+            textures,
+            vec![
+                TextureId::Managed(11),
+                TextureId::Managed(22),
+                TextureId::Managed(33)
+            ]
+        );
+    }
+
+    /// 验证 visual 偏移清零在目标 resize 和目标帧之前排队。
+    #[test]
+    fn visual_reset_is_ordered_before_target_resize_and_frame() {
+        let mailbox = RenderMailbox::default();
+        mailbox.submit_control(RenderControl::ArmWindowVisualReset);
+        mailbox.submit_resize(PhysicalSize::new(1_920, 1_080));
+        mailbox.submit_frame(test_frame(1, 11));
+
+        let work = mailbox.wait_for_work();
+        let controls: Vec<_> = work.controls.into_iter().collect();
+        assert!(matches!(
+            controls.as_slice(),
+            [RenderControl::ArmWindowVisualReset, RenderControl::Resize(size)]
+                if *size == PhysicalSize::new(1_920, 1_080)
+        ));
+        assert_eq!(work.frame.expect("目标帧应排在控制命令后").generation, 1);
+    }
+
+    /// 验证 mailbox 关闭会释放未处理同步命令，避免等待端永久阻塞。
+    #[test]
+    fn closing_mailbox_disconnects_pending_visual_control() {
+        let mailbox = RenderMailbox::default();
+        let (completed, receiver) = mpsc::sync_channel(1);
+        assert!(mailbox.submit_visual_hold(
+            PhysicalPosition::new(1, 1),
+            Some(test_frame(1, 11)),
+            completed,
+        ));
+
+        mailbox.close();
+
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
     }
 
     /// 验证慢合成负载下事件线程提交 p95 至少比同步执行低 50%。

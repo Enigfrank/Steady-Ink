@@ -17,9 +17,11 @@ AppVerName={#MyAppName} {#MyAppVersion}
 AppPublisher=Enigfrank
 AppPublisherURL=https://github.com/Enigfrank/Steady-Ink
 AppSupportURL=https://github.com/Enigfrank/Steady-Ink/issues
-DefaultDirName={autopf}\Steady Ink
+DefaultDirName={code:GetDefaultInstallDir}
 DefaultGroupName={#MyAppName}
+DisableDirPage=no
 DisableProgramGroupPage=yes
+UsePreviousAppDir=yes
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 PrivilegesRequired=admin
@@ -80,6 +82,8 @@ Root: HKLM64; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType
 Filename: "{app}\steady-ink.exe"; Description: "{cm:LaunchProgram,{#MyAppName}}"; Flags: nowait postinstall skipifsilent runasoriginaluser
 
 [Code]
+#include "default-dir.iss"
+
 const
   AutostartSubkey = 'Software\Microsoft\Windows\CurrentVersion\Run';
   AutostartValueName = 'Steady Ink';

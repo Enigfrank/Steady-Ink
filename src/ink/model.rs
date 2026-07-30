@@ -223,7 +223,7 @@ impl OperationId {
     }
 }
 
-/// 一条速度笔锋笔画中的确定位置和物理像素宽度。
+/// 一条可变笔锋笔画中的确定位置和物理像素宽度。
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct VariableStrokePoint {
     pub point: CanvasPoint,

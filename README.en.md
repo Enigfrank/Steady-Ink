@@ -20,7 +20,7 @@
 
 ## Features
 
-- Six pen colors, `4/6/8/16px` widths, optional speed tapering, three eraser sizes, undo, and clear.
+- Six pen colors, `4/6/8/16px` widths, optional natural tapering, three eraser sizes, undo, and clear.
 - Windows Pointer pen, touch, palm rejection, and palm erasing input.
 - PowerPoint and WPS presentation detection, navigation, and annotation integration.
 - Local crash recovery, readable mode, machine-wide startup, and in-app restart.

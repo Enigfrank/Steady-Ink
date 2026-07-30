@@ -40,7 +40,7 @@ impl InkDocument {
         Some(id)
     }
 
-    /// 追加一条已经固化逐点宽度的速度笔锋笔画。
+    /// 追加一条已经固化逐点宽度的可变笔锋笔画。
     pub fn append_variable_draw_stroke(
         &mut self,
         points: Vec<VariableStrokePoint>,

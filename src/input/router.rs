@@ -22,7 +22,7 @@ pub enum PointerAction {
     Cancel,
 }
 
-/// 一个供速度笔锋和普通笔画共用的带单调时间采样。
+/// 一个供输入路由和笔画构建共用的带单调时间采样。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PointerSample {
     pub point: CanvasPoint,

@@ -65,13 +65,13 @@ pub(super) const fn pen_width_selector_width(
     orientation.popup_width(PEN_WIDTHS.len(), metrics)
 }
 
-/// 绘制共用工具偏好，并按入口决定是否显示速度笔锋开关。
+/// 绘制共用工具偏好，并按入口决定是否显示自然笔锋开关。
 pub fn render_tool_preferences(
     ui: &mut Ui,
     tools: ToolState,
     metrics: InterfaceMetrics,
     readable_mode: bool,
-    show_speed_taper: bool,
+    show_natural_taper: bool,
 ) -> Option<UiCommand> {
     let color_command = render_color_selector(
         ui,
@@ -93,18 +93,18 @@ pub fn render_tool_preferences(
     if command.is_none() {
         command = eraser_size_command;
     }
-    if show_speed_taper {
+    if show_natural_taper {
         ui.add_space(metrics.space_2);
-        let mut speed_taper_enabled = tools.speed_taper_enabled;
+        let mut natural_taper_enabled = tools.natural_taper_enabled;
         if ui
             .add_sized(
                 [ui.available_width(), metrics.touch_target],
-                egui::Checkbox::new(&mut speed_taper_enabled, "速度模拟笔锋"),
+                egui::Checkbox::new(&mut natural_taper_enabled, "自然笔锋"),
             )
             .changed()
             && command.is_none()
         {
-            command = Some(UiCommand::SetSpeedTaperEnabled(speed_taper_enabled));
+            command = Some(UiCommand::SetNaturalTaperEnabled(natural_taper_enabled));
         }
     }
     command

@@ -1,10 +1,10 @@
 mod batch_drawer;
 mod document;
 mod model;
+mod natural_taper;
 mod page_store;
 pub(crate) mod renderer;
 mod spatial_index;
-mod speed_taper;
 mod stroke_geometry;
 mod surface_pool;
 mod velocity_tracker;
@@ -15,6 +15,7 @@ pub use model::{
     CanvasPoint, ClearOperation, DrawStroke, DrawStrokeShape, EraseSample, EraseStroke, EraserSize,
     InkBounds, InkColor, InkOperation, InkTool, OperationId, PenWidth, VariableStrokePoint,
 };
+pub(crate) use natural_taper::NaturalStrokeBuilder;
 pub use page_store::{PageInkEntry, PageInkStore, PageKey};
 pub use renderer::{ActiveInkPreview, InkRenderCache, InkSyncKind, OwnedActiveInkPreview};
 pub(crate) use renderer::{
@@ -22,7 +23,6 @@ pub(crate) use renderer::{
     draw_image_rect_logical, preview_replaces_region,
 };
 pub(crate) use spatial_index::InkSpatialIndex;
-pub(crate) use speed_taper::SpeedStrokeBuilder;
 pub(crate) use surface_pool::SurfacePool;
 pub(crate) use velocity_tracker::{
     BASE_PREVIEW_TILE_SIZE, VelocityTracker, preview_tile_size_for_velocity,

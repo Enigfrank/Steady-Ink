@@ -32,7 +32,7 @@ pub enum UiCommand {
     SetColor(InkColor),
     SetPenWidth(PenWidth),
     SetEraserSize(EraserSize),
-    SetSpeedTaperEnabled(bool),
+    SetNaturalTaperEnabled(bool),
     SetPalmSizePreset(PalmSizePreset),
     Undo,
     Clear,
@@ -110,7 +110,7 @@ pub struct ToolState {
     pub color: InkColor,
     pub pen_width: PenWidth,
     pub eraser_size: EraserSize,
-    pub speed_taper_enabled: bool,
+    pub natural_taper_enabled: bool,
 }
 
 /// 工具按钮组在当前帧产生的命令和拖动状态。
@@ -147,7 +147,7 @@ impl Default for ToolState {
             color: InkColor::default(),
             pen_width: PenWidth::default(),
             eraser_size: EraserSize::default(),
-            speed_taper_enabled: false,
+            natural_taper_enabled: false,
         }
     }
 }

@@ -100,7 +100,8 @@ pub struct ToolPreferences {
     pub color: InkColor,
     pub pen_width: PenWidth,
     pub eraser_size: EraserSize,
-    pub speed_taper_enabled: bool,
+    #[serde(alias = "speed_taper_enabled")]
+    pub natural_taper_enabled: bool,
 }
 
 impl Default for ToolPreferences {
@@ -110,7 +111,7 @@ impl Default for ToolPreferences {
             color: InkColor::default(),
             pen_width: PenWidth::default(),
             eraser_size: EraserSize::default(),
-            speed_taper_enabled: false,
+            natural_taper_enabled: false,
         }
     }
 }
@@ -168,7 +169,7 @@ mod tests {
         )
         .expect("旧版设置应能反序列化");
 
-        assert!(!settings.tools.speed_taper_enabled);
+        assert!(!settings.tools.natural_taper_enabled);
         assert_eq!(settings.palm_size_preset, PalmSizePreset::Standard);
     }
 
@@ -198,10 +199,10 @@ mod tests {
     }
 
     #[test]
-    fn speed_taper_preference_survives_a_toml_round_trip() {
+    fn natural_taper_preference_survives_a_toml_round_trip() {
         let settings = UserSettings {
             tools: super::ToolPreferences {
-                speed_taper_enabled: true,
+                natural_taper_enabled: true,
                 ..super::ToolPreferences::default()
             },
             ..UserSettings::default()
@@ -209,7 +210,26 @@ mod tests {
         let serialized = toml::to_string(&settings).expect("设置应能序列化");
         let reloaded: UserSettings = toml::from_str(&serialized).expect("设置应能反序列化");
 
-        assert!(reloaded.tools.speed_taper_enabled);
+        assert!(reloaded.tools.natural_taper_enabled);
+        assert!(serialized.contains("natural_taper_enabled = true"));
+        assert!(!serialized.contains("speed_taper_enabled"));
+    }
+
+    /// 验证旧速度笔锋键的启用和关闭值都迁移为自然笔锋设置。
+    #[test]
+    fn legacy_speed_taper_preference_migrates_on_save() {
+        for enabled in [false, true] {
+            let source = format!(
+                "[tools]\nspeed_taper_enabled = {}\n",
+                if enabled { "true" } else { "false" }
+            );
+            let settings: UserSettings = toml::from_str(&source).expect("旧设置键应能反序列化");
+            let serialized = toml::to_string(&settings).expect("迁移后的设置应能序列化");
+
+            assert_eq!(settings.tools.natural_taper_enabled, enabled);
+            assert!(serialized.contains(&format!("natural_taper_enabled = {enabled}")));
+            assert!(!serialized.contains("speed_taper_enabled"));
+        }
     }
 
     /// 验证三档手掌尺寸使用稳定名称完成设置往返。

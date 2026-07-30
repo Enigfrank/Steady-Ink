@@ -1205,7 +1205,7 @@ fn draw_pen_path(canvas: &Canvas, points: &[CanvasPoint], color: InkColor, width
     canvas.draw_path(&path, &paint);
 }
 
-/// 使用单个填充路径绘制逐点宽度速度笔锋，避免每点独立 GPU 绘制。
+/// 使用单个填充路径绘制逐点宽度笔锋，避免每点独立 GPU 绘制。
 fn draw_variable_pen_path(canvas: &Canvas, points: &[VariableStrokePoint], color: InkColor) {
     let Some(first) = points.first() else {
         return;

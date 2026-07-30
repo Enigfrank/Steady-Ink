@@ -22,7 +22,7 @@ use crate::{
     error::AppError,
     ink::{
         ActiveInkPreview, CanvasPoint, EraseSample, InkDocument, InkOperation, InkTool,
-        OwnedActiveInkPreview, SpeedStrokeBuilder, VariableStrokePoint,
+        NaturalStrokeBuilder, OwnedActiveInkPreview, VariableStrokePoint,
     },
     input::{
         InputRouter, PointerAction, PointerSample, SharedPalmSizePreset, WindowsPointerEvent,
@@ -73,51 +73,38 @@ struct ActiveGesture {
     samples: ActiveGestureSamples,
     tool: InkTool,
     tools: ToolState,
-    speed_builder: Option<SpeedStrokeBuilder>,
+    natural_builder: Option<NaturalStrokeBuilder>,
     variable_preview: Vec<VariableStrokePoint>,
 }
 
 #[derive(Debug)]
 enum ActiveGestureSamples {
-    Tool {
-        points: Vec<CanvasPoint>,
-        timestamps_micros: Option<Vec<u64>>,
-    },
+    Tool { points: Vec<CanvasPoint> },
     PalmErase(Vec<EraseSample>),
 }
 
 impl ActiveGesture {
     /// 使用当前工具选择从第一个物理像素点开始手势。
-    fn new(sample: PointerSample, tools: ToolState, dpi_scale: f32) -> Self {
-        let speed_builder = (tools.tool == InkTool::Pen && tools.speed_taper_enabled)
-            .then(|| {
-                SpeedStrokeBuilder::new(
-                    sample.point,
-                    sample.timestamp_micros,
-                    tools.pen_width.pixels(),
-                    dpi_scale,
-                )
-            })
+    fn new(sample: PointerSample, tools: ToolState) -> Self {
+        let natural_builder = (tools.tool == InkTool::Pen && tools.natural_taper_enabled)
+            .then(|| NaturalStrokeBuilder::new(sample.point, tools.pen_width.pixels()))
             .flatten();
         Self {
             samples: ActiveGestureSamples::Tool {
                 points: vec![sample.point],
-                timestamps_micros: speed_builder
-                    .as_ref()
-                    .map(|_| vec![sample.timestamp_micros]),
             },
             tool: tools.tool,
             tools,
-            speed_builder,
+            natural_builder,
             variable_preview: Vec::new(),
         }
     }
 
     /// 使用当前工具选择从第一个非空物理像素批次开始手势。
-    fn from_points(points: Vec<PointerSample>, tools: ToolState, dpi_scale: f32) -> Option<Self> {
+    fn from_points(points: Vec<PointerSample>, tools: ToolState) -> Option<Self> {
         let mut points = points.into_iter();
         let first = points.next()?;
-        let mut gesture = Self::new(first, tools, dpi_scale);
+        let mut gesture = Self::new(first, tools);
         gesture.extend(points);
         Some(gesture)
     }
@@ -128,7 +115,7 @@ impl ActiveGesture {
             samples: ActiveGestureSamples::PalmErase(vec![sample]),
             tool: tools.tool,
             tools,
-            speed_builder: None,
+            natural_builder: None,
             variable_preview: Vec::new(),
         }
     }
@@ -142,11 +129,7 @@ impl ActiveGesture {
 
     /// 追加一个与上一个点有实际距离的采样，避免驱动重复点膨胀历史。
     fn push_point(&mut self, sample: PointerSample) {
-        let ActiveGestureSamples::Tool {
-            points,
-            timestamps_micros,
-        } = &mut self.samples
-        else {
+        let ActiveGestureSamples::Tool { points } = &mut self.samples else {
             return;
         };
         let should_push = points.last().is_none_or(|last| {
@@ -156,11 +139,8 @@ impl ActiveGesture {
         });
         if should_push {
             points.push(sample.point);
-            if let Some(timestamps_micros) = timestamps_micros.as_mut() {
-                timestamps_micros.push(sample.timestamp_micros);
-            }
-            if let Some(builder) = self.speed_builder.as_mut() {
-                builder.push(sample.point, sample.timestamp_micros);
+            if let Some(builder) = self.natural_builder.as_mut() {
+                builder.push(sample.point);
             }
         }
     }
@@ -176,7 +156,7 @@ impl ActiveGesture {
     fn preview(&mut self) -> ActiveInkPreview<'_> {
         match &self.samples {
             ActiveGestureSamples::Tool { points, .. } => {
-                if let Some(builder) = self.speed_builder.as_ref() {
+                if let Some(builder) = self.natural_builder.as_ref() {
                     builder.finalize_into(&mut self.variable_preview);
                     ActiveInkPreview::VariableTool {
                         points: &self.variable_preview,
@@ -199,11 +179,11 @@ impl ActiveGesture {
 
     /// 把完整手势提交为一次画笔或区域擦除 operation。
     fn commit(self, document: &mut InkDocument) -> bool {
-        let speed_builder = self.speed_builder;
+        let natural_builder = self.natural_builder;
         match self.samples {
             ActiveGestureSamples::Tool { points, .. } => match self.tool {
                 InkTool::Pen => {
-                    if let Some(builder) = speed_builder {
+                    if let Some(builder) = natural_builder {
                         document
                             .append_variable_draw_stroke(
                                 builder.finalized_points(),
@@ -304,7 +284,7 @@ impl DesktopRuntime {
             color: settings.tools.color,
             pen_width: settings.tools.pen_width,
             eraser_size: settings.tools.eraser_size,
-            speed_taper_enabled: settings.tools.speed_taper_enabled,
+            natural_taper_enabled: settings.tools.natural_taper_enabled,
         };
         let window_context = D3DWindowContext::new(event_loop)?;
         let slideshow_ui_window = SlideshowUiWindow::new(
@@ -451,10 +431,9 @@ impl DesktopRuntime {
     /// 将统一指针动作应用到当前活动手势或普通批注文档。
     fn apply_pointer_action(&mut self, action: PointerAction) -> bool {
         self.note_performance_input();
-        let dpi_scale = self.window_context.window().scale_factor() as f32;
         match action {
             PointerAction::Begin(point) => {
-                self.active_gesture = Some(ActiveGesture::new(point, self.tools, dpi_scale));
+                self.active_gesture = Some(ActiveGesture::new(point, self.tools));
                 false
             }
             PointerAction::Move(point) => {
@@ -473,7 +452,7 @@ impl DesktopRuntime {
                 false
             }
             PointerAction::BeginBatch(points) => {
-                self.active_gesture = ActiveGesture::from_points(points, self.tools, dpi_scale);
+                self.active_gesture = ActiveGesture::from_points(points, self.tools);
                 false
             }
             PointerAction::MoveBatch(points) => {
@@ -511,7 +490,7 @@ impl DesktopRuntime {
                 false
             }
             PointerAction::CommitBuffered(points) => {
-                if let Some(gesture) = ActiveGesture::from_points(points, self.tools, dpi_scale)
+                if let Some(gesture) = ActiveGesture::from_points(points, self.tools)
                     && let Some(document) = self.state.active_document_mut()
                 {
                     return gesture.commit(document);
@@ -712,9 +691,9 @@ impl DesktopRuntime {
                 self.settings.tools.eraser_size = size;
                 self.save_settings();
             }
-            UiCommand::SetSpeedTaperEnabled(enabled) => {
-                self.tools.speed_taper_enabled = enabled;
-                self.settings.tools.speed_taper_enabled = enabled;
+            UiCommand::SetNaturalTaperEnabled(enabled) => {
+                self.tools.natural_taper_enabled = enabled;
+                self.settings.tools.natural_taper_enabled = enabled;
                 self.save_settings();
             }
             UiCommand::SetPalmSizePreset(preset) => {
@@ -1864,14 +1843,9 @@ mod tests {
                 PointerSample::new(CanvasPoint::new(1.0, 0.0), 300),
             ],
             ToolState::default(),
-            1.0,
         )
         .expect("non-empty batch must start a gesture");
-        let ActiveGestureSamples::Tool {
-            points,
-            timestamps_micros,
-        } = gesture.samples
-        else {
+        let ActiveGestureSamples::Tool { points } = gesture.samples else {
             panic!("tool gesture must retain point samples");
         };
 
@@ -1879,7 +1853,6 @@ mod tests {
             points,
             vec![CanvasPoint::new(0.0, 0.0), CanvasPoint::new(1.0, 0.0)]
         );
-        assert!(timestamps_micros.is_none());
     }
 
     /// 验证固定宽度预览在急转弯时严格结束于最后一个真实采样。
@@ -1892,7 +1865,6 @@ mod tests {
                 PointerSample::new(CanvasPoint::new(8.0, 8.0), 16_000),
             ],
             ToolState::default(),
-            1.0,
         )
         .expect("有效批次应创建活动手势");
 
@@ -1914,11 +1886,11 @@ mod tests {
         assert_eq!(points.last(), Some(&CanvasPoint::new(8.0, 8.0)));
     }
 
-    /// 验证速度笔锋预览不在最后一个真实采样之外追加直线尾段。
+    /// 验证自然笔锋预览不外推尾段，且提交使用完全相同的变量点。
     #[test]
-    fn speed_taper_preview_has_no_extrapolated_tail() {
+    fn natural_taper_preview_matches_committed_points() {
         let tools = ToolState {
-            speed_taper_enabled: true,
+            natural_taper_enabled: true,
             ..ToolState::default()
         };
         let mut gesture = ActiveGesture::from_points(
@@ -1928,23 +1900,74 @@ mod tests {
                 PointerSample::new(CanvasPoint::new(8.0, 8.0), 16_000),
             ],
             tools,
-            1.0,
         )
         .expect("有效批次应创建活动手势");
-        let real_count = gesture
-            .speed_builder
-            .as_ref()
-            .expect("速度笔锋应创建构建器")
-            .finalized_points()
-            .len();
-
         let ActiveInkPreview::VariableTool { points, .. } = gesture.preview() else {
-            panic!("速度笔锋应生成可变宽度预览");
+            panic!("自然笔锋应生成可变宽度预览");
         };
-        assert_eq!(points.len(), real_count);
+        let preview_points = points.to_vec();
         assert_eq!(
-            points.last().map(|point| point.point),
+            preview_points.last().map(|point| point.point),
             Some(CanvasPoint::new(8.0, 8.0))
         );
+
+        let mut document = InkDocument::new();
+        assert!(gesture.commit(&mut document));
+        let [InkOperation::DrawStroke(stroke)] = document.operations() else {
+            panic!("提交应生成一条画笔操作");
+        };
+        let crate::ink::DrawStrokeShape::Variable { points } = &stroke.shape else {
+            panic!("自然笔锋应提交可变宽度几何");
+        };
+        assert_eq!(points, &preview_points);
+    }
+
+    /// 验证相同几何路径的自然笔锋不受采样时间戳变化影响。
+    #[test]
+    fn natural_taper_ignores_pointer_timestamps() {
+        let tools = ToolState {
+            natural_taper_enabled: true,
+            ..ToolState::default()
+        };
+        let positions = [
+            CanvasPoint::new(0.0, 0.0),
+            CanvasPoint::new(8.0, 0.0),
+            CanvasPoint::new(16.0, 8.0),
+            CanvasPoint::new(32.0, 8.0),
+        ];
+        let mut first = ActiveGesture::from_points(
+            positions
+                .into_iter()
+                .enumerate()
+                .map(|(index, point)| PointerSample::new(point, index as u64 * 1_000))
+                .collect(),
+            tools,
+        )
+        .expect("第一组采样应创建活动手势");
+        let mut second = ActiveGesture::from_points(
+            positions
+                .into_iter()
+                .enumerate()
+                .map(|(index, point)| PointerSample::new(point, index as u64 * 100_000 + 7))
+                .collect(),
+            tools,
+        )
+        .expect("第二组采样应创建活动手势");
+
+        let ActiveInkPreview::VariableTool {
+            points: first_points,
+            ..
+        } = first.preview()
+        else {
+            panic!("第一组采样应生成自然笔锋");
+        };
+        let ActiveInkPreview::VariableTool {
+            points: second_points,
+            ..
+        } = second.preview()
+        else {
+            panic!("第二组采样应生成自然笔锋");
+        };
+        assert_eq!(first_points, second_points);
     }
 }

@@ -2,4 +2,4 @@ mod runtime;
 mod state;
 
 pub use runtime::run;
-pub use state::{AppMode, AppState};
+pub use state::{AppMode, AppState, SlideshowInputMode};

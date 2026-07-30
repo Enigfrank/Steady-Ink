@@ -7,7 +7,7 @@ mod settings_view;
 mod slideshow_toolbar;
 mod toolbar;
 
-pub use toolbar::{IdlePanel, ToolState, UiCommand, UiViewState, render};
+pub use toolbar::{IdlePanel, ToolState, UiCommand, UiFrameOutput, UiViewState, render};
 
 use egui::{FontData, FontDefinitions, FontFamily};
 

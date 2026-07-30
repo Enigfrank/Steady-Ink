@@ -17,7 +17,7 @@ use winit::{
 };
 
 use crate::{
-    app::{AppMode, AppState},
+    app::{AppMode, AppState, SlideshowInputMode},
     autostart::{self, MachineAutostartState},
     error::AppError,
     ink::{
@@ -34,10 +34,13 @@ use crate::{
     render::{EguiUiState, RenderEvent, RenderFrame, RenderPerformanceMetadata, RenderThread},
     settings::{SettingsStore, UserSettings},
     slideshow::{
-        ComDetector, ComDetectorEvent, ComDiagnostics, SlideShowControlAction, SlideShowSession,
+        ComDetector, ComDetectorEvent, ComDiagnostics, PageSwitchOutcome, SlidePage,
+        SlideShowControlAction, SlideShowKey, SlideShowSession,
     },
-    ui::{self, IdlePanel, ToolState, UiCommand, UiViewState, design_tokens},
-    window::{D3DWindowContext, IdleWindowView, WindowPlacement},
+    ui::{self, IdlePanel, ToolState, UiCommand, UiFrameOutput, UiViewState, design_tokens},
+    window::{
+        D3DWindowContext, IdleWindowView, PhysicalHitRect, SlideshowUiWindow, WindowPlacement,
+    },
 };
 
 /// egui 请求立即或延迟重绘时发送给 winit 的用户事件。
@@ -228,16 +231,19 @@ impl ActiveGesture {
     }
 }
 
-/// 组合窗口、渲染器、状态机和输入路由的单窗口运行时。
+/// 组合主画布、放映控件窗口、渲染器、状态机和输入路由的桌面运行时。
 struct DesktopRuntime {
     redraw_proxy: EventLoopProxy<UserEvent>,
     render_thread: RenderThread,
     recovery: RecoveryManager,
     egui: EguiUiState,
+    slideshow_egui: EguiUiState,
+    slideshow_ui_window: SlideshowUiWindow,
     window_context: D3DWindowContext,
     state: AppState,
     empty_document: InkDocument,
     tools: ToolState,
+    slideshow_input_mode: SlideshowInputMode,
     input_router: InputRouter,
     active_gesture: Option<ActiveGesture>,
     windows_pointer_receiver: Receiver<WindowsPointerEvent>,
@@ -301,11 +307,19 @@ impl DesktopRuntime {
             speed_taper_enabled: settings.tools.speed_taper_enabled,
         };
         let window_context = D3DWindowContext::new(event_loop)?;
+        let slideshow_ui_window = SlideshowUiWindow::new(
+            event_loop,
+            window_context.render_target().raw_hwnd(),
+            window_context.target_annotation_placement(true),
+        )?;
         let egui = EguiUiState::new(event_loop, window_context.window());
+        let slideshow_egui = EguiUiState::new(event_loop, slideshow_ui_window.window());
         let render_wake_proxy = event_proxy.clone();
         let render_thread = RenderThread::spawn(
             window_context.render_target(),
             egui.context().clone(),
+            slideshow_ui_window.render_target(),
+            slideshow_egui.context().clone(),
             move || {
                 let _ = render_wake_proxy.send_event(UserEvent::Render);
             },
@@ -323,10 +337,13 @@ impl DesktopRuntime {
             render_thread,
             recovery,
             egui,
+            slideshow_egui,
+            slideshow_ui_window,
             window_context,
             state,
             empty_document: InkDocument::new(),
             tools,
+            slideshow_input_mode: SlideshowInputMode::Ink,
             input_router: InputRouter::default(),
             active_gesture: None,
             windows_pointer_receiver,
@@ -363,6 +380,11 @@ impl DesktopRuntime {
         self.window_context.window().id()
     }
 
+    /// 返回独立放映控件窗口标识。
+    fn slideshow_ui_window_id(&self) -> WindowId {
+        self.slideshow_ui_window.window_id()
+    }
+
     /// 使用恢复状态对应的稳定几何显示首次创建的窗口。
     fn show(&self) -> Result<(), AppError> {
         let placement = if self.state.mode().accepts_ink_input() {
@@ -397,10 +419,11 @@ impl DesktopRuntime {
         let event_response = self
             .egui
             .on_window_event(self.window_context.window(), event);
+        let accepts_canvas_input = self.accepts_canvas_input();
         if let Some(pointer_action) = self.input_router.route(
             event,
             event_response.consumed,
-            self.state.mode().accepts_ink_input(),
+            accepts_canvas_input,
             self.pen_contact_active.load(Ordering::Acquire),
         ) {
             if self.apply_pointer_action(pointer_action) {
@@ -409,6 +432,20 @@ impl DesktopRuntime {
             self.request_redraw();
         }
         Ok(surface_rebuilt || event_response.repaint)
+    }
+
+    /// 只把独立放映控件窗口事件交给其 egui 状态，不进入墨迹输入路由。
+    fn handle_slideshow_ui_window_event(&mut self, event: &WindowEvent) -> bool {
+        let surface_rebuilt = if let WindowEvent::Resized(size) = event {
+            self.render_thread.resize_slideshow_ui(*size);
+            true
+        } else {
+            false
+        };
+        let response = self
+            .slideshow_egui
+            .on_window_event(self.slideshow_ui_window.window(), event);
+        surface_rebuilt || response.repaint
     }
 
     /// 将统一指针动作应用到当前活动手势或普通批注文档。
@@ -509,6 +546,7 @@ impl DesktopRuntime {
         };
         let view = UiViewState {
             mode,
+            slideshow_input_mode: self.slideshow_input_mode,
             idle_panel: self.idle_panel,
             dock_side: self.window_context.dock_side(),
             tools,
@@ -535,10 +573,32 @@ impl DesktopRuntime {
             machine_autostart_error: self.machine_autostart_error.as_deref(),
             graphics_diagnostics: self.render_thread.diagnostics(),
         };
-        let mut ui_command = None;
+        let slideshow_active = mode.is_slideshow();
+        let mut ui_output = UiFrameOutput::default();
         let egui_frame = self.egui.run_ui(self.window_context.window(), |ui| {
-            ui_command = ui::render(ui, view)
+            if !slideshow_active {
+                ui_output = ui::render(ui, view);
+            }
         });
+        let slideshow_egui_frame =
+            self.slideshow_egui
+                .run_ui(self.slideshow_ui_window.window(), |ui| {
+                    if slideshow_active {
+                        ui_output = ui::render(ui, view);
+                    }
+                });
+        if slideshow_active {
+            let hit_regions = physical_hit_regions(
+                &ui_output.slideshow_hit_regions,
+                slideshow_egui_frame.pixels_per_point,
+            );
+            if let Err(error) = self.slideshow_ui_window.update_regions(&hit_regions) {
+                tracing::warn!(%error, "更新放映控件窗口区域失败");
+            }
+        } else if let Err(error) = self.slideshow_ui_window.hide() {
+            tracing::warn!(%error, "隐藏放映控件窗口失败");
+        }
+        let ui_command = ui_output.command;
 
         let document = self.state.active_document().unwrap_or(&self.empty_document);
         let preview = self.active_gesture.as_mut().map(ActiveGesture::preview);
@@ -558,6 +618,7 @@ impl DesktopRuntime {
             document: document.clone(),
             active_preview: preview.map(OwnedActiveInkPreview::from),
             egui: egui_frame,
+            slideshow_ui: slideshow_egui_frame,
             performance,
         };
 
@@ -597,10 +658,12 @@ impl DesktopRuntime {
         let mut outcome = UiCommandOutcome::default();
         match command {
             UiCommand::ExitApplication => {
+                self.reset_slideshow_input_mode();
                 outcome.exit_action = Some(ApplicationExitAction::Exit);
                 return outcome;
             }
             UiCommand::RestartApplication => {
+                self.reset_slideshow_input_mode();
                 outcome.exit_action = Some(ApplicationExitAction::Restart);
                 return outcome;
             }
@@ -615,7 +678,20 @@ impl DesktopRuntime {
                 }
             }
             UiCommand::SelectPen => self.tools.tool = InkTool::Pen,
-            UiCommand::SelectEraser => self.tools.tool = InkTool::RegionEraser,
+            UiCommand::ToggleSlideshowPenMode => {
+                if self.state.mode().is_slideshow() {
+                    let (mode, tool) =
+                        slideshow_pen_transition(self.slideshow_input_mode, self.tools.tool);
+                    self.set_slideshow_input_mode(mode);
+                    self.tools.tool = tool;
+                }
+            }
+            UiCommand::SelectEraser => {
+                if self.state.mode().is_slideshow() {
+                    self.set_slideshow_input_mode(SlideshowInputMode::Ink);
+                }
+                self.tools.tool = InkTool::RegionEraser;
+            }
             UiCommand::CycleEraserSize => {
                 self.tools.cycle_eraser_size();
                 self.settings.tools.eraser_size = self.tools.eraser_size;
@@ -764,6 +840,7 @@ impl DesktopRuntime {
                 if self.dismiss_slideshow_confirmation
                     && self.state.dismiss_disconnected_slideshow()
                 {
+                    self.reset_slideshow_input_mode();
                     self.dismiss_slideshow_confirmation = false;
                     outcome.geometry_placement = Some(self.prepare_annotation_geometry(false));
                 }
@@ -893,6 +970,33 @@ impl DesktopRuntime {
         }
     }
 
+    /// 返回当前顶层模式和放映瞬时模式是否共同允许软件画布接收墨迹。
+    fn accepts_canvas_input(&self) -> bool {
+        self.state.mode().accepts_ink_input()
+            && (!self.state.mode().is_slideshow() || self.slideshow_input_mode.accepts_ink_input())
+    }
+
+    /// 切换放映输入模式，并在路由边界处终止尚未完成的墨迹手势。
+    fn set_slideshow_input_mode(&mut self, mode: SlideshowInputMode) {
+        if self.slideshow_input_mode != mode {
+            self.active_gesture = None;
+            self.input_router.cancel();
+        }
+        if let Err(error) = self
+            .window_context
+            .set_slideshow_mouse_mode(slideshow_mouse_hit_test_enabled(self.state.mode(), mode))
+        {
+            tracing::warn!(%error, ?mode, "切换放映画布整体穿透失败");
+            return;
+        }
+        self.slideshow_input_mode = mode;
+    }
+
+    /// 退出或新建放映会话时恢复默认画笔输入并关闭原生穿透。
+    fn reset_slideshow_input_mode(&mut self) {
+        self.set_slideshow_input_mode(SlideshowInputMode::Ink);
+    }
+
     /// 排空 COM detector 事件，并把统一事件应用到状态机和窗口生命周期。
     fn process_slideshow_events(&mut self) -> bool {
         let previous_state = self.state.clone();
@@ -911,10 +1015,18 @@ impl DesktopRuntime {
         let mut changed = false;
         while let Ok(event) = self.windows_pointer_receiver.try_recv() {
             if event.cancels_ui_pointer() {
-                self.egui.cancel_pointer();
+                if self.state.mode().is_slideshow() {
+                    self.slideshow_egui.cancel_pointer();
+                } else {
+                    self.egui.cancel_pointer();
+                }
             }
             let ui_hit = {
-                let egui_context = self.egui.context();
+                let egui_context = if self.state.mode().is_slideshow() {
+                    self.slideshow_egui.context()
+                } else {
+                    self.egui.context()
+                };
                 event
                     .position()
                     .and_then(|position| {
@@ -922,11 +1034,11 @@ impl DesktopRuntime {
                     })
                     .is_some_and(|position| egui_context.layer_id_at(position).is_some())
             };
-            if let Some(action) = self.input_router.route_windows_pointer(
-                event,
-                ui_hit,
-                self.state.mode().accepts_ink_input(),
-            ) {
+            let accepts_canvas_input = self.accepts_canvas_input();
+            if let Some(action) =
+                self.input_router
+                    .route_windows_pointer(event, ui_hit, accepts_canvas_input)
+            {
                 if self.apply_pointer_action(action) {
                     self.queue_recovery();
                 }
@@ -934,6 +1046,41 @@ impl DesktopRuntime {
             }
         }
         changed
+    }
+
+    /// 应用精确页面切换结果，仅在真实换页时终止输入并重建活动墨迹缓存。
+    fn apply_page_switch_outcome(
+        &mut self,
+        key: &SlideShowKey,
+        page: SlidePage,
+        outcome: PageSwitchOutcome,
+    ) -> bool {
+        match outcome {
+            PageSwitchOutcome::Unchanged => false,
+            PageSwitchOutcome::MetadataUpdated => {
+                tracing::info!(
+                    application = ?key.application,
+                    window_id = key.window_id,
+                    page = page.key.show_position(),
+                    total_pages = ?page.total_pages,
+                    "放映当前页元数据已更新"
+                );
+                true
+            }
+            PageSwitchOutcome::PageChanged => {
+                self.active_gesture = None;
+                self.input_router.cancel();
+                self.render_thread.invalidate_ink_cache();
+                tracing::info!(
+                    application = ?key.application,
+                    window_id = key.window_id,
+                    page = page.key.show_position(),
+                    total_pages = ?page.total_pages,
+                    "放映页面已切换并恢复逐页墨迹"
+                );
+                true
+            }
+        }
     }
 
     /// 应用一个 detector 事件；只有实际改变可见状态时返回 true。
@@ -950,42 +1097,68 @@ impl DesktopRuntime {
                     .state
                     .slideshow_session()
                     .is_some_and(|session| session.key() == &key);
-                let changed = if same_session {
+                if same_session {
                     if self.state.mode() == AppMode::SlideShowConnectionLost {
-                        self.state.restore_slideshow_connection(&key, page)
+                        let Some(outcome) = self.state.restore_slideshow_connection(&key, page)
+                        else {
+                            return false;
+                        };
+                        self.apply_page_switch_outcome(&key, page, outcome);
+                        self.slideshow_connection_error = None;
+                        self.dismiss_slideshow_confirmation = false;
+                        tracing::info!(
+                            application = ?key.application,
+                            window_id = key.window_id,
+                            page = page.key.show_position(),
+                            "放映连接已恢复"
+                        );
+                        true
                     } else {
-                        self.state.change_slide(&key, page)
+                        let Some(outcome) = self.state.change_slide(&key, page) else {
+                            return false;
+                        };
+                        self.apply_page_switch_outcome(&key, page, outcome)
                     }
                 } else {
                     let changed = self.state.start_slideshow(SlideShowSession::new(key, page));
                     if changed {
+                        self.reset_slideshow_input_mode();
+                        self.tools.tool = InkTool::Pen;
                         self.slideshow_session_generation =
                             self.slideshow_session_generation.wrapping_add(1);
+                        self.apply_annotation_transition(true);
+                        self.slideshow_connection_error = None;
+                        self.dismiss_slideshow_confirmation = false;
+                        if let Some(session) = self.state.slideshow_session() {
+                            tracing::info!(
+                                application = ?session.key().application,
+                                window_id = session.key().window_id,
+                                page = page.key.show_position(),
+                                "放映批注会话已开始"
+                            );
+                        }
                     }
                     changed
-                };
-                if changed {
-                    self.apply_annotation_transition(true);
-                    self.slideshow_connection_error = None;
-                    self.dismiss_slideshow_confirmation = false;
                 }
-                changed
             }
             ComDetectorEvent::SlideChanged { key, page } => {
-                let changed = self.state.change_slide(&key, page);
-                if changed {
-                    self.active_gesture = None;
-                    self.input_router.cancel();
-                    self.render_thread.invalidate_ink_cache();
-                }
-                changed
+                let Some(outcome) = self.state.change_slide(&key, page) else {
+                    return false;
+                };
+                self.apply_page_switch_outcome(&key, page, outcome)
             }
             ComDetectorEvent::SlideShowEnded { key } => {
                 let changed = self.state.end_slideshow(&key);
                 if changed {
+                    self.reset_slideshow_input_mode();
                     self.apply_annotation_transition(false);
                     self.slideshow_connection_error = None;
                     self.dismiss_slideshow_confirmation = false;
+                    tracing::info!(
+                        application = ?key.application,
+                        window_id = key.window_id,
+                        "放映批注会话已确认结束"
+                    );
                 }
                 changed
             }
@@ -1140,6 +1313,10 @@ impl DesktopRuntime {
 
     /// 按退出原因清理或保留恢复文件，并始终停止渲染线程。
     fn shutdown(&mut self, clean_exit: bool) -> Result<(), AppError> {
+        self.reset_slideshow_input_mode();
+        if let Err(error) = self.slideshow_ui_window.hide() {
+            tracing::warn!(%error, "关闭应用时隐藏放映控件窗口失败");
+        }
         let recovery_result = if clean_exit {
             self.recovery.shutdown_clean()
         } else {
@@ -1149,7 +1326,7 @@ impl DesktopRuntime {
         recovery_result.and(render_result)
     }
 
-    /// 向唯一窗口请求一次按需重绘。
+    /// 由主窗口驱动一次同时包含画布和放映控件表面的按需重绘。
     fn request_redraw(&self) {
         self.window_context.window().request_redraw();
     }
@@ -1186,6 +1363,47 @@ fn window_drag_finished(event: &WindowEvent) -> bool {
 fn egui_position_from_physical(position: CanvasPoint, pixels_per_point: f32) -> Option<egui::Pos2> {
     (pixels_per_point.is_finite() && pixels_per_point > 0.0)
         .then(|| egui::pos2(position.x / pixels_per_point, position.y / pixels_per_point))
+}
+
+/// 把本帧 egui 点坐标区域向外取整为客户区物理像素矩形。
+fn physical_hit_regions(regions: &[egui::Rect], pixels_per_point: f32) -> Vec<PhysicalHitRect> {
+    if !pixels_per_point.is_finite() || pixels_per_point <= 0.0 {
+        return Vec::new();
+    }
+    regions
+        .iter()
+        .filter(|region| region.is_finite())
+        .filter_map(|region| {
+            let physical = PhysicalHitRect {
+                min_x: (region.min.x * pixels_per_point).floor() as i32,
+                min_y: (region.min.y * pixels_per_point).floor() as i32,
+                max_x: (region.max.x * pixels_per_point).ceil() as i32,
+                max_y: (region.max.y * pixels_per_point).ceil() as i32,
+            };
+            (physical.min_x < physical.max_x && physical.min_y < physical.max_y).then_some(physical)
+        })
+        .collect()
+}
+
+/// 根据放映输入模式和当前工具计算画笔按钮的完整状态转换。
+const fn slideshow_pen_transition(
+    input_mode: SlideshowInputMode,
+    tool: InkTool,
+) -> (SlideshowInputMode, InkTool) {
+    match (input_mode, tool) {
+        (SlideshowInputMode::Ink, InkTool::Pen) => (SlideshowInputMode::Mouse, InkTool::Pen),
+        (SlideshowInputMode::Ink, InkTool::RegionEraser) | (SlideshowInputMode::Mouse, _) => {
+            (SlideshowInputMode::Ink, InkTool::Pen)
+        }
+    }
+}
+
+/// 返回当前顶层状态是否允许原生放映画布选择性穿透。
+const fn slideshow_mouse_hit_test_enabled(
+    app_mode: AppMode,
+    input_mode: SlideshowInputMode,
+) -> bool {
+    app_mode.is_slideshow() && matches!(input_mode, SlideshowInputMode::Mouse)
 }
 
 /// 启动时读取一次系统级自启动状态，不让注册表访问进入每帧渲染路径。
@@ -1244,6 +1462,13 @@ impl DesktopApplication {
             .set_request_repaint_callback(move |info| {
                 let _ = proxy.send_event(UserEvent::RequestRepaint(info.delay));
             });
+        let proxy = self.proxy.clone();
+        runtime
+            .slideshow_egui
+            .context()
+            .set_request_repaint_callback(move |info| {
+                let _ = proxy.send_event(UserEvent::RequestRepaint(info.delay));
+            });
     }
 
     /// 根据下一个延迟重绘时间更新 winit 控制流。
@@ -1257,7 +1482,7 @@ impl DesktopApplication {
 }
 
 impl ApplicationHandler<UserEvent> for DesktopApplication {
-    /// 在 Windows 恢复应用时创建唯一窗口和 GPU 资源。
+    /// 在 Windows 恢复应用时创建主画布、放映控件窗口和 GPU 资源。
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.runtime.is_some() || self.startup_error.is_some() {
             return;
@@ -1306,10 +1531,12 @@ impl ApplicationHandler<UserEvent> for DesktopApplication {
         let Some(runtime) = self.runtime.as_mut() else {
             return;
         };
-        if window_id != runtime.window_id() {
+        let is_main_window = window_id == runtime.window_id();
+        let is_slideshow_ui_window = window_id == runtime.slideshow_ui_window_id();
+        if !is_main_window && !is_slideshow_ui_window {
             return;
         }
-        if matches!(event, WindowEvent::CloseRequested) {
+        if is_main_window && matches!(event, WindowEvent::CloseRequested) {
             self.exit_action = Some(ApplicationExitAction::Exit);
             event_loop.exit();
             return;
@@ -1319,7 +1546,7 @@ impl ApplicationHandler<UserEvent> for DesktopApplication {
             return;
         }
 
-        if matches!(event, WindowEvent::RedrawRequested) {
+        if is_main_window && matches!(event, WindowEvent::RedrawRequested) {
             self.next_repaint = None;
             match runtime.render() {
                 Ok(Some(exit_action)) => {
@@ -1331,6 +1558,15 @@ impl ApplicationHandler<UserEvent> for DesktopApplication {
                     self.startup_error = Some(error);
                     event_loop.exit();
                 }
+            }
+            return;
+        }
+
+        if is_slideshow_ui_window {
+            if !matches!(event, WindowEvent::RedrawRequested)
+                && runtime.handle_slideshow_ui_window_event(&event)
+            {
+                runtime.request_redraw();
             }
             return;
         }
@@ -1511,6 +1747,62 @@ mod tests {
     fn invalid_pixels_per_point_has_no_egui_position() {
         assert!(egui_position_from_physical(CanvasPoint::new(1.0, 1.0), 0.0).is_none());
         assert!(egui_position_from_physical(CanvasPoint::new(1.0, 1.0), f32::NAN).is_none());
+    }
+
+    /// 验证 egui 区域按像素比例向外取整，完整覆盖边缘物理像素。
+    #[test]
+    fn hit_regions_expand_to_physical_pixel_boundaries() {
+        let regions = physical_hit_regions(
+            &[egui::Rect::from_min_max(
+                egui::pos2(10.25, 20.5),
+                egui::pos2(30.25, 40.5),
+            )],
+            1.5,
+        );
+
+        assert_eq!(
+            regions,
+            vec![PhysicalHitRect {
+                min_x: 15,
+                min_y: 30,
+                max_x: 46,
+                max_y: 61,
+            }]
+        );
+    }
+
+    /// 验证放映画笔按钮严格执行画笔、橡皮擦和触摸三种入口的状态表。
+    #[test]
+    fn slideshow_pen_button_follows_mode_transition_table() {
+        assert_eq!(
+            slideshow_pen_transition(SlideshowInputMode::Ink, InkTool::Pen),
+            (SlideshowInputMode::Mouse, InkTool::Pen)
+        );
+        assert_eq!(
+            slideshow_pen_transition(SlideshowInputMode::Ink, InkTool::RegionEraser),
+            (SlideshowInputMode::Ink, InkTool::Pen)
+        );
+        assert_eq!(
+            slideshow_pen_transition(SlideshowInputMode::Mouse, InkTool::RegionEraser),
+            (SlideshowInputMode::Ink, InkTool::Pen)
+        );
+    }
+
+    /// 验证只有活动放映的 Mouse 模式启用原生命中穿透。
+    #[test]
+    fn native_pass_through_requires_slideshow_mouse_mode() {
+        assert!(slideshow_mouse_hit_test_enabled(
+            AppMode::SlideShowAnnotatingExpanded,
+            SlideshowInputMode::Mouse
+        ));
+        assert!(!slideshow_mouse_hit_test_enabled(
+            AppMode::SlideShowAnnotatingExpanded,
+            SlideshowInputMode::Ink
+        ));
+        assert!(!slideshow_mouse_hit_test_enabled(
+            AppMode::IdleFloatingToolbar,
+            SlideshowInputMode::Mouse
+        ));
     }
 
     /// 验证只有会改变原生窗口尺寸的命令走目标几何重绘路径。

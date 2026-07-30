@@ -11,7 +11,7 @@ use super::{
     },
 };
 use crate::{
-    app::AppMode,
+    app::{AppMode, SlideshowInputMode},
     autostart::MachineAutostartState,
     ink::{EraserSize, InkColor, InkTool, PenWidth},
     performance::PerformanceSnapshot,
@@ -26,6 +26,7 @@ pub enum UiCommand {
     EnterAnnotation,
     ExitAnnotation,
     SelectPen,
+    ToggleSlideshowPenMode,
     SelectEraser,
     CycleEraserSize,
     SetColor(InkColor),
@@ -70,6 +71,7 @@ pub enum IdlePanel {
 #[derive(Debug, Clone, Copy)]
 pub struct UiViewState<'a> {
     pub mode: AppMode,
+    pub slideshow_input_mode: SlideshowInputMode,
     pub idle_panel: IdlePanel,
     pub dock_side: DockSide,
     pub tools: ToolState,
@@ -92,6 +94,13 @@ pub struct UiViewState<'a> {
     pub machine_autostart_state: Option<MachineAutostartState>,
     pub machine_autostart_error: Option<&'a str>,
     pub graphics_diagnostics: &'a GraphicsDiagnostics,
+}
+
+/// 顶层 UI 一帧产生的离散命令和放映原生命中区域。
+#[derive(Debug, Default)]
+pub struct UiFrameOutput {
+    pub command: Option<UiCommand>,
+    pub slideshow_hit_regions: Vec<Rect>,
 }
 
 /// 普通批注工具栏当前选择。
@@ -154,17 +163,27 @@ impl ToolState {
     }
 }
 
-/// 根据顶层模式绘制当前工具栏，并返回最多一个离散 UI 命令。
-pub fn render(ui: &mut Ui, view: UiViewState<'_>) -> Option<UiCommand> {
-    let command = match view.mode {
+/// 根据顶层模式绘制当前工具栏，并返回命令及实际放映 UI 命中区域。
+pub fn render(ui: &mut Ui, view: UiViewState<'_>) -> UiFrameOutput {
+    let output = match view.mode {
         AppMode::IdleFloatingToolbar => match view.idle_panel {
-            IdlePanel::Toolbar => render_idle_toolbar(ui, view.readable_mode),
-            IdlePanel::QuickSettings => super::quick_settings::render(ui, view),
-            IdlePanel::Settings => super::settings_view::render(ui, view),
+            IdlePanel::Toolbar => UiFrameOutput {
+                command: render_idle_toolbar(ui, view.readable_mode),
+                ..UiFrameOutput::default()
+            },
+            IdlePanel::QuickSettings => UiFrameOutput {
+                command: super::quick_settings::render(ui, view),
+                ..UiFrameOutput::default()
+            },
+            IdlePanel::Settings => UiFrameOutput {
+                command: super::settings_view::render(ui, view),
+                ..UiFrameOutput::default()
+            },
         },
-        AppMode::NormalAnnotating => {
-            render_annotation_toolbar(ui, view.tools, view.dock_side, view.readable_mode)
-        }
+        AppMode::NormalAnnotating => UiFrameOutput {
+            command: render_annotation_toolbar(ui, view.tools, view.dock_side, view.readable_mode),
+            ..UiFrameOutput::default()
+        },
         AppMode::SlideShowAnnotatingExpanded
         | AppMode::SlideShowAnnotatingCollapsed
         | AppMode::SlideShowConnectionLost => super::slideshow_toolbar::render(ui.ctx(), view),
@@ -172,7 +191,7 @@ pub fn render(ui: &mut Ui, view: UiViewState<'_>) -> Option<UiCommand> {
     if view.performance_monitoring_enabled && view.mode.accepts_ink_input() {
         super::performance_overlay::render(ui.ctx(), view.performance_snapshot, view.readable_mode);
     }
-    command
+    output
 }
 
 /// 绘制右侧中部非批注悬浮卡片工具栏。
@@ -273,6 +292,7 @@ fn render_annotation_toolbar(
                         let mut interaction = render_ink_tool_buttons(
                             ui,
                             tools,
+                            None,
                             normal_picker_placement(dock_side),
                             SelectorOrientation::Vertical,
                             readable_mode,
@@ -426,28 +446,41 @@ fn constrain_axis_position(
 pub(super) fn render_ink_tool_buttons(
     ui: &mut Ui,
     tools: ToolState,
+    slideshow_input_mode: Option<SlideshowInputMode>,
     picker_placement: RectAlign,
     picker_orientation: SelectorOrientation,
     readable_mode: bool,
 ) -> ToolbarInteraction {
     let mut interaction = ToolbarInteraction::default();
+    let mouse_mode = slideshow_input_mode == Some(SlideshowInputMode::Mouse);
+    let (pen_label, pen_icon, pen_command) = if mouse_mode {
+        ("触摸", Icon::Cursor, UiCommand::ToggleSlideshowPenMode)
+    } else if slideshow_input_mode.is_some() {
+        ("画笔", Icon::Pen, UiCommand::ToggleSlideshowPenMode)
+    } else {
+        ("画笔", Icon::Pen, UiCommand::SelectPen)
+    };
     let pen = icon_button_with_surface(
         ui,
-        "画笔",
-        Icon::Pen,
-        tools.tool == InkTool::Pen,
+        pen_label,
+        pen_icon,
+        mouse_mode || tools.tool == InkTool::Pen,
         None,
         readable_mode,
     );
-    interaction.observe(&pen, UiCommand::SelectPen);
-    let color = icon_button_with_surface(
-        ui,
-        "颜色",
-        Icon::Color,
-        tools.tool == InkTool::Pen,
-        Some(color32(tools.color)),
-        readable_mode,
-    );
+    interaction.observe(&pen, pen_command);
+    let color = ui
+        .add_enabled_ui(!mouse_mode, |ui| {
+            icon_button_with_surface(
+                ui,
+                "颜色",
+                Icon::Color,
+                tools.tool == InkTool::Pen,
+                Some(color32(tools.color)),
+                readable_mode,
+            )
+        })
+        .inner;
     interaction.observe_drag(&color);
     keep_picker_command(
         &mut interaction,
@@ -459,14 +492,18 @@ pub(super) fn render_ink_tool_buttons(
             readable_mode,
         ),
     );
-    let pen_width = icon_button_with_surface(
-        ui,
-        pen_width_label(tools.pen_width),
-        Icon::PenWidth,
-        tools.tool == InkTool::Pen,
-        None,
-        readable_mode,
-    );
+    let pen_width = ui
+        .add_enabled_ui(!mouse_mode, |ui| {
+            icon_button_with_surface(
+                ui,
+                pen_width_label(tools.pen_width),
+                Icon::PenWidth,
+                tools.tool == InkTool::Pen,
+                None,
+                readable_mode,
+            )
+        })
+        .inner;
     interaction.observe_drag(&pen_width);
     keep_picker_command(
         &mut interaction,
@@ -736,6 +773,18 @@ pub(super) fn paint_icon(
                 ],
                 stroke,
             );
+        }
+        Icon::Cursor => {
+            let points = vec![
+                center + egui::vec2(-half * 0.65, -half * 0.85),
+                center + egui::vec2(half * 0.65, half * 0.15),
+                center + egui::vec2(half * 0.1, half * 0.25),
+                center + egui::vec2(half * 0.45, half * 0.8),
+                center + egui::vec2(half * 0.1, half),
+                center + egui::vec2(-half * 0.2, half * 0.45),
+                center + egui::vec2(-half * 0.65, half * 0.75),
+            ];
+            painter.add(Shape::convex_polygon(points, foreground, stroke));
         }
         Icon::Settings => {
             painter.circle_stroke(center, half * 0.45, stroke);
@@ -1081,6 +1130,7 @@ pub(super) fn color32(color: InkColor) -> Color32 {
 #[derive(Debug, Clone, Copy)]
 pub(super) enum Icon {
     Pen,
+    Cursor,
     Settings,
     Sliders,
     Color,

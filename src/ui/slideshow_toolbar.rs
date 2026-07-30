@@ -6,7 +6,7 @@ use egui::{
 use super::{
     design_tokens as tokens, pixel_snap,
     settings_controls::SelectorOrientation,
-    toolbar::{Icon, UiCommand, UiViewState, icon_button, render_ink_tool_buttons},
+    toolbar::{Icon, UiCommand, UiFrameOutput, UiViewState, icon_button, render_ink_tool_buttons},
 };
 use crate::{app::AppMode, window::DockSide};
 
@@ -38,31 +38,38 @@ struct ToolbarPlacement {
     direction: ExpansionDirection,
 }
 
-/// 绘制放映态双侧翻页组、底部胶囊工具栏和可选退出确认框。
-pub fn render(context: &Context, view: UiViewState<'_>) -> Option<UiCommand> {
+/// 绘制放映态控件，并返回命令和本帧实际交互区域。
+pub fn render(context: &Context, view: UiViewState<'_>) -> UiFrameOutput {
     let mut command = None;
+    let mut hit_regions = Vec::new();
     keep_first(
         &mut command,
-        render_navigation_group(context, DockSide::Left, view),
+        render_navigation_group(context, DockSide::Left, view, &mut hit_regions),
     );
     keep_first(
         &mut command,
-        render_navigation_group(context, DockSide::Right, view),
+        render_navigation_group(context, DockSide::Right, view, &mut hit_regions),
     );
-    keep_first(&mut command, render_bottom_toolbar(context, view));
+    keep_first(
+        &mut command,
+        render_bottom_toolbar(context, view, &mut hit_regions),
+    );
 
     if view.mode == AppMode::SlideShowConnectionLost {
         if view.dismiss_slideshow_confirmation {
             keep_first(
                 &mut command,
-                render_dismiss_confirmation(context, view.readable_mode),
+                render_dismiss_confirmation(context, view.readable_mode, &mut hit_regions),
             );
         } else {
-            render_connection_status(context, view.readable_mode);
+            render_connection_status(context, view.readable_mode, &mut hit_regions);
         }
     }
 
-    command
+    UiFrameOutput {
+        command,
+        slideshow_hit_regions: hit_regions,
+    }
 }
 
 /// 在目标尚无命令时保留第一个离散交互，避免同一帧后绘制区域覆盖先前点击。
@@ -77,10 +84,11 @@ fn render_navigation_group(
     context: &Context,
     side: DockSide,
     view: UiViewState<'_>,
+    hit_regions: &mut Vec<Rect>,
 ) -> Option<UiCommand> {
     let (id, anchor, offset) = navigation_placement(side);
 
-    Area::new(id)
+    let response = Area::new(id)
         .anchor(anchor, offset)
         .order(Order::Foreground)
         .show(context, |ui| {
@@ -131,8 +139,9 @@ fn render_navigation_group(
                 },
             )
             .inner
-        })
-        .inner
+        });
+    hit_regions.push(response.response.rect);
+    response.inner
 }
 
 /// 返回左右翻页组在对应屏幕下角的稳定锚点，并让控件外框紧贴屏幕边缘。
@@ -181,7 +190,11 @@ fn render_page_number(ui: &mut Ui, current: u32, total: u32, readable_mode: bool
 }
 
 /// 绘制固定收缩按钮和从其右侧滑入、滑出的工具栏主体。
-fn render_bottom_toolbar(context: &Context, view: UiViewState<'_>) -> Option<UiCommand> {
+fn render_bottom_toolbar(
+    context: &Context,
+    view: UiViewState<'_>,
+    hit_regions: &mut Vec<Rect>,
+) -> Option<UiCommand> {
     let screen = context.content_rect();
     let body_width = toolbar_body_width();
     let toggle_width = toolbar_outer_height();
@@ -234,8 +247,9 @@ fn render_bottom_toolbar(context: &Context, view: UiViewState<'_>) -> Option<UiC
         tokens::SLIDESHOW_TOOLBAR_ANIMATION_SECONDS,
     );
 
-    let mut command = render_toolbar_body(context, view, placement, progress);
-    let toggle_interaction = render_toolbar_toggle(context, view, state.toggle_position, expanded);
+    let mut command = render_toolbar_body(context, view, placement, progress, hit_regions);
+    let toggle_interaction =
+        render_toolbar_toggle(context, view, state.toggle_position, expanded, hit_regions);
     state.toggle_position += toggle_interaction.drag_delta;
     state.toggle_position =
         constrain_toggle_position(state.toggle_position, screen, Vec2::splat(toggle_width));
@@ -250,6 +264,7 @@ fn render_toolbar_body(
     view: UiViewState<'_>,
     placement: ToolbarPlacement,
     progress: f32,
+    hit_regions: &mut Vec<Rect>,
 ) -> Option<UiCommand> {
     if progress <= f32::EPSILON {
         return None;
@@ -277,7 +292,7 @@ fn render_toolbar_body(
             ),
         ),
     };
-    Area::new("slideshow_toolbar_body".into())
+    let response = Area::new("slideshow_toolbar_body".into())
         .fixed_pos(Pos2::new(animated_left, placement.origin.y))
         .order(Order::Middle)
         .interactable(true)
@@ -298,6 +313,7 @@ fn render_toolbar_body(
                         let interaction = render_ink_tool_buttons(
                             ui,
                             view.tools,
+                            Some(view.slideshow_input_mode),
                             RectAlign::TOP_START,
                             SelectorOrientation::Horizontal,
                             view.readable_mode,
@@ -342,8 +358,12 @@ fn render_toolbar_body(
                 },
             )
             .inner
-        })
-        .inner
+        });
+    let visible_rect = response.response.rect.intersect(clip_rect);
+    if visible_rect.width() > 0.0 && visible_rect.height() > 0.0 {
+        hit_regions.push(visible_rect);
+    }
+    response.inner
 }
 
 /// 绘制位置始终不变的收缩或展开按钮；连接中断时禁止再次收缩。
@@ -352,8 +372,9 @@ fn render_toolbar_toggle(
     view: UiViewState<'_>,
     position: Pos2,
     expanded: bool,
+    hit_regions: &mut Vec<Rect>,
 ) -> ToggleInteraction {
-    Area::new("slideshow_toolbar_toggle".into())
+    let response = Area::new("slideshow_toolbar_toggle".into())
         .fixed_pos(position)
         .order(Order::Foreground)
         .show(context, |ui| {
@@ -385,8 +406,9 @@ fn render_toolbar_toggle(
                 },
             )
             .inner
-        })
-        .inner
+        });
+    hit_regions.push(response.response.rect);
+    response.inner
 }
 
 /// 约束收缩/展开按钮完整留在当前可见视口内。
@@ -422,8 +444,8 @@ fn expansion_direction(
 }
 
 /// 在断线降级态工具栏上方显示简短状态，不占用底部工具按钮宽度。
-fn render_connection_status(context: &Context, readable_mode: bool) {
-    Area::new("slideshow_connection_status".into())
+fn render_connection_status(context: &Context, readable_mode: bool, hit_regions: &mut Vec<Rect>) {
+    let response = Area::new("slideshow_connection_status".into())
         .anchor(
             Align2::CENTER_BOTTOM,
             Vec2::new(0.0, -(toolbar_outer_height() + tokens::SPACE_2)),
@@ -449,11 +471,16 @@ fn render_connection_status(context: &Context, readable_mode: bool) {
                 },
             );
         });
+    hit_regions.push(response.response.rect);
 }
 
 /// 绘制退出本地批注的紧凑确认框，确认不会调用 COM 或发送模拟按键。
-fn render_dismiss_confirmation(context: &Context, readable_mode: bool) -> Option<UiCommand> {
-    Area::new("slideshow_dismiss_confirmation".into())
+fn render_dismiss_confirmation(
+    context: &Context,
+    readable_mode: bool,
+    hit_regions: &mut Vec<Rect>,
+) -> Option<UiCommand> {
+    let response = Area::new("slideshow_dismiss_confirmation".into())
         .anchor(
             Align2::CENTER_BOTTOM,
             Vec2::new(0.0, -(toolbar_outer_height() + tokens::SPACE_2)),
@@ -494,8 +521,9 @@ fn render_dismiss_confirmation(context: &Context, readable_mode: bool) -> Option
                 },
             )
             .inner
-        })
-        .inner
+        });
+    hit_regions.push(response.response.rect);
+    response.inner
 }
 
 /// 返回底部胶囊工具栏的固定外层高度。

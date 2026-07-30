@@ -23,7 +23,8 @@ use windows::{
         },
         UI::WindowsAndMessaging::{
             GWL_EXSTYLE, GetWindowLongW, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-            SWP_NOZORDER, SetWindowLongW, SetWindowPos, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
+            SWP_NOZORDER, SetWindowLongW, SetWindowPos, WS_EX_APPWINDOW, WS_EX_LAYERED,
+            WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
         },
     },
     core::Interface,
@@ -80,9 +81,19 @@ pub struct D3DRenderTarget {
 }
 
 impl D3DRenderTarget {
+    /// 创建一个只包含 HWND 整数快照和初始客户区尺寸的渲染目标。
+    pub(crate) const fn new(hwnd: isize, initial_size: PhysicalSize<u32>) -> Self {
+        Self { hwnd, initial_size }
+    }
+
     /// 将可跨线程传递的整数句柄恢复为 Windows API 使用的 HWND。
-    fn hwnd(self) -> HWND {
+    pub(crate) fn hwnd(self) -> HWND {
         HWND(self.hwnd as *mut std::ffi::c_void)
+    }
+
+    /// 返回可交给 winit owner-window 属性的原始 HWND 整数。
+    pub(crate) const fn raw_hwnd(self) -> isize {
+        self.hwnd
     }
 }
 
@@ -213,6 +224,7 @@ pub struct D3DWindowContext {
     dock_side: Cell<DockSide>,
     floating_top: Cell<i32>,
     idle_size_correction_pending: Cell<bool>,
+    slideshow_mouse_mode: Cell<bool>,
 }
 
 /// 持有渲染线程独占的 D3D12 设备和 DirectComposition 交换链。
@@ -270,10 +282,7 @@ impl D3DWindowContext {
         window.set_min_inner_size(Some(geometry.idle_size));
         let _ = window.request_inner_size(geometry.idle_size);
         let hwnd = window_hwnd(&window)?;
-        let render_target = D3DRenderTarget {
-            hwnd: hwnd.0 as isize,
-            initial_size: window.inner_size(),
-        };
+        let render_target = D3DRenderTarget::new(hwnd.0 as isize, window.inner_size());
 
         Ok(Self {
             window,
@@ -282,6 +291,7 @@ impl D3DWindowContext {
             dock_side: Cell::new(DockSide::Right),
             floating_top: Cell::new(geometry.idle_position.y),
             idle_size_correction_pending: Cell::new(true),
+            slideshow_mouse_mode: Cell::new(false),
         })
     }
 
@@ -293,6 +303,43 @@ impl D3DWindowContext {
     /// 返回在事件线程提取的 Win32 合成目标，避免跨线程调用 winit 句柄 API。
     pub const fn render_target(&self) -> D3DRenderTarget {
         self.render_target
+    }
+
+    /// 设置放映鼠标模式下主画布是否整体穿透到底层窗口。
+    pub(crate) fn set_slideshow_mouse_mode(&self, enabled: bool) -> Result<(), AppError> {
+        if self.slideshow_mouse_mode.get() == enabled {
+            return Ok(());
+        }
+
+        match self.apply_slideshow_cursor_hittest(enabled) {
+            Ok(style) => {
+                self.slideshow_mouse_mode.set(enabled);
+                log_slideshow_cursor_hittest_style(enabled, style);
+                Ok(())
+            }
+            Err(error) => match self.apply_slideshow_cursor_hittest(!enabled) {
+                Ok(_) => Err(error),
+                Err(rollback_error) => Err(AppError::Graphics(format!(
+                    "{error}; 恢复放映画布上一输入模式失败: {rollback_error}"
+                ))),
+            },
+        }
+    }
+
+    /// 通过 winit 的窗口状态机切换命中行为，并复核 Win32 最终样式。
+    fn apply_slideshow_cursor_hittest(&self, enabled: bool) -> Result<i32, AppError> {
+        self.window
+            .set_cursor_hittest(!enabled)
+            .map_err(|error| AppError::Graphics(format!("切换放映画布光标命中失败: {error}")))?;
+        apply_tool_window_style(self.render_target.hwnd())?;
+
+        let style = unsafe { GetWindowLongW(self.render_target.hwnd(), GWL_EXSTYLE) };
+        if !slideshow_cursor_hittest_style_matches(enabled, style) {
+            return Err(AppError::Graphics(format!(
+                "放映画布光标命中样式复核失败: enabled={enabled}, actual={style:#010x}"
+            )));
+        }
+        Ok(style)
     }
 
     /// 以运行时选定的稳定几何显示窗口，并从 Windows shell 隐藏该工具窗口。
@@ -767,6 +814,31 @@ const fn tool_window_ex_style(style: i32) -> i32 {
     (style & !(WS_EX_APPWINDOW.0 as i32)) | WS_EX_TOOLWINDOW.0 as i32
 }
 
+/// 返回 winit 光标命中切换后的扩展样式是否满足当前放映输入模式。
+const fn slideshow_cursor_hittest_style_matches(enabled: bool, style: i32) -> bool {
+    let layered = style & WS_EX_LAYERED.0 as i32 != 0;
+    let transparent = style & WS_EX_TRANSPARENT.0 as i32 != 0;
+    let no_redirection_bitmap = style & WS_EX_NOREDIRECTIONBITMAP.0 as i32 != 0;
+    no_redirection_bitmap
+        && if enabled {
+            layered && transparent
+        } else {
+            !layered && !transparent
+        }
+}
+
+/// 记录 winit 和 Win32 最终一致的放映画布命中样式。
+fn log_slideshow_cursor_hittest_style(enabled: bool, style: i32) {
+    tracing::info!(
+        enabled,
+        extended_style = style,
+        layered = style & WS_EX_LAYERED.0 as i32 != 0,
+        transparent = style & WS_EX_TRANSPARENT.0 as i32 != 0,
+        no_redirection_bitmap = style & WS_EX_NOREDIRECTIONBITMAP.0 as i32 != 0,
+        "放映画布原生输入模式已切换"
+    );
+}
+
 /// 读取 DXGI adapter 描述并生成设置页使用的图形诊断。
 fn read_graphics_diagnostics(
     adapter: &IDXGIAdapter1,
@@ -852,6 +924,36 @@ fn clamp_window_top(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 验证 winit Mouse 模式同时保留 DirectComposition 并启用 layered 透明命中。
+    #[test]
+    fn slideshow_mouse_hittest_requires_winit_window_flags() {
+        let style = WS_EX_NOREDIRECTIONBITMAP.0 as i32
+            | WS_EX_LAYERED.0 as i32
+            | WS_EX_TRANSPARENT.0 as i32;
+
+        assert!(slideshow_cursor_hittest_style_matches(true, style));
+        assert!(!slideshow_cursor_hittest_style_matches(
+            true,
+            style & !(WS_EX_TRANSPARENT.0 as i32)
+        ));
+        assert!(!slideshow_cursor_hittest_style_matches(
+            true,
+            style & !(WS_EX_NOREDIRECTIONBITMAP.0 as i32)
+        ));
+    }
+
+    /// 验证 Ink 模式移除 winit 添加的 layered 和透明命中样式。
+    #[test]
+    fn slideshow_ink_hittest_restores_direct_composition_style() {
+        let style = WS_EX_NOREDIRECTIONBITMAP.0 as i32;
+
+        assert!(slideshow_cursor_hittest_style_matches(false, style));
+        assert!(!slideshow_cursor_hittest_style_matches(
+            false,
+            style | WS_EX_LAYERED.0 as i32
+        ));
+    }
 
     /// 创建不依赖原生显示器句柄的窗口几何测试样本。
     fn geometry_fixture() -> WindowGeometry {

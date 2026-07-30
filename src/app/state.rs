@@ -1,6 +1,6 @@
 use crate::{
     ink::InkDocument,
-    slideshow::{SlidePage, SlideShowKey, SlideShowSession},
+    slideshow::{PageSwitchOutcome, SlidePage, SlideShowKey, SlideShowSession},
 };
 
 /// 顶层界面与输入路由使用的应用模式。
@@ -33,6 +33,21 @@ impl AppMode {
                 | Self::SlideShowAnnotatingCollapsed
                 | Self::SlideShowConnectionLost
         )
+    }
+}
+
+/// 当前放映会话的瞬时画布输入模式，不进入恢复文件或用户设置。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SlideshowInputMode {
+    #[default]
+    Ink,
+    Mouse,
+}
+
+impl SlideshowInputMode {
+    /// 返回当前放映画布是否允许创建或擦除软件墨迹。
+    pub const fn accepts_ink_input(self) -> bool {
+        matches!(self, Self::Ink)
     }
 }
 
@@ -176,32 +191,31 @@ impl AppState {
         &mut self,
         show_key: &SlideShowKey,
         current_page: SlidePage,
-    ) -> bool {
+    ) -> Option<PageSwitchOutcome> {
         if self.mode != AppMode::SlideShowConnectionLost {
-            return false;
+            return None;
         }
-        let Some(session) = self.slideshow_session.as_mut() else {
-            return false;
-        };
+        let session = self.slideshow_session.as_mut()?;
         if session.key() != show_key {
-            return false;
+            return None;
         }
 
-        session.switch_page(current_page);
+        let outcome = session.switch_page(current_page);
         self.mode = AppMode::SlideShowAnnotatingExpanded;
-        true
+        Some(outcome)
     }
 
     /// 处理 COM 页切换事件并保存、恢复对应位置墨迹。
-    pub fn change_slide(&mut self, show_key: &SlideShowKey, target_page: SlidePage) -> bool {
-        let Some(session) = self.slideshow_session.as_mut() else {
-            return false;
-        };
+    pub fn change_slide(
+        &mut self,
+        show_key: &SlideShowKey,
+        target_page: SlidePage,
+    ) -> Option<PageSwitchOutcome> {
+        let session = self.slideshow_session.as_mut()?;
         if session.key() != show_key {
-            return false;
+            return None;
         }
-        session.switch_page(target_page);
-        true
+        Some(session.switch_page(target_page))
     }
 
     /// 处理 COM 确认的放映结束，清空会话和对应抑制标记。
@@ -279,5 +293,27 @@ mod tests {
         state.suppressed_show_key = Some(key);
 
         assert!(state.validate_recovery().is_err());
+    }
+
+    /// 验证真实换页和重复快照都不会改变放映工具栏展开状态。
+    #[test]
+    fn page_updates_preserve_slideshow_toolbar_state() {
+        let key = SlideShowKey::new(PresentationApplication::PowerPoint, "deck", 1);
+        let first = SlidePage::new(PageKey::new(1).expect("测试页键有效"), Some(10), Some(2));
+        let second = SlidePage::new(PageKey::new(2).expect("测试页键有效"), Some(20), Some(2));
+        let mut state = AppState::default();
+        assert!(state.start_slideshow(SlideShowSession::new(key.clone(), first)));
+        assert!(state.collapse_slideshow_toolbar());
+
+        assert_eq!(
+            state.change_slide(&key, first),
+            Some(PageSwitchOutcome::Unchanged)
+        );
+        assert_eq!(state.mode(), AppMode::SlideShowAnnotatingCollapsed);
+        assert_eq!(
+            state.change_slide(&key, second),
+            Some(PageSwitchOutcome::PageChanged)
+        );
+        assert_eq!(state.mode(), AppMode::SlideShowAnnotatingCollapsed);
     }
 }

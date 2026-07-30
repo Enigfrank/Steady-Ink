@@ -55,6 +55,13 @@ pub struct Compositor {
     gr_context: DirectContext,
 }
 
+/// 仅为独立放映控件窗口合成透明背景和 egui，不创建墨迹缓存。
+pub(crate) struct UiCompositor {
+    egui: EguiSkiaPainter,
+    window_surfaces: Vec<SwapChainSurface>,
+    gr_context: DirectContext,
+}
+
 /// 一次创建持久墨迹与增强模式活动预览所需的 GPU 资源。
 struct InkResources {
     cache: InkRenderCache,
@@ -71,6 +78,74 @@ struct PreviewComposite {
     render_size: [u32; 2],
     linear_sampling: bool,
     replace_region: bool,
+}
+
+impl UiCompositor {
+    /// 从第二个 D3D target 创建只含 egui 资源的轻量合成器。
+    pub fn new(
+        window_context: &D3DRenderContext,
+        egui_context: egui::Context,
+    ) -> Result<Self, AppError> {
+        let mut gr_context = create_direct_context(window_context)?;
+        let size: [u32; 2] = window_context.swap_chain_size().into();
+        let window_surfaces = create_window_surfaces(&mut gr_context, window_context, size)?;
+        Ok(Self {
+            egui: EguiSkiaPainter::new(egui_context),
+            window_surfaces,
+            gr_context,
+        })
+    }
+
+    /// 调整控件 swap chain 并重建对应的 Skia back-buffer surface。
+    pub fn resize(
+        &mut self,
+        window_context: &mut D3DRenderContext,
+        size: [u32; 2],
+    ) -> Result<(), AppError> {
+        let physical_size = winit::dpi::PhysicalSize::new(size[0].max(1), size[1].max(1));
+        if window_context.swap_chain_size() == physical_size {
+            return Ok(());
+        }
+        self.gr_context.flush_and_submit();
+        self.window_surfaces.clear();
+        window_context.recreate_swap_chain(physical_size)?;
+        self.window_surfaces = create_window_surfaces(&mut self.gr_context, window_context, size)?;
+        Ok(())
+    }
+
+    /// 清空透明背景并把一帧 egui 绘制到控件窗口 back buffer。
+    pub fn paint(
+        &mut self,
+        window_context: &D3DRenderContext,
+        egui_frame: EguiFrame,
+    ) -> Result<(), AppError> {
+        self.gr_context.reset(None);
+        let index = window_context.current_back_buffer_index();
+        let surface_count = self.window_surfaces.len();
+        let target = self.window_surfaces.get_mut(index).ok_or_else(|| {
+            AppError::Graphics(format!(
+                "放映控件 DXGI 返回了无效 back buffer 索引 {index}，Skia surface 数量为 {surface_count}"
+            ))
+        })?;
+        let canvas = target.surface.canvas();
+        canvas.reset_matrix();
+        canvas.clear(Color::TRANSPARENT);
+        self.egui.paint(canvas, egui_frame)?;
+        self.gr_context
+            .flush_and_submit_surface(&mut target.surface, None);
+        Ok(())
+    }
+
+    /// 估算控件交换链与 egui 上传纹理的受管 GPU 字节数。
+    pub fn estimated_managed_gpu_bytes(&self, window_context: &D3DRenderContext) -> u64 {
+        let size = window_context.swap_chain_size();
+        let swap_chain_bytes = u64::from(size.width)
+            .saturating_mul(u64::from(size.height))
+            .saturating_mul(4)
+            .saturating_mul(u64::try_from(self.window_surfaces.len()).unwrap_or(u64::MAX));
+        swap_chain_bytes
+            .saturating_add(u64::try_from(self.egui.estimated_texture_bytes()).unwrap_or(u64::MAX))
+    }
 }
 
 impl Compositor {

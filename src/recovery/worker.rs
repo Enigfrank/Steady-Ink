@@ -366,7 +366,7 @@ mod tests {
                 InkColor::Blue,
                 PenWidth::Px6,
             );
-        assert!(state.change_slide(&key, second));
+        assert!(state.change_slide(&key, second).is_some());
         state
             .active_document_mut()
             .expect("第二页应有活动文档")

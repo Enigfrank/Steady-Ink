@@ -31,6 +31,8 @@ const RECONNECT_INTERVAL: Duration = Duration::from_secs(1);
 const MESSAGE_PUMP_INTERVAL: Duration = Duration::from_millis(16);
 const COM_QUERY_RETRY_DELAY: Duration = Duration::from_millis(50);
 const COM_QUERY_MAX_ATTEMPTS: usize = 5;
+const EMPTY_SNAPSHOT_CONFIRMATION_DELAY: Duration = Duration::from_millis(40);
+const EMPTY_SNAPSHOT_CONFIRMATION_ATTEMPTS: usize = 3;
 
 type WakeCallback = Arc<dyn Fn() + Send + Sync>;
 
@@ -337,19 +339,22 @@ fn run_connected_session(
         }
     };
 
-    let current_snapshot =
-        match query_active_slideshow_with_retry(&application, candidate.application) {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                emitter.emit(ComDetectorEvent::ConnectionLost {
-                    key: last_confirmed_snapshot
-                        .as_ref()
-                        .map(|snapshot| snapshot.key.clone()),
-                    detail: error.to_string(),
-                });
-                return;
-            }
-        };
+    let current_snapshot = match query_active_slideshow_with_presence_confirmation(
+        &application,
+        candidate.application,
+        last_confirmed_snapshot.as_ref(),
+    ) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            emitter.emit(ComDetectorEvent::ConnectionLost {
+                key: last_confirmed_snapshot
+                    .as_ref()
+                    .map(|snapshot| snapshot.key.clone()),
+                detail: error.to_string(),
+            });
+            return;
+        }
+    };
     emit_reconnected_snapshot(
         emitter,
         last_confirmed_snapshot.as_ref(),
@@ -450,7 +455,11 @@ fn refresh_connected_snapshot(
     application: &windows::Win32::System::Com::IDispatch,
     previous_snapshot: &mut Option<ActiveSlideShowSnapshot>,
 ) -> bool {
-    match query_active_slideshow_with_retry(application, candidate.application) {
+    match query_active_slideshow_with_presence_confirmation(
+        application,
+        candidate.application,
+        previous_snapshot.as_ref(),
+    ) {
         Ok(current_snapshot) => {
             emit_snapshot_difference(
                 emitter,
@@ -486,19 +495,22 @@ fn handle_pending_controls(
             action,
         } = command
         else {
-            let current_snapshot =
-                match query_active_slideshow_with_retry(application, candidate.application) {
-                    Ok(snapshot) => snapshot,
-                    Err(error) => {
-                        emitter.emit(ComDetectorEvent::ConnectionLost {
-                            key: previous_snapshot
-                                .as_ref()
-                                .map(|snapshot| snapshot.key.clone()),
-                            detail: error.to_string(),
-                        });
-                        return false;
-                    }
-                };
+            let current_snapshot = match query_active_slideshow_with_presence_confirmation(
+                application,
+                candidate.application,
+                previous_snapshot.as_ref(),
+            ) {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    emitter.emit(ComDetectorEvent::ConnectionLost {
+                        key: previous_snapshot
+                            .as_ref()
+                            .map(|snapshot| snapshot.key.clone()),
+                        detail: error.to_string(),
+                    });
+                    return false;
+                }
+            };
             if let Some(snapshot) = current_snapshot.as_ref() {
                 emitter.emit(ComDetectorEvent::SlideShowStarted {
                     key: snapshot.key.clone(),
@@ -532,20 +544,23 @@ fn handle_pending_controls(
                 }
             };
 
-        emit_snapshot_difference(
-            emitter,
-            previous_snapshot.as_ref(),
-            current_snapshot.as_ref(),
-        );
-        *previous_snapshot = current_snapshot;
-
-        let Some(snapshot) = previous_snapshot.as_ref() else {
+        if !update_snapshot_for_control(emitter, previous_snapshot, current_snapshot) {
+            tracing::warn!(
+                ?action,
+                application = ?expected_key.application,
+                window_id = expected_key.window_id,
+                "控制前置复核得到瞬时空快照，已保留最后确认的放映会话"
+            );
             emitter.emit(ComDetectorEvent::ControlFailed {
                 action,
-                detail: "COM 已确认当前没有活动放映".to_owned(),
+                detail: "COM 控制前置复核暂未找到活动放映，已保留当前批注会话".to_owned(),
             });
             continue;
-        };
+        }
+
+        let snapshot = previous_snapshot
+            .as_ref()
+            .expect("刚写入的放映快照必须存在");
         if snapshot.key != expected_key {
             emitter.emit(ComDetectorEvent::ControlFailed {
                 action,
@@ -600,6 +615,77 @@ fn query_active_slideshow_with_retry(
     }
 }
 
+/// 在已有可靠会话时对首次空快照做有限存在性复核，避免瞬时 COM 空值结束会话。
+fn query_active_slideshow_with_presence_confirmation(
+    application: &windows::Win32::System::Com::IDispatch,
+    application_kind: PresentationApplication,
+    previous: Option<&ActiveSlideShowSnapshot>,
+) -> windows::core::Result<Option<ActiveSlideShowSnapshot>> {
+    let initial = query_active_slideshow_with_retry(application, application_kind)?;
+    let confirmation = confirm_snapshot_after_initial(previous, initial, || {
+        pump_sta_messages();
+        thread::sleep(EMPTY_SNAPSHOT_CONFIRMATION_DELAY);
+        query_active_slideshow_with_retry(application, application_kind)
+    })?;
+    if confirmation.empty_observations > 0 {
+        if let Some(snapshot) = confirmation.snapshot.as_ref() {
+            tracing::info!(
+                empty_observations = confirmation.empty_observations,
+                application = ?snapshot.key.application,
+                window_id = snapshot.key.window_id,
+                page = snapshot.page.key.show_position(),
+                "瞬时空放映快照已恢复，抑制会话结束"
+            );
+        } else if let Some(previous) = previous {
+            tracing::info!(
+                empty_observations = confirmation.empty_observations,
+                application = ?previous.key.application,
+                window_id = previous.key.window_id,
+                "连续空放映快照已确认，会话可以结束"
+            );
+        }
+    }
+    Ok(confirmation.snapshot)
+}
+
+/// 空快照存在性复核的纯状态结果，供 COM 路径和确定性测试共用。
+#[derive(Debug, PartialEq, Eq)]
+struct SnapshotPresenceConfirmation {
+    snapshot: Option<ActiveSlideShowSnapshot>,
+    empty_observations: usize,
+}
+
+/// 根据首次查询和后续有限序列确认空快照是否代表真实结束。
+fn confirm_snapshot_after_initial<E>(
+    previous: Option<&ActiveSlideShowSnapshot>,
+    initial: Option<ActiveSlideShowSnapshot>,
+    mut query_again: impl FnMut() -> Result<Option<ActiveSlideShowSnapshot>, E>,
+) -> Result<SnapshotPresenceConfirmation, E> {
+    if previous.is_none() || initial.is_some() {
+        return Ok(SnapshotPresenceConfirmation {
+            snapshot: initial,
+            empty_observations: 0,
+        });
+    }
+
+    let mut empty_observations = 1;
+    while empty_observations < EMPTY_SNAPSHOT_CONFIRMATION_ATTEMPTS {
+        match query_again()? {
+            Some(snapshot) => {
+                return Ok(SnapshotPresenceConfirmation {
+                    snapshot: Some(snapshot),
+                    empty_observations,
+                });
+            }
+            None => empty_observations += 1,
+        }
+    }
+    Ok(SnapshotPresenceConfirmation {
+        snapshot: None,
+        empty_observations,
+    })
+}
+
 /// 返回一个 COM 错误是否属于 Office 忙碌时可安全短重试的 RPC 状态。
 fn is_transient_com_rejection(error: &windows::core::Error) -> bool {
     matches!(
@@ -622,6 +708,20 @@ fn reject_pending_controls(
             });
         }
     }
+}
+
+/// 控制前置复核仅在得到可靠快照时更新会话；空值必须保留最后确认状态。
+fn update_snapshot_for_control(
+    emitter: &DetectorEventEmitter,
+    previous: &mut Option<ActiveSlideShowSnapshot>,
+    current: Option<ActiveSlideShowSnapshot>,
+) -> bool {
+    let Some(current) = current else {
+        return false;
+    };
+    emit_snapshot_difference(emitter, previous.as_ref(), Some(&current));
+    *previous = Some(current);
+    true
 }
 
 /// 比较两个可靠 COM 快照并发出开始、翻页或结束事件。
@@ -734,4 +834,108 @@ enum ConnectedCandidate {
         diagnostics: ComDiagnostics,
     },
     Unavailable(ComDiagnostics),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ink::PageKey;
+
+    /// 创建纯快照序列测试使用的稳定放映快照。
+    fn snapshot(window_id: i64, page: u32) -> ActiveSlideShowSnapshot {
+        ActiveSlideShowSnapshot {
+            key: SlideShowKey::new(PresentationApplication::PowerPoint, "deck", window_id),
+            page: SlidePage::new(
+                PageKey::new(page).expect("测试页键有效"),
+                Some(i64::from(page)),
+                Some(3),
+            ),
+        }
+    }
+
+    /// 创建可收集 detector 事件且不触发真实唤醒的测试 emitter。
+    fn emitter_fixture() -> (DetectorEventEmitter, Receiver<ComDetectorEvent>) {
+        let (sender, receiver) = mpsc::channel();
+        (
+            DetectorEventEmitter {
+                sender,
+                wake: Arc::new(|| {}),
+            },
+            receiver,
+        )
+    }
+
+    /// 验证活动会话首次空快照后恢复同一快照时抑制结束。
+    #[test]
+    fn single_empty_then_recovery_preserves_session() {
+        let previous = snapshot(1, 1);
+        let recovered = previous.clone();
+        let mut retries = vec![Ok::<_, ()>(Some(recovered.clone()))].into_iter();
+
+        let confirmation = confirm_snapshot_after_initial(Some(&previous), None, || {
+            retries.next().expect("只需一次复核")
+        })
+        .expect("测试复核不应失败");
+
+        assert_eq!(confirmation.snapshot, Some(recovered));
+        assert_eq!(confirmation.empty_observations, 1);
+        let (emitter, receiver) = emitter_fixture();
+        emit_snapshot_difference(&emitter, Some(&previous), confirmation.snapshot.as_ref());
+        assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    /// 验证达到固定空快照次数后才确认结束活动会话。
+    #[test]
+    fn consecutive_empty_snapshots_confirm_end() {
+        let previous = snapshot(1, 1);
+        let mut retry_count = 0;
+
+        let confirmation = confirm_snapshot_after_initial(Some(&previous), None, || {
+            retry_count += 1;
+            Ok::<_, ()>(None)
+        })
+        .expect("测试复核不应失败");
+
+        assert_eq!(confirmation.snapshot, None);
+        assert_eq!(
+            confirmation.empty_observations,
+            EMPTY_SNAPSHOT_CONFIRMATION_ATTEMPTS
+        );
+        assert_eq!(retry_count, EMPTY_SNAPSHOT_CONFIRMATION_ATTEMPTS - 1);
+    }
+
+    /// 验证控制前置复核为空时保留最后确认快照且不产生结束事件。
+    #[test]
+    fn empty_control_preflight_keeps_last_confirmed_snapshot() {
+        let confirmed = snapshot(1, 1);
+        let mut previous = Some(confirmed.clone());
+        let (emitter, receiver) = emitter_fixture();
+
+        assert!(!update_snapshot_for_control(&emitter, &mut previous, None));
+        assert_eq!(previous, Some(confirmed));
+        assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    /// 验证空快照后出现另一会话时生成旧会话结束和新会话开始事件。
+    #[test]
+    fn empty_then_different_key_switches_sessions() {
+        let previous = snapshot(1, 1);
+        let current = snapshot(2, 1);
+        let confirmation = confirm_snapshot_after_initial(Some(&previous), None, || {
+            Ok::<_, ()>(Some(current.clone()))
+        })
+        .expect("测试复核不应失败");
+        let (emitter, receiver) = emitter_fixture();
+
+        emit_snapshot_difference(&emitter, Some(&previous), confirmation.snapshot.as_ref());
+
+        assert!(matches!(
+            receiver.recv().expect("应结束旧会话"),
+            ComDetectorEvent::SlideShowEnded { key } if key == previous.key
+        ));
+        assert!(matches!(
+            receiver.recv().expect("应开始新会话"),
+            ComDetectorEvent::SlideShowStarted { key, .. } if key == current.key
+        ));
+    }
 }

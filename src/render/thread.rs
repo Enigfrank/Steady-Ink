@@ -7,7 +7,7 @@ use std::{
 
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 
-use super::{Compositor, EguiFrame};
+use super::{Compositor, EguiFrame, compositor::UiCompositor};
 use crate::{
     error::AppError,
     ink::{InkBounds, InkDocument, InkOperation, InkSyncKind, OwnedActiveInkPreview},
@@ -33,6 +33,7 @@ pub struct RenderFrame {
     pub document: InkDocument,
     pub active_preview: Option<OwnedActiveInkPreview>,
     pub egui: EguiFrame,
+    pub slideshow_ui: EguiFrame,
     pub performance: Option<RenderPerformanceMetadata>,
 }
 
@@ -55,6 +56,7 @@ enum RenderControl {
         completed: mpsc::SyncSender<Result<(), String>>,
     },
     Resize(PhysicalSize<u32>),
+    ResizeSlideshowUi(PhysicalSize<u32>),
     SetAnnotationResourcesEnabled(bool),
     InvalidateInk,
     InvalidateInkRegion(InkBounds),
@@ -67,12 +69,19 @@ struct RenderWork {
     frame: Option<RenderFrame>,
 }
 
+/// 一块原生呈现表面在线程启动时需要的 target 与 egui context。
+struct RenderSurfaceSetup {
+    target: D3DRenderTarget,
+    egui_context: egui::Context,
+}
+
 /// latest-frame 邮箱的互斥状态。
 #[derive(Default)]
 struct MailboxState {
     controls: VecDeque<RenderControl>,
     frame: Option<RenderFrame>,
     skipped_texture_deltas: Vec<egui::TexturesDelta>,
+    skipped_slideshow_texture_deltas: Vec<egui::TexturesDelta>,
     closed: bool,
 }
 
@@ -97,6 +106,9 @@ impl RenderMailbox {
             state
                 .skipped_texture_deltas
                 .extend(skipped.egui.texture_deltas);
+            state
+                .skipped_slideshow_texture_deltas
+                .extend(skipped.slideshow_ui.texture_deltas);
             if let Some(metadata) = state
                 .frame
                 .as_mut()
@@ -153,11 +165,17 @@ impl RenderMailbox {
             state
                 .skipped_texture_deltas
                 .extend(stale.egui.texture_deltas);
+            state
+                .skipped_slideshow_texture_deltas
+                .extend(stale.slideshow_ui.texture_deltas);
         }
         if let Some(source_frame) = source_frame.as_mut() {
             state
                 .skipped_texture_deltas
                 .append(&mut source_frame.egui.texture_deltas);
+            state
+                .skipped_slideshow_texture_deltas
+                .append(&mut source_frame.slideshow_ui.texture_deltas);
         }
         state
             .controls
@@ -176,6 +194,9 @@ impl RenderMailbox {
             state
                 .skipped_texture_deltas
                 .extend(stale.egui.texture_deltas);
+            state
+                .skipped_slideshow_texture_deltas
+                .extend(stale.slideshow_ui.texture_deltas);
         }
         if let Some(RenderControl::Resize(current)) = state.controls.back_mut() {
             *current = size;
@@ -198,6 +219,13 @@ impl RenderMailbox {
             let mut deltas = std::mem::take(&mut state.skipped_texture_deltas);
             deltas.append(&mut frame.egui.texture_deltas);
             frame.egui.texture_deltas = deltas;
+        }
+        if let Some(frame) = frame.as_mut()
+            && !state.skipped_slideshow_texture_deltas.is_empty()
+        {
+            let mut deltas = std::mem::take(&mut state.skipped_slideshow_texture_deltas);
+            deltas.append(&mut frame.slideshow_ui.texture_deltas);
+            frame.slideshow_ui.texture_deltas = deltas;
         }
         RenderWork {
             controls: std::mem::take(&mut state.controls),
@@ -229,6 +257,8 @@ impl RenderThread {
     pub fn spawn(
         target: D3DRenderTarget,
         egui_context: egui::Context,
+        slideshow_ui_target: D3DRenderTarget,
+        slideshow_egui_context: egui::Context,
         wake_event_loop: impl Fn() + Send + 'static,
     ) -> Result<Self, AppError> {
         let mailbox = Arc::new(RenderMailbox::default());
@@ -237,12 +267,20 @@ impl RenderThread {
         let performance = performance_monitor.snapshot_reader();
         let (events_tx, events) = mpsc::channel();
         let (initialized_tx, initialized_rx) = mpsc::sync_channel(1);
+        let main_surface = RenderSurfaceSetup {
+            target,
+            egui_context,
+        };
+        let slideshow_surface = RenderSurfaceSetup {
+            target: slideshow_ui_target,
+            egui_context: slideshow_egui_context,
+        };
         let join = thread::Builder::new()
             .name("steady-ink-render".to_owned())
             .spawn(move || {
                 run_render_thread(
-                    target,
-                    egui_context,
+                    main_surface,
+                    slideshow_surface,
                     worker_mailbox,
                     events_tx,
                     initialized_tx,
@@ -330,6 +368,12 @@ impl RenderThread {
         self.mailbox.submit_resize(size);
     }
 
+    /// 请求在下一帧前调整独立放映控件窗口的 swap chain。
+    pub fn resize_slideshow_ui(&self, size: PhysicalSize<u32>) {
+        self.mailbox
+            .submit_control(RenderControl::ResizeSlideshowUi(size));
+    }
+
     /// 请求切换批注模式下的大型 GPU 资源驻留策略。
     pub fn set_annotation_resources_enabled(&self, enabled: bool) {
         self.mailbox
@@ -379,21 +423,37 @@ impl Drop for RenderThread {
 
 /// 在线程内创建全部 GPU 状态并持续处理控制命令和最新帧。
 fn run_render_thread(
-    target: D3DRenderTarget,
-    egui_context: egui::Context,
+    main_surface: RenderSurfaceSetup,
+    slideshow_surface: RenderSurfaceSetup,
     mailbox: Arc<RenderMailbox>,
     events: mpsc::Sender<RenderEvent>,
     initialized: mpsc::SyncSender<Result<(GraphicsDiagnostics, Option<String>), String>>,
     mut performance_monitor: PerformanceMonitor,
     wake_event_loop: &impl Fn(),
 ) {
-    let initialization = D3DRenderContext::new(target).and_then(|context| {
-        let (compositor, initial_ink_error) = Compositor::new(&context, egui_context)?;
+    let initialization = D3DRenderContext::new(main_surface.target).and_then(|context| {
+        let (compositor, initial_ink_error) = Compositor::new(&context, main_surface.egui_context)?;
+        let slideshow_ui_context = D3DRenderContext::new(slideshow_surface.target)?;
+        let slideshow_ui_compositor =
+            UiCompositor::new(&slideshow_ui_context, slideshow_surface.egui_context)?;
         let diagnostics = context.diagnostics_snapshot();
-        Ok((context, compositor, diagnostics, initial_ink_error))
+        Ok((
+            context,
+            compositor,
+            slideshow_ui_context,
+            slideshow_ui_compositor,
+            diagnostics,
+            initial_ink_error,
+        ))
     });
-    let (mut window_context, mut compositor, diagnostics, mut last_ink_error) = match initialization
-    {
+    let (
+        mut window_context,
+        mut compositor,
+        mut slideshow_ui_context,
+        mut slideshow_ui_compositor,
+        diagnostics,
+        mut last_ink_error,
+    ) = match initialization {
         Ok(initialized_state) => initialized_state,
         Err(error) => {
             let _ = initialized.send(Err(error.to_string()));
@@ -432,6 +492,9 @@ fn run_render_thread(
                     result
                 }
                 RenderControl::Resize(size) => compositor.resize(&mut window_context, size.into()),
+                RenderControl::ResizeSlideshowUi(size) => {
+                    slideshow_ui_compositor.resize(&mut slideshow_ui_context, size.into())
+                }
                 RenderControl::SetAnnotationResourcesEnabled(enabled) => {
                     compositor.set_annotation_resources_enabled(enabled)
                 }
@@ -484,7 +547,13 @@ fn run_render_thread(
                 .map(OwnedActiveInkPreview::as_borrowed);
             let result = compositor
                 .paint(&window_context, &frame.document, preview, frame.egui)
-                .and_then(|ink_sync| window_context.present().map(|()| ink_sync));
+                .and_then(|ink_sync| window_context.present().map(|()| ink_sync))
+                .and_then(|ink_sync| {
+                    slideshow_ui_compositor
+                        .paint(&slideshow_ui_context, frame.slideshow_ui)
+                        .and_then(|()| slideshow_ui_context.present())
+                        .map(|()| ink_sync)
+                });
             let ink_sync = match result {
                 Ok(ink_sync) => ink_sync,
                 Err(error) => {
@@ -512,7 +581,11 @@ fn run_render_thread(
                 let input_latency = metadata
                     .input_started_at
                     .map(|started_at| presented_at.saturating_duration_since(started_at));
-                let managed_gpu_bytes = compositor.estimated_managed_gpu_bytes(&window_context);
+                let managed_gpu_bytes = compositor
+                    .estimated_managed_gpu_bytes(&window_context)
+                    .saturating_add(
+                        slideshow_ui_compositor.estimated_managed_gpu_bytes(&slideshow_ui_context),
+                    );
                 let performance_ink_sync = performance_ink_sync(ink_sync);
                 let slow_frame = performance_monitor.record_frame(PerformanceFrameSample {
                     presented_at,
@@ -623,6 +696,14 @@ mod tests {
                     free: vec![TextureId::Managed(texture)],
                 }],
             },
+            slideshow_ui: EguiFrame {
+                shapes: Vec::new(),
+                pixels_per_point: 1.0,
+                texture_deltas: vec![TexturesDelta {
+                    set: Vec::new(),
+                    free: vec![TextureId::Managed(texture + 100)],
+                }],
+            },
             performance: None,
         }
     }
@@ -672,6 +753,13 @@ mod tests {
             .flat_map(|delta| delta.free.iter())
             .copied()
             .collect();
+        let slideshow_textures: Vec<_> = frame
+            .slideshow_ui
+            .texture_deltas
+            .iter()
+            .flat_map(|delta| delta.free.iter())
+            .copied()
+            .collect();
 
         assert_eq!(frame.generation, 3);
         assert_eq!(
@@ -696,6 +784,14 @@ mod tests {
                 TextureId::Managed(33)
             ]
         );
+        assert_eq!(
+            slideshow_textures,
+            vec![
+                TextureId::Managed(111),
+                TextureId::Managed(122),
+                TextureId::Managed(133)
+            ]
+        );
     }
 
     /// 验证 resize 丢弃旧尺寸画面、合并连续尺寸并保留纹理 delta。
@@ -715,6 +811,7 @@ mod tests {
         ));
         let frame = work.frame.expect("resize 后的新画面应保留");
         assert_eq!(frame.egui.texture_deltas.len(), 2);
+        assert_eq!(frame.slideshow_ui.texture_deltas.len(), 2);
     }
 
     /// 验证 visual 冻结丢弃所有旧布局图形，但把待处理帧和命令帧纹理增量交给目标帧。
@@ -749,12 +846,27 @@ mod tests {
             .flat_map(|delta| delta.free.iter())
             .copied()
             .collect();
+        let slideshow_textures: Vec<_> = target_frame
+            .slideshow_ui
+            .texture_deltas
+            .iter()
+            .flat_map(|delta| delta.free.iter())
+            .copied()
+            .collect();
         assert_eq!(
             textures,
             vec![
                 TextureId::Managed(11),
                 TextureId::Managed(22),
                 TextureId::Managed(33)
+            ]
+        );
+        assert_eq!(
+            slideshow_textures,
+            vec![
+                TextureId::Managed(111),
+                TextureId::Managed(122),
+                TextureId::Managed(133)
             ]
         );
     }

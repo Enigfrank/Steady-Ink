@@ -8,4 +8,6 @@ pub use control::{SlideShowControlAction, SlideShowControlBackend};
 pub use detector::{
     ComCandidateDiagnostic, ComCandidateStatus, ComDetector, ComDetectorEvent, ComDiagnostics,
 };
-pub use session::{PresentationApplication, SlidePage, SlideShowKey, SlideShowSession};
+pub use session::{
+    PageSwitchOutcome, PresentationApplication, SlidePage, SlideShowKey, SlideShowSession,
+};

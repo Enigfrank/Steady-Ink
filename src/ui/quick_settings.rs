@@ -89,7 +89,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        app::AppMode,
+        app::{AppMode, SlideshowInputMode},
         performance::PerformanceSnapshot,
         settings::{LogLevel, PalmSizePreset},
         ui::{IdlePanel, ToolState},
@@ -149,6 +149,7 @@ mod tests {
             crate::ui::configure_context(&context);
             let view = UiViewState {
                 mode: AppMode::IdleFloatingToolbar,
+                slideshow_input_mode: SlideshowInputMode::Ink,
                 idle_panel: IdlePanel::QuickSettings,
                 dock_side,
                 tools: ToolState::default(),

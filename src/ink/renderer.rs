@@ -1319,7 +1319,7 @@ mod tests {
                 tool: InkTool::Pen,
                 color: InkColor::Red,
                 pen_width: PenWidth::Px4,
-                eraser_size: EraserSize::Px24,
+                eraser_size: EraserSize::Px36,
             }
             .latest_position(),
             Some(CanvasPoint::new(3.0, 4.0))
@@ -1328,7 +1328,7 @@ mod tests {
             ActiveInkPreview::VariableTool {
                 points: &variable_points,
                 color: InkColor::Red,
-                eraser_size: EraserSize::Px24,
+                eraser_size: EraserSize::Px36,
             }
             .latest_position(),
             Some(CanvasPoint::new(5.0, 6.0))
@@ -1349,7 +1349,7 @@ mod tests {
         let circle_samples: Vec<_> = points
             .iter()
             .copied()
-            .map(|point| EraseSample::circle(point, EraserSize::Px24.pixels()))
+            .map(|point| EraseSample::circle(point, EraserSize::Px36.pixels()))
             .collect();
         let circle_stroke = EraseStroke::new(OperationId::new(1), circle_samples)
             .expect("有效圆形擦除应创建事实操作");
@@ -1358,7 +1358,7 @@ mod tests {
             tool: InkTool::RegionEraser,
             color: InkColor::Red,
             pen_width: PenWidth::Px4,
-            eraser_size: EraserSize::Px24,
+            eraser_size: EraserSize::Px36,
         };
         assert!(active_preview_matches_erase(circle_preview, &circle_stroke));
 
@@ -1382,7 +1382,7 @@ mod tests {
                 tool: InkTool::RegionEraser,
                 color: InkColor::Red,
                 pen_width: PenWidth::Px4,
-                eraser_size: EraserSize::Px24,
+                eraser_size: EraserSize::Px36,
             },
             &circle_stroke
         ));
@@ -1402,7 +1402,7 @@ mod tests {
         let erase_id = document
             .append_erase_stroke(vec![EraseSample::circle(
                 CanvasPoint::new(16.0, 16.0),
-                EraserSize::Px24.pixels(),
+                EraserSize::Px36.pixels(),
             )])
             .expect("有效擦除应创建事实操作");
         let erase_bounds = document
@@ -1426,7 +1426,7 @@ mod tests {
             tool: InkTool::RegionEraser,
             color: InkColor::Red,
             pen_width: PenWidth::Px4,
-            eraser_size: EraserSize::Px24,
+            eraser_size: EraserSize::Px36,
         });
         assert_eq!(
             cache.deferred_erase.as_ref().map(|stroke| stroke.id),

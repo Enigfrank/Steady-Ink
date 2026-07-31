@@ -170,26 +170,28 @@ impl Default for PenWidth {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EraserSize {
-    Px24,
-    Px48,
+    #[serde(alias = "px24")]
+    Px36,
+    #[serde(alias = "px48")]
     Px72,
+    Px144,
 }
 
 impl EraserSize {
     /// 返回当前档位对应的物理像素直径。
     pub const fn pixels(self) -> f32 {
         match self {
-            Self::Px24 => 24.0,
-            Self::Px48 => 48.0,
+            Self::Px36 => 36.0,
             Self::Px72 => 72.0,
+            Self::Px144 => 144.0,
         }
     }
 }
 
 impl Default for EraserSize {
-    /// 返回产品默认橡皮擦大小 48px。
+    /// 返回产品默认橡皮擦大小 72px。
     fn default() -> Self {
-        Self::Px48
+        Self::Px72
     }
 }
 

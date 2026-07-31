@@ -178,7 +178,7 @@ mod tests {
             tool: InkTool::Pen,
             color: InkColor::Red,
             pen_width: width,
-            eraser_size: EraserSize::Px24,
+            eraser_size: EraserSize::Px36,
         }
     }
 
@@ -194,14 +194,14 @@ mod tests {
         let thin = ActiveInkPreview::VariableTool {
             points: &thin_points,
             color: InkColor::Red,
-            eraser_size: EraserSize::Px24,
+            eraser_size: EraserSize::Px36,
         };
         let eraser = ActiveInkPreview::Tool {
             points: &[CanvasPoint::new(1.0, 1.0)],
             tool: InkTool::RegionEraser,
             color: InkColor::Red,
             pen_width: PenWidth::Px4,
-            eraser_size: EraserSize::Px24,
+            eraser_size: EraserSize::Px36,
         };
 
         assert_eq!(high_quality_config.render_scale, 2.0);

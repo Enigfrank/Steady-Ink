@@ -105,7 +105,7 @@ pub struct ToolPreferences {
 }
 
 impl Default for ToolPreferences {
-    /// 返回产品确认的红色、4px 画笔和 48px 橡皮擦默认值。
+    /// 返回产品确认的红色、4px 画笔和 72px 橡皮擦默认值。
     fn default() -> Self {
         Self {
             color: InkColor::default(),
@@ -145,7 +145,7 @@ impl Default for UserSettings {
 #[cfg(test)]
 mod tests {
     use super::{PalmSizePreset, UserSettings};
-    use crate::ink::PenWidth;
+    use crate::ink::{EraserSize, PenWidth};
 
     #[test]
     fn missing_readable_mode_uses_the_default() {
@@ -283,6 +283,39 @@ mod tests {
         let serialized = toml::to_string(&settings).expect("设置应能序列化");
         assert!(serialized.contains("pen_width = \"px16\""));
         assert!(!serialized.contains("px24"));
+    }
+
+    /// 验证旧版 24/48/72px 橡皮擦配置迁移到 36/72/144px 新档位。
+    #[test]
+    fn legacy_eraser_sizes_migrate_to_new_diameters() {
+        // 旧 24px 和 48px 就近映射到新档位；旧 72px 保留同名档位。
+        for (legacy, expected) in [
+            ("px24", EraserSize::Px36),
+            ("px48", EraserSize::Px72),
+            ("px72", EraserSize::Px72),
+        ] {
+            let source = format!("[tools]\neraser_size = \"{legacy}\"\n");
+            let settings: UserSettings =
+                toml::from_str(&source).expect("旧版橡皮擦档位应能反序列化");
+
+            assert_eq!(settings.tools.eraser_size, expected);
+        }
+
+        // 新档位使用稳定的 36/72/144 像素直径。
+        assert_eq!(EraserSize::Px36.pixels(), 36.0);
+        assert_eq!(EraserSize::Px72.pixels(), 72.0);
+        assert_eq!(EraserSize::Px144.pixels(), 144.0);
+
+        // 新配置往返使用稳定名称。
+        let serialized = toml::to_string(&UserSettings {
+            tools: super::ToolPreferences {
+                eraser_size: EraserSize::Px144,
+                ..super::ToolPreferences::default()
+            },
+            ..UserSettings::default()
+        })
+        .expect("设置应能序列化");
+        assert!(serialized.contains("eraser_size = \"px144\""));
     }
 
     /// 验证旧版抗锯齿字段可被兼容忽略，保存时不再写回可变档位。

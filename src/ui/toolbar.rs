@@ -142,7 +142,7 @@ impl ToolbarInteraction {
 }
 
 impl Default for ToolState {
-    /// 返回已确认的默认画笔、红色、4px 和 48px 配置。
+    /// 返回已确认的默认画笔、红色、4px 和 72px 配置。
     fn default() -> Self {
         Self {
             tool: InkTool::default(),
@@ -155,12 +155,12 @@ impl Default for ToolState {
 }
 
 impl ToolState {
-    /// 按 24px、48px、72px 的固定顺序切换区域橡皮擦大小。
+    /// 按 36px、72px、144px 的固定顺序切换区域橡皮擦大小。
     pub fn cycle_eraser_size(&mut self) {
         self.eraser_size = match self.eraser_size {
-            EraserSize::Px24 => EraserSize::Px48,
-            EraserSize::Px48 => EraserSize::Px72,
-            EraserSize::Px72 => EraserSize::Px24,
+            EraserSize::Px36 => EraserSize::Px72,
+            EraserSize::Px72 => EraserSize::Px144,
+            EraserSize::Px144 => EraserSize::Px36,
         };
     }
 }
@@ -1133,9 +1133,9 @@ pub(super) const fn pen_width_label(width: PenWidth) -> &'static str {
 /// 返回橡皮擦大小按钮使用的紧凑标签。
 pub(super) const fn eraser_size_label(size: EraserSize) -> &'static str {
     match size {
-        EraserSize::Px24 => "24px",
-        EraserSize::Px48 => "48px",
+        EraserSize::Px36 => "36px",
         EraserSize::Px72 => "72px",
+        EraserSize::Px144 => "144px",
     }
 }
 

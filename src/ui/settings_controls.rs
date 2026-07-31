@@ -19,7 +19,7 @@ const COLORS: [InkColor; 6] = [
     InkColor::White,
 ];
 const PEN_WIDTHS: [PenWidth; 4] = [PenWidth::Px4, PenWidth::Px6, PenWidth::Px8, PenWidth::Px16];
-const ERASER_SIZES: [EraserSize; 3] = [EraserSize::Px24, EraserSize::Px48, EraserSize::Px72];
+const ERASER_SIZES: [EraserSize; 3] = [EraserSize::Px36, EraserSize::Px72, EraserSize::Px144];
 
 /// 颜色和画笔粗细选择项在不同界面中的排列方向。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -296,9 +296,9 @@ fn draw_selection_visual(
         }
         SelectionVisual::EraserSize(size) => {
             let radius = match size {
-                EraserSize::Px24 => metrics.space_2,
-                EraserSize::Px48 => metrics.space_3,
+                EraserSize::Px36 => metrics.space_3,
                 EraserSize::Px72 => metrics.space_4,
+                EraserSize::Px144 => metrics.space_6,
             };
             ui.painter().circle_stroke(
                 center,
@@ -334,9 +334,9 @@ const fn pen_width_label(width: PenWidth) -> &'static str {
 /// 返回橡皮擦直径档位标签。
 const fn eraser_size_label(size: EraserSize) -> &'static str {
     match size {
-        EraserSize::Px24 => "24px",
-        EraserSize::Px48 => "48px",
+        EraserSize::Px36 => "36px",
         EraserSize::Px72 => "72px",
+        EraserSize::Px144 => "144px",
     }
 }
 

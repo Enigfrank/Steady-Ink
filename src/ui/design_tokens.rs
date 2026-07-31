@@ -41,6 +41,7 @@ pub struct InterfaceMetrics {
     pub space_3: f32,
     pub space_4: f32,
     pub space_6: f32,
+    pub space_8: f32,
     pub margin_space_2: i8,
     pub margin_space_4: i8,
     pub card_radius: u8,
@@ -67,6 +68,7 @@ impl InterfaceMetrics {
             space_3: 12.0 * scale,
             space_4: 16.0 * scale,
             space_6: 24.0 * scale,
+            space_8: 32.0 * scale,
             margin_space_2: scaled_integer(8, scale) as i8,
             margin_space_4: scaled_integer(16, scale) as i8,
             card_radius: scaled_integer(8, scale),
@@ -94,6 +96,7 @@ pub const COLOR_TEXT_PRIMARY: Color32 = Color32::from_rgb(17, 24, 39);
 pub const COLOR_TEXT_SECONDARY: Color32 = Color32::from_rgb(107, 114, 128);
 pub const COLOR_TEXT_TERTIARY: Color32 = Color32::from_rgb(156, 163, 175);
 pub const COLOR_PRIMARY: Color32 = Color32::from_rgb(37, 99, 235);
+pub const COLOR_BORDER_INPUT: Color32 = Color32::from_rgb(209, 213, 219);
 pub const COLOR_ERROR: Color32 = Color32::from_rgb(220, 38, 38);
 pub const COLOR_ERROR_SURFACE: Color32 = Color32::from_rgba_unmultiplied_const(220, 38, 38, 220);
 pub const OPAQUE_COLOR_BACKGROUND: Color32 =
@@ -319,5 +322,6 @@ mod tests {
         assert_eq!(SETTINGS_METRICS.option_text, 16.0);
         assert_eq!(SETTINGS_METRICS.icon_size, 20.0);
         assert_eq!(SETTINGS_METRICS.touch_target, 64.0);
+        assert_eq!(SETTINGS_METRICS.space_8, 32.0);
     }
 }

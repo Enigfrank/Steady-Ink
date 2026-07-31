@@ -1,4 +1,6 @@
-use egui::{Align2, Color32, CornerRadius, FontId, Pos2, Response, Sense, Stroke, Ui, Vec2};
+use egui::{
+    Align, Align2, Color32, CornerRadius, FontId, Layout, Pos2, Response, Sense, Stroke, Ui, Vec2,
+};
 
 use super::{
     design_tokens::{self as tokens, InterfaceMetrics},
@@ -128,30 +130,6 @@ pub(super) fn render_log_level_selector(
                 .clicked()
             {
                 command = Some(UiCommand::SetLogLevel(level));
-            }
-        }
-    });
-    command
-}
-
-/// 绘制小、标准、大三档手掌尺寸选择器。
-pub(super) fn render_palm_size_selector(
-    ui: &mut Ui,
-    selected: PalmSizePreset,
-    metrics: InterfaceMetrics,
-) -> Option<UiCommand> {
-    section_label(ui, "手掌尺寸", metrics);
-    let mut command = None;
-    ui.horizontal(|ui| {
-        for preset in PalmSizePreset::ALL {
-            if ui
-                .add_sized(
-                    Vec2::splat(metrics.touch_target),
-                    egui::Button::selectable(selected == preset, preset.label()),
-                )
-                .clicked()
-            {
-                command = Some(UiCommand::SetPalmSizePreset(preset));
             }
         }
     });
@@ -380,4 +358,238 @@ enum SelectionVisual {
     Color(Color32),
     PenWidth(PenWidth),
     EraserSize(EraserSize),
+}
+
+/// 绘制设置页行式选项行：固定标签列加控件区，行高为完整触摸高度。
+fn selection_row(
+    ui: &mut Ui,
+    label: &str,
+    metrics: InterfaceMetrics,
+    add_contents: impl FnOnce(&mut Ui),
+) {
+    ui.horizontal(|ui| {
+        ui.allocate_ui_with_layout(
+            Vec2::new(metrics.diagnostic_label_width, metrics.touch_target),
+            Layout::left_to_right(Align::Center),
+            |ui| {
+                ui.label(
+                    egui::RichText::new(label)
+                        .size(metrics.option_text)
+                        .color(tokens::COLOR_TEXT_PRIMARY),
+                );
+            },
+        );
+        ui.allocate_ui_with_layout(
+            Vec2::new(ui.available_width(), metrics.touch_target),
+            Layout::left_to_right(Align::Center),
+            add_contents,
+        );
+    });
+}
+
+/// 绘制设置页行式的画笔颜色选择行：圆形色块，命令与旧选择器一致。
+pub(super) fn render_color_selector_row(
+    ui: &mut Ui,
+    selected: InkColor,
+    metrics: InterfaceMetrics,
+    _readable_mode: bool,
+) -> Option<UiCommand> {
+    let mut command = None;
+    selection_row(ui, "画笔颜色", metrics, |ui| {
+        for color in COLORS {
+            if color_swatch_button(ui, color, selected == color, metrics).clicked()
+                && command.is_none()
+            {
+                command = Some(UiCommand::SetColor(color));
+            }
+        }
+    });
+    command
+}
+
+/// 绘制设置页行式布局中的圆形颜色色块，选中态使用加粗主色描边。
+fn color_swatch_button(
+    ui: &mut Ui,
+    color: InkColor,
+    selected: bool,
+    metrics: InterfaceMetrics,
+) -> Response {
+    let diameter = metrics.space_6 * 2.0;
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(diameter), Sense::click());
+    if !ui.is_rect_visible(rect) {
+        return response;
+    }
+    let center = rect.center();
+    let radius = metrics.space_6 - 1.0;
+    ui.painter().circle_filled(center, radius, color32(color));
+    let stroke = if selected {
+        Stroke::new(metrics.points(2.0), tokens::COLOR_PRIMARY)
+    } else if response.hovered() || response.is_pointer_button_down_on() {
+        Stroke::new(1.0, tokens::COLOR_TEXT_SECONDARY)
+    } else {
+        Stroke::new(1.0, tokens::COLOR_BORDER_INPUT)
+    };
+    ui.painter().circle_stroke(center, radius, stroke);
+    response.on_hover_text(color_label(color))
+}
+
+/// 绘制设置页行式的画笔粗细选择行，复用线宽预览方块按钮。
+pub(super) fn render_pen_width_selector_row(
+    ui: &mut Ui,
+    selected: PenWidth,
+    metrics: InterfaceMetrics,
+    readable_mode: bool,
+) -> Option<UiCommand> {
+    let mut command = None;
+    selection_row(ui, "画笔粗细", metrics, |ui| {
+        for width in PEN_WIDTHS {
+            if selection_button(
+                ui,
+                pen_width_label(width),
+                SelectionVisual::PenWidth(width),
+                selected == width,
+                metrics,
+                readable_mode,
+            )
+            .clicked()
+                && command.is_none()
+            {
+                command = Some(UiCommand::SetPenWidth(width));
+            }
+        }
+    });
+    command
+}
+
+/// 绘制设置页行式的橡皮擦大小选择行，复用圆环预览方块按钮。
+pub(super) fn render_eraser_size_selector_row(
+    ui: &mut Ui,
+    selected: EraserSize,
+    metrics: InterfaceMetrics,
+    readable_mode: bool,
+) -> Option<UiCommand> {
+    let mut command = None;
+    selection_row(ui, "橡皮擦大小", metrics, |ui| {
+        for size in ERASER_SIZES {
+            if selection_button(
+                ui,
+                eraser_size_label(size),
+                SelectionVisual::EraserSize(size),
+                selected == size,
+                metrics,
+                readable_mode,
+            )
+            .clicked()
+                && command.is_none()
+            {
+                command = Some(UiCommand::SetEraserSize(size));
+            }
+        }
+    });
+    command
+}
+
+/// 绘制设置页行式的手掌尺寸选择行。
+pub(super) fn render_palm_size_selector_row(
+    ui: &mut Ui,
+    selected: PalmSizePreset,
+    metrics: InterfaceMetrics,
+) -> Option<UiCommand> {
+    let mut command = None;
+    selection_row(ui, "手掌尺寸", metrics, |ui| {
+        for preset in PalmSizePreset::ALL {
+            if ui
+                .add_sized(
+                    Vec2::splat(metrics.touch_target),
+                    egui::Button::selectable(selected == preset, preset.label()),
+                )
+                .clicked()
+                && command.is_none()
+            {
+                command = Some(UiCommand::SetPalmSizePreset(preset));
+            }
+        }
+    });
+    command
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 断言形状中的全部文本都完整落在视口内。
+    fn assert_text_inside_viewport(shape: &egui::Shape, viewport: egui::Rect) {
+        match shape {
+            egui::Shape::Text(text) => {
+                let bounds = text.visual_bounding_rect();
+                assert!(
+                    viewport.expand(1.1).contains_rect(bounds),
+                    "文本 {:?} 越出视口: {bounds:?}",
+                    text.galley.job.text
+                );
+            }
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    assert_text_inside_viewport(shape, viewport);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// 验证四种行式选择器在设置页 528px 内容宽内全部放下。
+    #[test]
+    fn settings_row_selectors_fit_content_width() {
+        let metrics = tokens::SETTINGS_METRICS;
+        let content_width = 528.0 - metrics.diagnostic_label_width - metrics.space_2;
+        let color_width = COLORS.len() as f32 * (metrics.space_6 * 2.0)
+            + (COLORS.len() - 1) as f32 * metrics.space_2;
+        let pen_width = PEN_WIDTHS.len() as f32 * metrics.touch_target
+            + (PEN_WIDTHS.len() - 1) as f32 * metrics.space_2;
+        let eraser_width = ERASER_SIZES.len() as f32 * metrics.touch_target
+            + (ERASER_SIZES.len() - 1) as f32 * metrics.space_2;
+        let palm_width = PalmSizePreset::ALL.len() as f32 * metrics.touch_target
+            + (PalmSizePreset::ALL.len() - 1) as f32 * metrics.space_2;
+
+        assert!(
+            color_width <= content_width,
+            "画笔颜色行溢出: {color_width} > {content_width}"
+        );
+        assert!(
+            pen_width <= content_width,
+            "画笔粗细行溢出: {pen_width} > {content_width}"
+        );
+        assert!(
+            eraser_width <= content_width,
+            "橡皮擦大小行溢出: {eraser_width} > {content_width}"
+        );
+        assert!(
+            palm_width <= content_width,
+            "手掌尺寸行溢出: {palm_width} > {content_width}"
+        );
+    }
+
+    /// 验证行式颜色选择器在 560×640 设置视口内完整渲染，无文本越界。
+    #[test]
+    fn color_selector_row_renders_within_settings_viewport() {
+        let context = egui::Context::default();
+        crate::ui::configure_context(&context);
+        let output = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(560.0, 640.0),
+                )),
+                ..egui::RawInput::default()
+            },
+            |ui| {
+                let _ =
+                    render_color_selector_row(ui, InkColor::Red, tokens::SETTINGS_METRICS, false);
+            },
+        );
+        let viewport = context.content_rect();
+        for clipped in &output.shapes {
+            assert_text_inside_viewport(&clipped.shape, viewport);
+        }
+    }
 }

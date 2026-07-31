@@ -7,7 +7,8 @@ use super::{
     design_tokens::{self as tokens, InterfaceMetrics},
     pixel_snap,
     settings_controls::{
-        render_log_level_selector, render_palm_size_selector, render_tool_preferences,
+        render_color_selector_row, render_eraser_size_selector_row, render_log_level_selector,
+        render_palm_size_selector_row, render_pen_width_selector_row,
     },
     toolbar::{Icon, UiCommand, UiViewState, paint_icon},
 };
@@ -44,40 +45,71 @@ pub fn render(ui: &mut Ui, view: UiViewState<'_>) -> Option<UiCommand> {
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     section_heading(ui, "默认批注工具", metrics);
-                    let preferences_command =
-                        render_tool_preferences(
-                            ui,
-                            view.tools,
-                            tokens::SETTINGS_METRICS,
-                            view.readable_mode,
-                            true,
-                        );
+                    let mut preferences_command = None;
+                    let color_command =
+                        render_color_selector_row(ui, view.tools.color, metrics, view.readable_mode);
+                    if color_command.is_some() {
+                        preferences_command = color_command;
+                    }
+                    ui.add_space(metrics.space_1);
+                    let width_command = render_pen_width_selector_row(
+                        ui,
+                        view.tools.pen_width,
+                        metrics,
+                        view.readable_mode,
+                    );
+                    if preferences_command.is_none() {
+                        preferences_command = width_command;
+                    }
+                    ui.add_space(metrics.space_1);
+                    let eraser_command = render_eraser_size_selector_row(
+                        ui,
+                        view.tools.eraser_size,
+                        metrics,
+                        view.readable_mode,
+                    );
+                    if preferences_command.is_none() {
+                        preferences_command = eraser_command;
+                    }
+                    ui.add_space(metrics.space_2);
+                    let mut natural_taper_enabled = view.tools.natural_taper_enabled;
+                    if ui
+                        .add_sized(
+                            [ui.available_width(), metrics.touch_target],
+                            egui::Checkbox::new(&mut natural_taper_enabled, "自然笔锋"),
+                        )
+                        .changed()
+                        && preferences_command.is_none()
+                    {
+                        preferences_command =
+                            Some(UiCommand::SetNaturalTaperEnabled(natural_taper_enabled));
+                    }
                     if command.is_none() {
                         command = preferences_command;
                     }
 
-                    section_break(ui, metrics);
+                    section_gap(ui, metrics);
                     let display_command = render_display_settings(ui, view, metrics);
                     if command.is_none() {
                         command = display_command;
                     }
 
-                    section_break(ui, metrics);
+                    section_gap(ui, metrics);
                     section_heading(ui, "触摸与手掌", metrics);
                     let palm_size_command =
-                        render_palm_size_selector(ui, view.palm_size_preset, metrics);
+                        render_palm_size_selector_row(ui, view.palm_size_preset, metrics);
                     if command.is_none() {
                         command = palm_size_command;
                     }
 
-                    section_break(ui, metrics);
+                    section_gap(ui, metrics);
                     let autostart_command =
                         render_machine_autostart_setting(ui, view, metrics);
                     if command.is_none() {
                         command = autostart_command;
                     }
 
-                    section_break(ui, metrics);
+                    section_gap(ui, metrics);
                     section_heading(ui, "演示联动", metrics);
                     let mut integration_enabled = view.slideshow_integration_enabled;
                     if ui
@@ -103,9 +135,14 @@ pub fn render(ui: &mut Ui, view: UiViewState<'_>) -> Option<UiCommand> {
                         .color(tokens::COLOR_TEXT_SECONDARY),
                     );
 
-                    section_break(ui, metrics);
-                    egui::CollapsingHeader::new("诊断与日志")
-                        .default_open(false)
+                    section_gap(ui, metrics);
+                    egui::CollapsingHeader::new(
+                        egui::RichText::new("诊断与日志")
+                            .size(metrics.text_base)
+                            .strong()
+                            .color(tokens::COLOR_TEXT_PRIMARY),
+                    )
+                    .default_open(false)
                         .show(ui, |ui| {
                             let log_level_command =
                                 render_log_level_selector(ui, view.log_level, metrics);
@@ -119,7 +156,7 @@ pub fn render(ui: &mut Ui, view: UiViewState<'_>) -> Option<UiCommand> {
                             }
                         });
 
-                    section_break(ui, metrics);
+                    section_gap(ui, metrics);
                     render_settings_footer(ui, metrics);
                     ui.add_space(metrics.space_2);
                 });
@@ -133,6 +170,16 @@ pub fn render(ui: &mut Ui, view: UiViewState<'_>) -> Option<UiCommand> {
 fn render_header(ui: &mut Ui, metrics: InterfaceMetrics, readable_mode: bool) -> Option<UiCommand> {
     let mut command = None;
     ui.horizontal(|ui| {
+        let (icon_rect, _) = ui.allocate_exact_size(Vec2::splat(metrics.text_xl), Sense::hover());
+        paint_icon(
+            ui,
+            icon_rect.center(),
+            Icon::Settings,
+            None,
+            tokens::COLOR_TEXT_PRIMARY,
+            tokens::COLOR_TEXT_PRIMARY,
+            metrics,
+        );
         ui.label(
             egui::RichText::new("设置")
                 .size(metrics.text_xl)
@@ -421,18 +468,16 @@ fn settings_footer_text() -> String {
 fn section_heading(ui: &mut Ui, title: &str, metrics: InterfaceMetrics) {
     ui.label(
         egui::RichText::new(title)
-            .size(metrics.text_lg)
+            .size(metrics.text_base)
             .strong()
             .color(tokens::COLOR_TEXT_PRIMARY),
     );
     ui.add_space(metrics.space_2);
 }
 
-/// 在设置分组之间加入统一的留白和分隔线。
-fn section_break(ui: &mut Ui, metrics: InterfaceMetrics) {
-    ui.add_space(metrics.space_6);
-    ui.separator();
-    ui.add_space(metrics.space_4);
+/// 在设置分组之间加入统一的留白，替代原来的全宽分隔线。
+fn section_gap(ui: &mut Ui, metrics: InterfaceMetrics) {
+    ui.add_space(metrics.space_8);
 }
 
 /// 绘制运行诊断、性能摘要和性能快照导出操作。
@@ -676,6 +721,23 @@ mod tests {
                 UiCommand::ExitApplication,
             ]
         );
+    }
+
+    /// 验证「打开配置文件」与「重启应用」同为实体样式，退出保留危险样式。
+    #[test]
+    fn open_config_and_restart_share_neutral_style() {
+        assert!(matches!(
+            SETTINGS_ACTIONS[0].style,
+            SettingsActionStyle::Neutral
+        ));
+        assert!(matches!(
+            SETTINGS_ACTIONS[1].style,
+            SettingsActionStyle::Neutral
+        ));
+        assert!(matches!(
+            SETTINGS_ACTIONS[2].style,
+            SettingsActionStyle::Danger
+        ));
     }
 
     /// 验证三个操作按钮扣除两段网格间距后恰好填满可用宽度。

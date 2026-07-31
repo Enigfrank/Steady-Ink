@@ -1,6 +1,9 @@
 use skia_safe::{Canvas, Color, Paint, PaintCap, PaintJoin, PaintStyle, PathBuilder};
 
-use super::{CanvasPoint, DrawStrokeShape, InkColor, InkOperation, PenWidth};
+use super::{
+    CanvasPoint, DrawStrokeShape, InkColor, InkOperation, PenWidth,
+    stroke_geometry::{append_open_bezier_path, light_filter_points},
+};
 
 const MAX_OPERATIONS_PER_BATCH: usize = 100;
 
@@ -46,7 +49,10 @@ impl BatchDrawer {
             }
             Some(_) => false,
             None => {
-                self.current = Some(StrokeBatch::new(stroke.color, *width, points));
+                let Some(batch) = StrokeBatch::new(stroke.color, *width, points) else {
+                    return false;
+                };
+                self.current = Some(batch);
                 true
             }
         }
@@ -87,27 +93,26 @@ impl Default for BatchDrawer {
 
 impl StrokeBatch {
     /// 用第一条固定宽度笔画创建批次。
-    fn new(color: InkColor, width: PenWidth, points: &[CanvasPoint]) -> Self {
+    fn new(color: InkColor, width: PenWidth, points: &[CanvasPoint]) -> Option<Self> {
         let mut batch = Self {
             color,
             width,
             path_builder: PathBuilder::new(),
             operation_count: 0,
         };
-        batch.append(points);
-        batch
+        batch.append(points).then_some(batch)
     }
 
-    /// 将一条固定宽度笔画作为独立子路径追加到批次。
-    fn append(&mut self, points: &[CanvasPoint]) {
-        let Some(first) = points.first() else {
-            return;
+    /// 将一条固定宽度笔画滤波后作为独立贝塞尔子路径追加到批次。
+    fn append(&mut self, points: &[CanvasPoint]) -> bool {
+        let Some(filtered_points) = light_filter_points(points) else {
+            return false;
         };
-        self.path_builder.move_to((first.x, first.y));
-        for point in &points[1..] {
-            self.path_builder.line_to((point.x, point.y));
+        if !append_open_bezier_path(&mut self.path_builder, &filtered_points) {
+            return false;
         }
         self.operation_count += 1;
+        true
     }
 }
 

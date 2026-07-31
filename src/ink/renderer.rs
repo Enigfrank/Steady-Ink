@@ -7,7 +7,11 @@ use skia_safe::{
 use super::{
     BatchDrawer, CanvasPoint, EraseSample, EraseStroke, EraserSize, InkBounds, InkColor,
     InkDocument, InkOperation, InkSpatialIndex, InkTool, OperationId, PenWidth,
-    VariableStrokePoint, stroke_geometry::variable_outline,
+    VariableStrokePoint,
+    stroke_geometry::{
+        append_closed_bezier_path, append_open_bezier_path, light_filter_points,
+        light_filter_variable_points, variable_outline,
+    },
 };
 use crate::error::AppError;
 
@@ -582,9 +586,12 @@ pub(crate) fn draw_active_preview(canvas: &Canvas, preview: ActiveInkPreview<'_>
     }
 }
 
-/// 连续清除普通圆形橡皮擦路径，避免快速移动时在采样点之间留下间隙。
+/// 滤波后以贝塞尔路径连续清除普通圆形橡皮擦路径，避免采样点之间留下间隙。
 fn draw_circle_erase_path(canvas: &Canvas, points: &[CanvasPoint], diameter: f32) {
-    let Some(first) = points.first() else {
+    let Some(filtered_points) = light_filter_points(points) else {
+        return;
+    };
+    let Some(first) = filtered_points.first() else {
         return;
     };
     let mut paint = clear_paint(PaintStyle::Stroke);
@@ -592,16 +599,15 @@ fn draw_circle_erase_path(canvas: &Canvas, points: &[CanvasPoint], diameter: f32
     paint.set_stroke_cap(PaintCap::Round);
     paint.set_stroke_join(PaintJoin::Round);
 
-    if points.len() == 1 {
+    if filtered_points.len() == 1 {
         paint.set_style(PaintStyle::Fill);
         canvas.draw_circle((first.x, first.y), diameter / 2.0, &paint);
         return;
     }
 
     let mut path_builder = PathBuilder::new();
-    path_builder.move_to((first.x, first.y));
-    for point in &points[1..] {
-        path_builder.line_to((point.x, point.y));
+    if !append_open_bezier_path(&mut path_builder, &filtered_points) {
+        return;
     }
     canvas.draw_path(&path_builder.detach(), &paint);
 }
@@ -716,9 +722,12 @@ fn draw_clear_ellipse(canvas: &Canvas, sample: EraseSample, paint: &Paint) {
     canvas.restore_to_count(save_count);
 }
 
-/// 使用固定宽度和圆角连接绘制画笔路径。
+/// 对固定宽度笔画执行一次轻量滤波并使用贝塞尔路径绘制。
 fn draw_pen_path(canvas: &Canvas, points: &[CanvasPoint], color: InkColor, width: PenWidth) {
-    let Some(first) = points.first() else {
+    let Some(filtered_points) = light_filter_points(points) else {
+        return;
+    };
+    let Some(first) = filtered_points.first() else {
         return;
     };
     let rgba = color.rgba();
@@ -730,23 +739,25 @@ fn draw_pen_path(canvas: &Canvas, points: &[CanvasPoint], color: InkColor, width
     paint.set_stroke_cap(PaintCap::Round);
     paint.set_stroke_join(PaintJoin::Round);
 
-    if points.len() == 1 {
+    if filtered_points.len() == 1 {
         canvas.draw_circle((first.x, first.y), width.pixels() / 2.0, &paint);
         return;
     }
 
     let mut path_builder = PathBuilder::new();
-    path_builder.move_to((first.x, first.y));
-    for point in &points[1..] {
-        path_builder.line_to((point.x, point.y));
+    if !append_open_bezier_path(&mut path_builder, &filtered_points) {
+        return;
     }
     let path = path_builder.detach();
     canvas.draw_path(&path, &paint);
 }
 
-/// 使用单个填充路径绘制逐点宽度笔锋，避免每点独立 GPU 绘制。
+/// 对逐点宽度笔锋滤波位置并使用闭合贝塞尔轮廓绘制。
 fn draw_variable_pen_path(canvas: &Canvas, points: &[VariableStrokePoint], color: InkColor) {
-    let Some(first) = points.first() else {
+    let Some(filtered_points) = light_filter_variable_points(points) else {
+        return;
+    };
+    let Some(first) = filtered_points.first() else {
         return;
     };
     let rgba = color.rgba();
@@ -755,22 +766,17 @@ fn draw_variable_pen_path(canvas: &Canvas, points: &[VariableStrokePoint], color
     paint.set_color(Color::from_argb(rgba[3], rgba[0], rgba[1], rgba[2]));
     paint.set_style(PaintStyle::Fill);
 
-    if points.len() == 1 {
+    if filtered_points.len() == 1 {
         canvas.draw_circle((first.point.x, first.point.y), first.width / 2.0, &paint);
         return;
     }
-    let Some(outline) = variable_outline(points) else {
-        return;
-    };
-    let Some(first_outline) = outline.first() else {
+    let Some(outline) = variable_outline(&filtered_points) else {
         return;
     };
     let mut path_builder = PathBuilder::new();
-    path_builder.move_to((first_outline.x, first_outline.y));
-    for point in &outline[1..] {
-        path_builder.line_to((point.x, point.y));
+    if !append_closed_bezier_path(&mut path_builder, &outline) {
+        return;
     }
-    path_builder.close();
     canvas.draw_path(&path_builder.detach(), &paint);
 }
 

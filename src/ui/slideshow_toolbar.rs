@@ -1,12 +1,15 @@
 use egui::{
-    Align2, Area, Context, CornerRadius, FontId, Id, Margin, Order, Pos2, Rect, RectAlign, Sense,
-    Stroke, Ui, Vec2,
+    Align2, Area, Context, CornerRadius, FontId, Id, Margin, Order, Pos2, Rect, RectAlign,
+    Response, Sense, Stroke, Ui, Vec2,
 };
 
 use super::{
     design_tokens as tokens, pixel_snap,
     settings_controls::SelectorOrientation,
-    toolbar::{Icon, UiCommand, UiFrameOutput, UiViewState, icon_button, render_ink_tool_buttons},
+    toolbar::{
+        Icon, UiCommand, UiFrameOutput, UiViewState, icon_button, paint_icon,
+        render_ink_tool_buttons,
+    },
 };
 use crate::{app::AppMode, window::DockSide};
 
@@ -104,30 +107,16 @@ fn render_navigation_group(
                     ui.add_enabled_ui(view.slideshow_controls_enabled, |ui| {
                         ui.horizontal(|ui| {
                             let mut command = None;
-                            if icon_button(
-                                ui,
-                                "上一页",
-                                Icon::Previous,
-                                false,
-                                None,
-                                view.readable_mode,
-                            )
-                            .clicked()
+                            if icon_only_button(ui, Icon::Previous, "上一页", view.readable_mode)
+                                .clicked()
                             {
                                 command = Some(UiCommand::PreviousSlide);
                             }
                             if let Some((current, total)) = view.slide_page_numbers {
                                 render_page_number(ui, current, total, view.readable_mode);
                             }
-                            if icon_button(
-                                ui,
-                                "下一页",
-                                Icon::Next,
-                                false,
-                                None,
-                                view.readable_mode,
-                            )
-                            .clicked()
+                            if icon_only_button(ui, Icon::Next, "下一页", view.readable_mode)
+                                .clicked()
                             {
                                 command = Some(UiCommand::NextSlide);
                             }
@@ -142,6 +131,38 @@ fn render_navigation_group(
         });
     hit_regions.push(response.response.rect);
     response.inner
+}
+
+/// 绘制仅含居中图标、无文字说明的方形按钮，悬停时显示文字提示。
+fn icon_only_button(ui: &mut Ui, icon: Icon, tooltip: &str, readable_mode: bool) -> Response {
+    let size = Vec2::splat(tokens::TOUCH_TARGET);
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    if ui.is_rect_visible(rect) {
+        let enabled = ui.is_enabled();
+        let (fill, border) = tokens::button_colors(readable_mode, false, &response, enabled);
+        pixel_snap::paint_pixel_aligned_rect(
+            ui,
+            rect,
+            CornerRadius::same(tokens::BUTTON_RADIUS),
+            fill,
+            Stroke::new(1.0, border),
+        );
+        let foreground = if enabled {
+            tokens::COLOR_TEXT_SECONDARY
+        } else {
+            tokens::COLOR_TEXT_TERTIARY
+        };
+        paint_icon(
+            ui,
+            rect.center(),
+            icon,
+            None,
+            foreground,
+            foreground,
+            tokens::TOOL_METRICS,
+        );
+    }
+    response.on_hover_text(tooltip)
 }
 
 /// 返回左右翻页组在对应屏幕下角的稳定锚点，并让控件外框紧贴屏幕边缘。
@@ -318,6 +339,7 @@ fn render_toolbar_body(
                             SelectorOrientation::Horizontal,
                             view.readable_mode,
                         );
+                        hit_regions.extend(interaction.popup_rects);
                         let mut command = interaction.command;
                         ui.add_space(tokens::SPACE_2);
                         let (exit_label, exit_enabled, requested_command) =

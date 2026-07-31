@@ -113,12 +113,14 @@ pub struct ToolState {
     pub natural_taper_enabled: bool,
 }
 
-/// 工具按钮组在当前帧产生的命令和拖动状态。
+/// 工具按钮组在当前帧产生的命令、拖动状态和打开中的弹层区域。
 #[derive(Debug, Default)]
 pub(super) struct ToolbarInteraction {
     pub command: Option<UiCommand>,
     pub drag_delta: Vec2,
     pub drag_stopped: bool,
+    /// 本帧打开的弹层区域，供放映控件窗口扩展命中区域。
+    pub popup_rects: Vec<Rect>,
 }
 
 impl ToolbarInteraction {
@@ -482,16 +484,17 @@ pub(super) fn render_ink_tool_buttons(
         })
         .inner;
     interaction.observe_drag(&color);
-    keep_picker_command(
-        &mut interaction,
-        render_color_picker(
-            &color,
-            tools.color,
-            picker_placement,
-            picker_orientation,
-            readable_mode,
-        ),
+    let (color_command, color_rect) = render_color_picker(
+        &color,
+        tools.color,
+        picker_placement,
+        picker_orientation,
+        readable_mode,
     );
+    keep_picker_command(&mut interaction, color_command);
+    if let Some(rect) = color_rect {
+        interaction.popup_rects.push(rect);
+    }
     let pen_width = ui
         .add_enabled_ui(!mouse_mode, |ui| {
             icon_button_with_surface(
@@ -505,16 +508,17 @@ pub(super) fn render_ink_tool_buttons(
         })
         .inner;
     interaction.observe_drag(&pen_width);
-    keep_picker_command(
-        &mut interaction,
-        render_pen_width_picker(
-            &pen_width,
-            tools.pen_width,
-            picker_placement,
-            picker_orientation,
-            readable_mode,
-        ),
+    let (width_command, width_rect) = render_pen_width_picker(
+        &pen_width,
+        tools.pen_width,
+        picker_placement,
+        picker_orientation,
+        readable_mode,
     );
+    keep_picker_command(&mut interaction, width_command);
+    if let Some(rect) = width_rect {
+        interaction.popup_rects.push(rect);
+    }
     ui.add_space(tokens::SPACE_2);
     let eraser = icon_button_with_surface(
         ui,
@@ -556,7 +560,7 @@ fn render_color_picker(
     placement: RectAlign,
     orientation: SelectorOrientation,
     readable_mode: bool,
-) -> Option<UiCommand> {
+) -> (Option<UiCommand>, Option<Rect>) {
     let selector_width = color_selector_width(orientation, tokens::TOOL_METRICS);
     let popup_style = trigger.ctx.style_of(egui::Theme::Light);
     let picker_frame = picker_frame(&popup_style, readable_mode);
@@ -571,7 +575,9 @@ fn render_color_picker(
     } else {
         popup
     };
-    popup
+    let popup_id = popup.get_id();
+    let context = popup.ctx().clone();
+    match popup
         .close_behavior(PopupCloseBehavior::CloseOnClick)
         .show(|ui| {
             pixel_snap::show_pixel_aligned_frame(ui, picker_frame, |ui| {
@@ -586,8 +592,13 @@ fn render_color_picker(
                 )
             })
             .inner
-        })
-        .and_then(|response| response.inner)
+        }) {
+        Some(response) => {
+            let rect = Popup::is_id_open(&context, popup_id).then_some(response.response.rect);
+            (response.inner, rect)
+        }
+        None => (None, None),
+    }
 }
 
 /// 切换粗细弹层，并复用设置页具有线宽差异预览的选择控件。
@@ -597,7 +608,7 @@ fn render_pen_width_picker(
     placement: RectAlign,
     orientation: SelectorOrientation,
     readable_mode: bool,
-) -> Option<UiCommand> {
+) -> (Option<UiCommand>, Option<Rect>) {
     let selector_width = pen_width_selector_width(orientation, tokens::TOOL_METRICS);
     let popup_style = trigger.ctx.style_of(egui::Theme::Light);
     let picker_frame = picker_frame(&popup_style, readable_mode);
@@ -612,7 +623,9 @@ fn render_pen_width_picker(
     } else {
         popup
     };
-    popup
+    let popup_id = popup.get_id();
+    let context = popup.ctx().clone();
+    match popup
         .close_behavior(PopupCloseBehavior::CloseOnClick)
         .show(|ui| {
             pixel_snap::show_pixel_aligned_frame(ui, picker_frame, |ui| {
@@ -627,8 +640,13 @@ fn render_pen_width_picker(
                 )
             })
             .inner
-        })
-        .and_then(|response| response.inner)
+        }) {
+        Some(response) => {
+            let rect = Popup::is_id_open(&context, popup_id).then_some(response.response.rect);
+            (response.inner, rect)
+        }
+        None => (None, None),
+    }
 }
 
 /// 返回颜色和粗细选择弹层的材质框架，并沿用 egui 的弹层内边距。
@@ -1155,6 +1173,93 @@ pub(super) enum Icon {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 验证颜色弹层关闭时返回空区域，打开后返回实际显示区域。
+    #[test]
+    fn color_picker_reports_popup_rect_only_when_open() {
+        let context = egui::Context::default();
+        crate::ui::configure_context(&context);
+        let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+
+        // 第一帧：渲染颜色按钮并记录其区域。
+        let mut button_rect = egui::Rect::NOTHING;
+        let _ = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..egui::RawInput::default()
+            },
+            |ui| {
+                button_rect =
+                    icon_button_with_surface(ui, "颜色", Icon::Color, false, None, false).rect;
+            },
+        );
+        assert!(button_rect.width() > 0.0 && button_rect.height() > 0.0);
+
+        let pointer_event = |pressed: bool| egui::Event::PointerButton {
+            pos: button_rect.center(),
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+        let render_with_picker =
+            |context: &egui::Context| -> Option<(Option<UiCommand>, Option<Rect>)> {
+                let mut result = None;
+                let _ = context.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(screen),
+                        ..egui::RawInput::default()
+                    },
+                    |ui| {
+                        let button =
+                            icon_button_with_surface(ui, "颜色", Icon::Color, false, None, false);
+                        result = Some(render_color_picker(
+                            &button,
+                            InkColor::Red,
+                            egui::RectAlign::TOP_START,
+                            SelectorOrientation::Horizontal,
+                            false,
+                        ));
+                    },
+                );
+                result
+            };
+
+        // 未点击时弹层关闭，不返回显示区域。
+        let (_, rect) = render_with_picker(&context).expect("未点击帧也应返回 picker 结果");
+        assert!(rect.is_none(), "弹层关闭时不应返回显示区域");
+
+        // 同帧按下并释放颜色按钮，触发弹层切换；点击帧同步渲染弹层使命令生效。
+        let mut click = egui::RawInput {
+            screen_rect: Some(screen),
+            ..egui::RawInput::default()
+        };
+        click
+            .events
+            .push(egui::Event::PointerMoved(button_rect.center()));
+        click.events.push(pointer_event(true));
+        click.events.push(pointer_event(false));
+        let mut clicked = false;
+        let mut open_result = None;
+        let _ = context.run_ui(click, |ui| {
+            let button = icon_button_with_surface(ui, "颜色", Icon::Color, false, None, false);
+            clicked = button.clicked();
+            open_result = Some(render_color_picker(
+                &button,
+                InkColor::Red,
+                egui::RectAlign::TOP_START,
+                SelectorOrientation::Horizontal,
+                false,
+            ));
+        });
+        assert!(clicked, "颜色按钮应响应点击并切换弹层");
+        let (_, rect) = open_result.expect("点击帧也应返回 picker 结果");
+        let popup_rect = rect.expect("弹层打开时应返回显示区域");
+        assert!(popup_rect.width() > 0.0 && popup_rect.height() > 0.0);
+        assert!(
+            !popup_rect.contains(button_rect.center()),
+            "弹层应避开触发按钮，实际位置 {popup_rect:?}"
+        );
+    }
 
     /// 验证重启图标保留明显缺口，不会退化为封闭圆圈。
     #[test]

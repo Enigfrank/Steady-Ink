@@ -1,6 +1,4 @@
-use egui::{
-    Align, Align2, Color32, CornerRadius, FontId, Layout, Pos2, Response, Sense, Stroke, Ui, Vec2,
-};
+use egui::{Align, Color32, CornerRadius, Layout, Pos2, Response, Sense, Stroke, Ui, Vec2};
 
 use super::{
     design_tokens::{self as tokens, InterfaceMetrics},
@@ -231,7 +229,7 @@ fn section_label(ui: &mut Ui, label: &str, metrics: InterfaceMetrics) {
     );
 }
 
-/// 绘制固定触摸尺寸的色样或数值选择按钮。
+/// 绘制固定触摸尺寸的色样或数值选择按钮，预览居中且不显示文字。
 fn selection_button(
     ui: &mut Ui,
     label: &str,
@@ -255,19 +253,8 @@ fn selection_button(
         Stroke::new(1.0, border),
     );
 
-    let center = Pos2::new(
-        rect.center().x,
-        rect.top() + metrics.space_3 + metrics.icon_size / 2.0,
-    );
-    draw_selection_visual(ui, center, visual, metrics, readable_mode);
-    ui.painter().text(
-        Pos2::new(rect.center().x, rect.bottom() - metrics.space_3),
-        Align2::CENTER_BOTTOM,
-        label,
-        FontId::proportional(metrics.option_text),
-        tokens::COLOR_TEXT_PRIMARY,
-    );
-    response
+    draw_selection_visual(ui, rect.center(), visual, metrics, readable_mode);
+    response.on_hover_text(label)
 }
 
 /// 绘制色样、画笔线宽或橡皮擦直径的视觉预览。

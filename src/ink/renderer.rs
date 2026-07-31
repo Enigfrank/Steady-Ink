@@ -1,20 +1,15 @@
 use skia_safe::{
-    AlphaType, BlendMode, Canvas, ClipOp, Color, ColorType, FilterMode, ImageInfo, MipmapMode,
-    Paint, PaintCap, PaintJoin, PaintStyle, PathBuilder, Rect, SamplingOptions, Surface,
-    canvas::SrcRectConstraint,
+    AlphaType, BlendMode, Canvas, ClipOp, Color, ColorType, ImageInfo, Paint, PaintCap, PaintJoin,
+    PaintStyle, PathBuilder, Rect, Surface,
     gpu::{self, Budgeted, DirectContext, SurfaceOrigin},
-    surface::BackendHandleAccess,
 };
 
 use super::{
-    BASE_PREVIEW_TILE_SIZE, BatchDrawer, CanvasPoint, EraseSample, EraseStroke, EraserSize,
-    InkBounds, InkColor, InkDocument, InkOperation, InkSpatialIndex, InkTool, OperationId,
-    PenWidth, SurfacePool, VariableStrokePoint,
-    stroke_geometry::{StrokeSegment, variable_outline, visit_smoothed_segments},
-    surface_pool::estimate_surface_bytes,
+    BatchDrawer, CanvasPoint, EraseSample, EraseStroke, EraserSize, InkBounds, InkColor,
+    InkDocument, InkOperation, InkSpatialIndex, InkTool, OperationId, PenWidth,
+    VariableStrokePoint, stroke_geometry::variable_outline,
 };
 use crate::error::AppError;
-use crate::settings::InkAntialiasingMode;
 
 /// 正在输入、尚未提交为 operation 的墨迹预览。
 #[derive(Debug, Clone, Copy)]
@@ -120,17 +115,6 @@ impl From<ActiveInkPreview<'_>> for OwnedActiveInkPreview {
     }
 }
 
-impl ActiveInkPreview<'_> {
-    /// 返回活动手势最新的物理像素位置，供预览资源策略采样。
-    pub(crate) fn latest_position(self) -> Option<CanvasPoint> {
-        match self {
-            Self::Tool { points, .. } => points.last().copied(),
-            Self::VariableTool { points, .. } => points.last().map(|sample| sample.point),
-            Self::PalmErase { samples } => samples.last().map(|sample| sample.center),
-        }
-    }
-}
-
 /// 返回活动预览是否仍是刚刚提交为待定擦除的同一手势。
 fn active_preview_matches_erase(preview: ActiveInkPreview<'_>, stroke: &EraseStroke) -> bool {
     match preview {
@@ -157,66 +141,20 @@ const ERASE_RADIUS_EPSILON: f32 = 0.01;
 const PALM_INTERPOLATION_STEP_FRACTION: f32 = 0.75;
 const PALM_INTERPOLATION_MIN_STEP: f32 = 4.0;
 const PALM_INTERPOLATION_MAX_STEP: f32 = 24.0;
-const SUPER_SAMPLE_SCALE: f32 = 2.0;
 const MAX_INCREMENTAL_REBUILD_AREA_RATIO: f32 = 0.1;
 
-/// 描述墨迹离屏 surface 的逻辑尺寸、渲染尺寸和实际多采样配置。
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct InkSurfaceConfig {
-    pub mode: InkAntialiasingMode,
-    pub render_scale: f32,
-    pub sample_count: usize,
+/// 返回 1x 墨迹 surface 的有效像素尺寸，并拒绝超出 Skia `i32` 范围的请求。
+fn surface_size(logical_size: [u32; 2]) -> Option<[u32; 2]> {
+    let width = logical_size[0].max(1);
+    let height = logical_size[1].max(1);
+    (width <= i32::MAX as u32 && height <= i32::MAX as u32).then_some([width, height])
 }
 
-impl InkSurfaceConfig {
-    /// 将用户可见的三档设置映射为固定的 GPU surface 参数。
-    pub const fn for_mode(mode: InkAntialiasingMode) -> Self {
-        match mode {
-            InkAntialiasingMode::Off => Self {
-                mode,
-                render_scale: 1.0,
-                sample_count: 0,
-            },
-            InkAntialiasingMode::Msaa => Self {
-                mode,
-                render_scale: 1.0,
-                sample_count: 4,
-            },
-            InkAntialiasingMode::Supersample => Self {
-                mode,
-                render_scale: SUPER_SAMPLE_SCALE,
-                sample_count: 0,
-            },
-        }
-    }
-
-    /// 创建仅供活动预览使用的 MSAA 配置，支持内部 2x/4x 动态采样。
-    pub(crate) const fn for_msaa_samples(sample_count: usize) -> Self {
-        Self {
-            mode: InkAntialiasingMode::Msaa,
-            render_scale: 1.0,
-            sample_count,
-        }
-    }
-
-    /// 返回合成到逻辑画布时是否必须线性缩小高分辨率图像。
-    pub(crate) const fn requires_linear_sampling(self) -> bool {
-        self.render_scale > 1.0
-    }
-
-    /// 计算向上取整后的实际 GPU 尺寸，拒绝超出 Skia `i32` 范围的请求。
-    pub fn render_size(self, logical_size: [u32; 2]) -> Option<[u32; 2]> {
-        Some([
-            scaled_dimension(logical_size[0], self.render_scale)?,
-            scaled_dimension(logical_size[1], self.render_scale)?,
-        ])
-    }
-}
-
-/// 将一个逻辑像素尺寸按固定渲染倍率转换为 GPU 像素尺寸。
-fn scaled_dimension(value: u32, scale: f32) -> Option<u32> {
-    let scaled = (f64::from(value.max(1)) * f64::from(scale)).ceil();
-    (scaled.is_finite() && scaled >= 1.0 && scaled <= f64::from(i32::MAX)).then_some(scaled as u32)
+/// 保守估算 1x RGBA 墨迹 surface 的颜色缓冲字节数。
+fn estimate_surface_bytes(render_size: [u32; 2]) -> usize {
+    (render_size[0] as usize)
+        .saturating_mul(render_size[1] as usize)
+        .saturating_mul(4)
 }
 
 /// 当前活动页唯一的持久 Skia GPU 墨迹层。
@@ -224,7 +162,6 @@ pub struct InkRenderCache {
     surface: Surface,
     logical_size: [u32; 2],
     render_size: [u32; 2],
-    config: InkSurfaceConfig,
     applied_operation_count: usize,
     last_operation_id: Option<OperationId>,
     last_operation_was_clear: bool,
@@ -245,23 +182,16 @@ pub enum InkSyncKind {
 }
 
 impl InkRenderCache {
-    /// 为指定逻辑尺寸创建透明的 GPU 墨迹层，并验证请求的 MSAA sample count。
-    pub fn new(
-        context: &mut DirectContext,
-        logical_size: [u32; 2],
-        mode: InkAntialiasingMode,
-    ) -> Result<Self, AppError> {
-        let config = InkSurfaceConfig::for_mode(mode);
-        let render_size = config
-            .render_size(logical_size)
+    /// 为指定逻辑尺寸创建透明的 1x GPU 墨迹层。
+    pub fn new(context: &mut DirectContext, logical_size: [u32; 2]) -> Result<Self, AppError> {
+        let render_size = surface_size(logical_size)
             .ok_or_else(|| AppError::Graphics("墨迹 surface 尺寸超出 Skia 支持范围".to_owned()))?;
-        let mut surface = create_gpu_surface(context, render_size, config)?;
+        let mut surface = create_gpu_surface(context, render_size)?;
         surface.canvas().clear(Color::TRANSPARENT);
         Ok(Self {
             surface,
             logical_size: [logical_size[0].max(1), logical_size[1].max(1)],
             render_size,
-            config,
             applied_operation_count: 0,
             last_operation_id: None,
             last_operation_was_clear: false,
@@ -312,10 +242,9 @@ impl InkRenderCache {
         } else {
             new_operations
         };
-        let draw_calls = draw_operations_with_config(
+        let draw_calls = draw_operations(
             self.surface.canvas(),
             operations_to_draw.iter(),
-            self.config,
             &mut self.batch_drawer,
         );
         self.deferred_erase = deferred_erase;
@@ -336,9 +265,6 @@ impl InkRenderCache {
 
     /// 返回当前 GPU 墨迹层快照，供同一上下文合成到窗口 framebuffer。
     pub fn snapshot(&mut self) -> skia_safe::Image {
-        if self.config.sample_count > 0 {
-            gpu::surfaces::resolve_msaa(&mut self.surface);
-        }
         self.surface.image_snapshot()
     }
 
@@ -366,9 +292,7 @@ impl InkRenderCache {
         let Some(stroke) = self.deferred_erase.take() else {
             return;
         };
-        with_logical_canvas(self.surface.canvas(), self.config, |canvas| {
-            draw_erase_samples(canvas, &stroke.samples);
-        });
+        draw_erase_samples(self.surface.canvas(), &stroke.samples);
     }
 
     /// 返回缓存使用的逻辑尺寸。
@@ -381,14 +305,9 @@ impl InkRenderCache {
         self.render_size
     }
 
-    /// 返回缓存的固定 surface 配置。
-    pub(crate) const fn config(&self) -> InkSurfaceConfig {
-        self.config
-    }
-
-    /// 返回持久墨迹 surface 的保守颜色/MSAA 缓冲字节估算。
+    /// 返回持久墨迹 surface 的保守颜色缓冲字节估算。
     pub(crate) fn estimated_bytes(&self) -> usize {
-        estimate_surface_bytes(self.render_size, self.config)
+        estimate_surface_bytes(self.render_size)
     }
 
     /// 强制下次同步从文档事实历史重建缓存。
@@ -418,10 +337,9 @@ impl InkRenderCache {
         self.surface.canvas().clear(Color::TRANSPARENT);
         let operations = document.replay_operations();
         let started_at = tracing::enabled!(tracing::Level::DEBUG).then(std::time::Instant::now);
-        let draw_calls = draw_operations_with_config(
+        let draw_calls = draw_operations(
             self.surface.canvas(),
             operations.iter(),
-            self.config,
             &mut self.batch_drawer,
         );
         self.rebuild_spatial_index(document);
@@ -461,19 +379,18 @@ impl InkRenderCache {
             .filter_map(|id| document.operation(id))
             .collect();
         let clip_rect = Rect::new(bounds.left, bounds.top, bounds.right, bounds.bottom);
-        let draw_calls = with_logical_canvas(self.surface.canvas(), self.config, |canvas| {
-            let save_count = canvas.save();
-            canvas.clip_rect(clip_rect, ClipOp::Intersect, false);
+        let canvas = self.surface.canvas();
+        let save_count = canvas.save();
+        canvas.clip_rect(clip_rect, ClipOp::Intersect, false);
 
-            let mut clear_paint = Paint::default();
-            clear_paint.set_style(PaintStyle::Fill);
-            clear_paint.set_blend_mode(BlendMode::Clear);
-            canvas.draw_rect(clip_rect, &clear_paint);
-            let draw_calls =
-                draw_operations(canvas, operations.iter().copied(), &mut self.batch_drawer);
-            canvas.restore_to_count(save_count);
-            draw_calls + 1
-        });
+        let mut clear_paint = Paint::default();
+        clear_paint.set_style(PaintStyle::Fill);
+        clear_paint.set_blend_mode(BlendMode::Clear);
+        canvas.draw_rect(clip_rect, &clear_paint);
+        let draw_calls =
+            draw_operations(canvas, operations.iter().copied(), &mut self.batch_drawer);
+        canvas.restore_to_count(save_count);
+        let draw_calls = draw_calls + 1;
         if let Some(started_at) = started_at {
             tracing::debug!(
                 operations = operations.len(),
@@ -573,81 +490,24 @@ fn is_small_rebuild_region(logical_size: [u32; 2], bounds: InkBounds) -> bool {
         && affected_area < canvas_width * canvas_height * MAX_INCREMENTAL_REBUILD_AREA_RATIO
 }
 
-/// 创建活动页或局部预览的离屏 GPU surface，并校验实际 MSAA 配置。
-fn create_gpu_surface(
-    context: &mut DirectContext,
-    size: [u32; 2],
-    config: InkSurfaceConfig,
-) -> Result<Surface, AppError> {
+/// 创建 1x 活动页墨迹离屏 GPU surface。
+fn create_gpu_surface(context: &mut DirectContext, size: [u32; 2]) -> Result<Surface, AppError> {
     let dimensions = (
         i32::try_from(size[0].max(1)).map_err(|error| AppError::Graphics(error.to_string()))?,
         i32::try_from(size[1].max(1)).map_err(|error| AppError::Graphics(error.to_string()))?,
     );
     let image_info = ImageInfo::new(dimensions, ColorType::RGBA8888, AlphaType::Premul, None);
-    if config.sample_count > 0
-        && context.max_surface_sample_count_for_color_type(ColorType::RGBA8888)
-            < config.sample_count
-    {
-        return Err(AppError::Graphics(format!(
-            "Skia 后端不支持墨迹 {}（最大 sample count 不足）",
-            config.mode.label()
-        )));
-    }
     gpu::surfaces::render_target(
         context,
         Budgeted::Yes,
         &image_info,
-        config.sample_count,
+        0,
         SurfaceOrigin::TopLeft,
         None,
         false,
         false,
     )
     .ok_or_else(|| AppError::Graphics("无法创建 Skia GPU 墨迹层".to_owned()))
-    .and_then(|mut surface| {
-        if config.sample_count > 0 {
-            let actual = gpu::surfaces::get_backend_render_target(
-                &mut surface,
-                BackendHandleAccess::FlushWrite,
-            )
-            .map_or(0, |target| target.sample_count());
-            if actual != config.sample_count {
-                return Err(AppError::Graphics(format!(
-                    "Skia 后端实际 sample count 为 {actual}，无法满足 {}",
-                    config.mode.label()
-                )));
-            }
-        }
-        Ok(surface)
-    })
-}
-
-/// 在需要时给逻辑墨迹绘制设置固定的渲染倍率。
-fn with_logical_canvas<T>(
-    canvas: &Canvas,
-    config: InkSurfaceConfig,
-    draw: impl FnOnce(&Canvas) -> T,
-) -> T {
-    if (config.render_scale - 1.0).abs() <= f32::EPSILON {
-        return draw(canvas);
-    }
-    let save_count = canvas.save();
-    canvas.scale((config.render_scale, config.render_scale));
-    let result = draw(canvas);
-    canvas.restore_to_count(save_count);
-    result
-}
-
-/// 通过指定 surface 的逻辑坐标系批量绘制一组事实操作。
-fn draw_operations_with_config<'a>(
-    canvas: &Canvas,
-    operations: impl IntoIterator<Item = &'a InkOperation>,
-    config: InkSurfaceConfig,
-    batch_drawer: &mut BatchDrawer,
-) -> usize {
-    with_logical_canvas(canvas, config, |canvas| {
-        draw_operations(canvas, operations, batch_drawer)
-    })
 }
 
 /// 按事实顺序绘制操作，并合并连续同属性的固定宽度笔画。
@@ -720,322 +580,6 @@ pub(crate) fn draw_active_preview(canvas: &Canvas, preview: ActiveInkPreview<'_>
             }
         }
     }
-}
-
-/// 返回活动预览在逻辑坐标中的保守影响区域，用于按块分配临时 surface。
-pub(crate) fn active_preview_bounds(preview: ActiveInkPreview<'_>) -> Option<InkBounds> {
-    match preview {
-        ActiveInkPreview::Tool {
-            points,
-            tool: InkTool::Pen,
-            pen_width,
-            ..
-        } => InkBounds::from_points(points, pen_width.pixels() / 2.0),
-        ActiveInkPreview::Tool {
-            points,
-            tool: InkTool::RegionEraser,
-            eraser_size,
-            ..
-        } => InkBounds::from_points(points, eraser_size.pixels() / 2.0 + 2.0),
-        ActiveInkPreview::VariableTool { points, .. } => {
-            let first = points.first()?;
-            let mut bounds = InkBounds {
-                left: first.point.x,
-                top: first.point.y,
-                right: first.point.x,
-                bottom: first.point.y,
-            };
-            let mut max_radius = first.width.max(0.0) / 2.0;
-            for sample in &points[1..] {
-                bounds.left = bounds.left.min(sample.point.x);
-                bounds.top = bounds.top.min(sample.point.y);
-                bounds.right = bounds.right.max(sample.point.x);
-                bounds.bottom = bounds.bottom.max(sample.point.y);
-                max_radius = max_radius.max(sample.width.max(0.0) / 2.0);
-            }
-            Some(bounds.expanded(max_radius + 2.0))
-        }
-        ActiveInkPreview::PalmErase { samples } => {
-            let first = samples.first()?;
-            let mut bounds = InkBounds {
-                left: first.center.x - first.radius_x,
-                top: first.center.y - first.radius_y,
-                right: first.center.x + first.radius_x,
-                bottom: first.center.y + first.radius_y,
-            };
-            for sample in &samples[1..] {
-                bounds.left = bounds.left.min(sample.center.x - sample.radius_x);
-                bounds.top = bounds.top.min(sample.center.y - sample.radius_y);
-                bounds.right = bounds.right.max(sample.center.x + sample.radius_x);
-                bounds.bottom = bounds.bottom.max(sample.center.y + sample.radius_y);
-            }
-            Some(bounds.expanded(2.0))
-        }
-    }
-}
-
-/// 判断活动预览是否需要用 `Src` 替换目标区域中的持久墨迹。
-pub(crate) const fn preview_replaces_region(preview: ActiveInkPreview<'_>) -> bool {
-    matches!(
-        preview,
-        ActiveInkPreview::Tool {
-            tool: InkTool::RegionEraser,
-            ..
-        } | ActiveInkPreview::PalmErase { .. }
-    )
-}
-
-/// 将离屏墨迹图像按逻辑坐标合成到目标 canvas，并在超采样时使用线性采样。
-pub(crate) fn draw_image_rect_logical(
-    canvas: &Canvas,
-    image: &skia_safe::Image,
-    source_render_size: [u32; 2],
-    destination: Rect,
-    linear: bool,
-    blend_mode: BlendMode,
-) {
-    let source = Rect::from_xywh(
-        0.0,
-        0.0,
-        source_render_size[0] as f32,
-        source_render_size[1] as f32,
-    );
-    let sampling = if linear {
-        SamplingOptions::new(FilterMode::Linear, MipmapMode::None)
-    } else {
-        SamplingOptions::default()
-    };
-    let mut paint = Paint::default();
-    paint.set_blend_mode(blend_mode);
-    canvas.draw_image_rect_with_sampling_options(
-        image,
-        Some((&source, SrcRectConstraint::Strict)),
-        destination,
-        sampling,
-        &paint,
-    );
-}
-
-/// 保存并合成增强模式下的局部活动预览 surface。
-pub(crate) struct InkPreviewCache {
-    surface: Surface,
-    origin: CanvasPoint,
-    logical_size: [u32; 2],
-    render_size: [u32; 2],
-    config: InkSurfaceConfig,
-}
-
-impl InkPreviewCache {
-    /// 为目标 bounds 创建一个按自适应分块对齐的局部预览 surface。
-    pub(crate) fn for_bounds(
-        context: &mut DirectContext,
-        bounds: InkBounds,
-        window_size: [u32; 2],
-        tile_size: u32,
-        config: InkSurfaceConfig,
-        surface_pool: &mut SurfacePool,
-    ) -> Result<Self, AppError> {
-        let (origin, logical_size) = preview_region(bounds, window_size, tile_size);
-        Self::new(context, origin, logical_size, config, surface_pool)
-    }
-
-    /// 创建一个按 512px 块对齐的局部预览 surface。
-    pub(crate) fn new(
-        context: &mut DirectContext,
-        origin: CanvasPoint,
-        logical_size: [u32; 2],
-        config: InkSurfaceConfig,
-        surface_pool: &mut SurfacePool,
-    ) -> Result<Self, AppError> {
-        let render_size = config
-            .render_size(logical_size)
-            .ok_or_else(|| AppError::Graphics("活动墨迹预览尺寸超出 Skia 支持范围".to_owned()))?;
-        let mut surface = surface_pool.acquire(render_size, config, || {
-            create_gpu_surface(context, render_size, config)
-        })?;
-        surface.canvas().clear(Color::TRANSPARENT);
-        Ok(Self {
-            surface,
-            origin,
-            logical_size,
-            render_size,
-            config,
-        })
-    }
-
-    /// 确保预览区域覆盖目标 bounds，越界时按固定块重建一次 surface。
-    pub(crate) fn ensure(
-        &mut self,
-        context: &mut DirectContext,
-        bounds: InkBounds,
-        window_size: [u32; 2],
-        tile_size: u32,
-        surface_pool: &mut SurfacePool,
-    ) -> Result<(), AppError> {
-        let (origin, logical_size) = preview_region(bounds, window_size, tile_size);
-        let current_right = self.origin.x + self.logical_size[0] as f32;
-        let current_bottom = self.origin.y + self.logical_size[1] as f32;
-        let requested_right = origin.x + logical_size[0] as f32;
-        let requested_bottom = origin.y + logical_size[1] as f32;
-        if self.origin.x <= origin.x
-            && self.origin.y <= origin.y
-            && current_right >= requested_right
-            && current_bottom >= requested_bottom
-        {
-            return Ok(());
-        }
-        let union_bounds = InkBounds {
-            left: self.origin.x.min(origin.x),
-            top: self.origin.y.min(origin.y),
-            right: current_right.max(requested_right),
-            bottom: current_bottom.max(requested_bottom),
-        };
-        let (expanded_origin, expanded_size) = preview_region(union_bounds, window_size, tile_size);
-        let replacement = Self::new(
-            context,
-            expanded_origin,
-            expanded_size,
-            self.config,
-            surface_pool,
-        )?;
-        let previous = std::mem::replace(self, replacement);
-        previous.release(surface_pool);
-        Ok(())
-    }
-
-    /// 手势结束后把临时 surface 缩回窗口左上角的基础块，避免长期保留大区域。
-    pub(crate) fn reset_to_base(
-        &mut self,
-        context: &mut DirectContext,
-        window_size: [u32; 2],
-        surface_pool: &mut SurfacePool,
-    ) -> Result<(), AppError> {
-        let origin = CanvasPoint::new(0.0, 0.0);
-        let logical_size = [
-            window_size[0].clamp(1, BASE_PREVIEW_TILE_SIZE),
-            window_size[1].clamp(1, BASE_PREVIEW_TILE_SIZE),
-        ];
-        if self.origin == origin && self.logical_size == logical_size {
-            return Ok(());
-        }
-        let replacement = Self::new(context, origin, logical_size, self.config, surface_pool)?;
-        let previous = std::mem::replace(self, replacement);
-        previous.release(surface_pool);
-        Ok(())
-    }
-
-    /// 消耗缓存并把拥有的离屏 surface 归还资源池。
-    pub(crate) fn release(self, surface_pool: &mut SurfacePool) {
-        surface_pool.release(self.surface, self.render_size, self.config);
-    }
-
-    /// 返回当前活动预览 surface 的保守颜色/MSAA 缓冲字节估算。
-    pub(crate) fn estimated_bytes(&self) -> usize {
-        estimate_surface_bytes(self.render_size, self.config)
-    }
-
-    /// 以透明底清理当前局部预览 surface。
-    pub(crate) fn clear(&mut self) {
-        self.surface.canvas().clear(Color::TRANSPARENT);
-    }
-
-    /// 将持久墨迹图像复制到局部 surface，供橡皮擦预览执行透明清除。
-    pub(crate) fn seed_from_image(
-        &mut self,
-        image: &skia_safe::Image,
-        source_render_size: [u32; 2],
-        source_logical_size: [u32; 2],
-        linear: bool,
-    ) {
-        self.clear();
-        let save_count = self.surface.canvas().save();
-        self.surface
-            .canvas()
-            .scale((self.config.render_scale, self.config.render_scale));
-        self.surface
-            .canvas()
-            .translate((-self.origin.x, -self.origin.y));
-        draw_image_rect_logical(
-            self.surface.canvas(),
-            image,
-            source_render_size,
-            Rect::from_xywh(
-                0.0,
-                0.0,
-                source_logical_size[0] as f32,
-                source_logical_size[1] as f32,
-            ),
-            linear,
-            BlendMode::Src,
-        );
-        self.surface.canvas().restore_to_count(save_count);
-    }
-
-    /// 在当前局部坐标中绘制一帧活动预览。
-    pub(crate) fn draw(&mut self, preview: ActiveInkPreview<'_>) {
-        let save_count = self.surface.canvas().save();
-        self.surface
-            .canvas()
-            .scale((self.config.render_scale, self.config.render_scale));
-        self.surface
-            .canvas()
-            .translate((-self.origin.x, -self.origin.y));
-        draw_active_preview(self.surface.canvas(), preview);
-        self.surface.canvas().restore_to_count(save_count);
-    }
-
-    /// 返回当前局部预览的图像快照。
-    pub(crate) fn snapshot(&mut self) -> skia_safe::Image {
-        if self.config.sample_count > 0 {
-            gpu::surfaces::resolve_msaa(&mut self.surface);
-        }
-        self.surface.image_snapshot()
-    }
-
-    /// 返回局部预览的逻辑原点。
-    pub(crate) const fn origin(&self) -> CanvasPoint {
-        self.origin
-    }
-
-    /// 返回局部预览的逻辑尺寸。
-    pub(crate) const fn logical_size(&self) -> [u32; 2] {
-        self.logical_size
-    }
-
-    /// 返回局部预览的实际 GPU 尺寸。
-    pub(crate) const fn render_size(&self) -> [u32; 2] {
-        self.render_size
-    }
-
-    /// 返回预览 surface 的精确池化配置。
-    pub(crate) const fn config(&self) -> InkSurfaceConfig {
-        self.config
-    }
-}
-
-/// 计算覆盖活动 bounds 的自适应分块区域，并裁剪到窗口尺寸内。
-fn preview_region(
-    bounds: InkBounds,
-    window_size: [u32; 2],
-    tile_size: u32,
-) -> (CanvasPoint, [u32; 2]) {
-    let window_width = window_size[0].max(1) as f32;
-    let window_height = window_size[1].max(1) as f32;
-    let tile_size = tile_size.max(1) as f32;
-    let left = bounds.left.max(0.0).min(window_width - 1.0);
-    let top = bounds.top.max(0.0).min(window_height - 1.0);
-    let right = bounds.right.max(left + 1.0).min(window_width);
-    let bottom = bounds.bottom.max(top + 1.0).min(window_height);
-    let origin_x = (left / tile_size).floor() * tile_size;
-    let origin_y = (top / tile_size).floor() * tile_size;
-    let end_x = (right / tile_size).ceil() * tile_size;
-    let end_y = (bottom / tile_size).ceil() * tile_size;
-    let width = end_x.min(window_width).max(origin_x + 1.0) - origin_x;
-    let height = end_y.min(window_height).max(origin_y + 1.0) - origin_y;
-    (
-        CanvasPoint::new(origin_x, origin_y),
-        [width.ceil() as u32, height.ceil() as u32],
-    )
 }
 
 /// 连续清除普通圆形橡皮擦路径，避免快速移动时在采样点之间留下间隙。
@@ -1193,14 +737,9 @@ fn draw_pen_path(canvas: &Canvas, points: &[CanvasPoint], color: InkColor, width
 
     let mut path_builder = PathBuilder::new();
     path_builder.move_to((first.x, first.y));
-    visit_smoothed_segments(points, |segment| match segment {
-        StrokeSegment::LineTo(point) => {
-            path_builder.line_to((point.x, point.y));
-        }
-        StrokeSegment::QuadTo { control, end } => {
-            path_builder.quad_to((control.x, control.y), (end.x, end.y));
-        }
-    });
+    for point in &points[1..] {
+        path_builder.line_to((point.x, point.y));
+    }
     let path = path_builder.detach();
     canvas.draw_path(&path, &paint);
 }
@@ -1228,14 +767,9 @@ fn draw_variable_pen_path(canvas: &Canvas, points: &[VariableStrokePoint], color
     };
     let mut path_builder = PathBuilder::new();
     path_builder.move_to((first_outline.x, first_outline.y));
-    visit_smoothed_segments(&outline, |segment| match segment {
-        StrokeSegment::LineTo(point) => {
-            path_builder.line_to((point.x, point.y));
-        }
-        StrokeSegment::QuadTo { control, end } => {
-            path_builder.quad_to((control.x, control.y), (end.x, end.y));
-        }
-    });
+    for point in &outline[1..] {
+        path_builder.line_to((point.x, point.y));
+    }
     path_builder.close();
     canvas.draw_path(&path_builder.detach(), &paint);
 }
@@ -1291,7 +825,6 @@ mod tests {
             surface,
             logical_size,
             render_size: logical_size,
-            config: InkSurfaceConfig::for_mode(InkAntialiasingMode::Off),
             applied_operation_count: 0,
             last_operation_id: None,
             last_operation_was_clear: false,
@@ -1301,45 +834,6 @@ mod tests {
             full_rebuild_requested: false,
             deferred_erase: None,
         }
-    }
-
-    /// 验证三类活动预览都暴露最新物理位置供速度策略采样。
-    #[test]
-    fn active_preview_reports_latest_position() {
-        let tool_points = [CanvasPoint::new(1.0, 2.0), CanvasPoint::new(3.0, 4.0)];
-        let variable_points = [VariableStrokePoint {
-            point: CanvasPoint::new(5.0, 6.0),
-            width: 4.0,
-        }];
-        let erase_samples = [EraseSample::circle(CanvasPoint::new(7.0, 8.0), 24.0)];
-
-        assert_eq!(
-            ActiveInkPreview::Tool {
-                points: &tool_points,
-                tool: InkTool::Pen,
-                color: InkColor::Red,
-                pen_width: PenWidth::Px4,
-                eraser_size: EraserSize::Px36,
-            }
-            .latest_position(),
-            Some(CanvasPoint::new(3.0, 4.0))
-        );
-        assert_eq!(
-            ActiveInkPreview::VariableTool {
-                points: &variable_points,
-                color: InkColor::Red,
-                eraser_size: EraserSize::Px36,
-            }
-            .latest_position(),
-            Some(CanvasPoint::new(5.0, 6.0))
-        );
-        assert_eq!(
-            ActiveInkPreview::PalmErase {
-                samples: &erase_samples,
-            }
-            .latest_position(),
-            Some(CanvasPoint::new(7.0, 8.0))
-        );
     }
 
     /// 验证刚提交的普通与手掌擦除预览不会被误判为后续新手势。
@@ -1468,81 +962,12 @@ mod tests {
         assert!((0.0..std::f32::consts::PI).contains(&interpolated.rotation_radians));
     }
 
-    /// 验证内部 surface 模式映射到固定倍率和 sample count。
+    /// 验证墨迹 surface 始终按逻辑尺寸 1x 创建，并拒绝超出 Skia 范围的尺寸。
     #[test]
-    fn surface_config_keeps_the_requested_quality_contract() {
-        let off = InkSurfaceConfig::for_mode(InkAntialiasingMode::Off);
-        assert_eq!(off.render_scale, 1.0);
-        assert_eq!(off.sample_count, 0);
-
-        let msaa = InkSurfaceConfig::for_mode(InkAntialiasingMode::Msaa);
-        assert_eq!(msaa.render_scale, 1.0);
-        assert_eq!(msaa.sample_count, 4);
-
-        let supersample = InkSurfaceConfig::for_mode(InkAntialiasingMode::Supersample);
-        assert_eq!(supersample.render_size([1919, 1079]), Some([3838, 2158]));
-        assert!(supersample.requires_linear_sampling());
-    }
-
-    /// 验证内部 MSAA 2x 只改变样本数，不改变逻辑渲染倍率。
-    #[test]
-    fn preview_msaa_two_uses_exact_sample_count() {
-        let config = InkSurfaceConfig::for_msaa_samples(2);
-
-        assert_eq!(config.mode, InkAntialiasingMode::Msaa);
-        assert_eq!(config.sample_count, 2);
-        assert_eq!(config.render_size([512, 512]), Some([512, 512]));
-    }
-
-    /// 验证超采样尺寸始终向上取整且不接受无法表示的尺寸。
-    #[test]
-    fn supersample_dimensions_round_up_without_overflow() {
-        let config = InkSurfaceConfig::for_mode(InkAntialiasingMode::Supersample);
-        assert_eq!(config.render_size([1, 1]), Some([2, 2]));
-        assert_eq!(config.render_size([u32::MAX, 1]), None);
-    }
-
-    /// 验证活动预览按 512px 网格覆盖跨块笔迹，并裁剪到窗口边缘。
-    #[test]
-    fn preview_region_expands_in_fixed_tiles() {
-        let (origin, size) = preview_region(
-            InkBounds {
-                left: 500.0,
-                top: 10.0,
-                right: 530.0,
-                bottom: 30.0,
-            },
-            [900, 700],
-            512,
-        );
-        assert_eq!(origin, CanvasPoint::new(0.0, 0.0));
-        assert_eq!(size, [900, 512]);
-
-        let (origin, size) = preview_region(
-            InkBounds {
-                left: 880.0,
-                top: 680.0,
-                right: 920.0,
-                bottom: 720.0,
-            },
-            [900, 700],
-            512,
-        );
-        assert_eq!(origin, CanvasPoint::new(512.0, 512.0));
-        assert_eq!(size, [388, 188]);
-    }
-
-    /// 验证快速书写使用 768px 分块扩大首次预览区域。
-    #[test]
-    fn preview_region_uses_adaptive_tile_size() {
-        let (origin, size) = preview_region(
-            InkBounds::from_xywh(520.0, 20.0, 20.0, 20.0),
-            [1600, 900],
-            768,
-        );
-
-        assert_eq!(origin, CanvasPoint::new(0.0, 0.0));
-        assert_eq!(size, [768, 768]);
+    fn surface_size_stays_at_logical_resolution() {
+        assert_eq!(surface_size([1919, 1079]), Some([1919, 1079]));
+        assert_eq!(surface_size([0, 0]), Some([1, 1]));
+        assert_eq!(surface_size([u32::MAX, 1]), None);
     }
 
     /// 验证小脏区使用局部重建，而达到阈值时回退全量重建。

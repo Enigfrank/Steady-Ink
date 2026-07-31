@@ -74,25 +74,6 @@ impl Default for PalmSizePreset {
     }
 }
 
-/// 渲染器内部使用的墨迹 surface 抗锯齿配置。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InkAntialiasingMode {
-    Off,
-    Msaa,
-    Supersample,
-}
-
-impl InkAntialiasingMode {
-    /// 返回图形错误诊断使用的中文模式名称。
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Off => "关闭",
-            Self::Msaa => "MSAA 4x",
-            Self::Supersample => "超采样 2x",
-        }
-    }
-}
-
 /// 可跨应用重启保存的默认工具偏好。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -324,7 +305,7 @@ mod tests {
         let settings: UserSettings = toml::from_str(
             r#"
                 slideshow_integration_enabled = true
-                ink_antialiasing = "supersample"
+                ink_antialiasing = "legacy"
                 ink_quality_priority = "high_quality"
             "#,
         )

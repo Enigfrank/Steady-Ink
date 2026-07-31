@@ -13,7 +13,7 @@
   <a href="./LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0--or--later-DC2626" alt="许可证：GPL-3.0-or-later"></a>
 </p>
 
-[English](./README.en.md)
+[English Document](./README.en.md)
 
 > [!WARNING]
 > Steady Ink 仍处于早期开发阶段,请谨慎使用!
@@ -31,11 +31,11 @@
 | 项目 | 状态 |
 | --- | --- |
 | 墨迹批注、平滑抗锯齿、橡皮擦和设置 | 已实现 |
-| Windows 触控、防误触和手掌橡皮擦 | 已实现，目标触摸设备仍需调校 |
+| Windows 触控、防误触和手掌橡皮擦 | 已在代码上实现， |
 | GPU 渲染线程、资源复用和崩溃恢复 | 已实现，仍需扩大显卡与设备覆盖验证 |
-| 性能监控和 JSON 导出 | 已实现，默认关闭 |
-| PowerPoint 放映联动 | 已完成基础验证 |
-| WPS 放映联动 | 已适配，仍需更多真实环境验证 |
+| 性能监控和 JSON 导出 | 已实现 |
+| PowerPoint 放映联动 | 已适配 |
+| WPS 放映联动 | 已适配 |
 
 ## 安装
 

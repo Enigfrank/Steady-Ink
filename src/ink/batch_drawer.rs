@@ -1,9 +1,6 @@
 use skia_safe::{Canvas, Color, Paint, PaintCap, PaintJoin, PaintStyle, PathBuilder};
 
-use super::{
-    CanvasPoint, DrawStrokeShape, InkColor, InkOperation, PenWidth,
-    stroke_geometry::{StrokeSegment, visit_smoothed_segments},
-};
+use super::{CanvasPoint, DrawStrokeShape, InkColor, InkOperation, PenWidth};
 
 const MAX_OPERATIONS_PER_BATCH: usize = 100;
 
@@ -107,15 +104,9 @@ impl StrokeBatch {
             return;
         };
         self.path_builder.move_to((first.x, first.y));
-        visit_smoothed_segments(points, |segment| match segment {
-            StrokeSegment::LineTo(point) => {
-                self.path_builder.line_to((point.x, point.y));
-            }
-            StrokeSegment::QuadTo { control, end } => {
-                self.path_builder
-                    .quad_to((control.x, control.y), (end.x, end.y));
-            }
-        });
+        for point in &points[1..] {
+            self.path_builder.line_to((point.x, point.y));
+        }
         self.operation_count += 1;
     }
 }

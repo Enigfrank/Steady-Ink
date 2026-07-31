@@ -1,4 +1,3 @@
-mod adaptive_aa;
 mod compositor;
 mod egui_skia;
 mod thread;

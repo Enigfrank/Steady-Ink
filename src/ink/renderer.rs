@@ -268,7 +268,8 @@ impl InkRenderCache {
     }
 
     /// 返回当前 GPU 墨迹层快照，供同一上下文合成到窗口 framebuffer。
-    pub fn snapshot(&mut self) -> skia_safe::Image {
+    pub fn snapshot(&mut self, context: &mut DirectContext) -> skia_safe::Image {
+        context.flush_and_submit_surface(&mut self.surface, None);
         self.surface.image_snapshot()
     }
 
@@ -500,12 +501,17 @@ fn create_gpu_surface(context: &mut DirectContext, size: [u32; 2]) -> Result<Sur
         i32::try_from(size[0].max(1)).map_err(|error| AppError::Graphics(error.to_string()))?,
         i32::try_from(size[1].max(1)).map_err(|error| AppError::Graphics(error.to_string()))?,
     );
-    let image_info = ImageInfo::new(dimensions, ColorType::RGBA8888, AlphaType::Premul, None);
+    let image_info = ImageInfo::new(
+        dimensions,
+        ColorType::BGRA8888,
+        AlphaType::Premul,
+        skia_safe::ColorSpace::new_srgb(),
+    );
     gpu::surfaces::render_target(
         context,
         Budgeted::Yes,
         &image_info,
-        0,
+        4,
         SurfaceOrigin::TopLeft,
         None,
         false,

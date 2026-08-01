@@ -233,7 +233,7 @@ impl Compositor {
         if let Some(preview) = active_preview {
             self.ink_cache.commit_deferred_erase_before_preview(preview);
         }
-        let ink_image = self.ink_cache.snapshot();
+        let ink_image = self.ink_cache.snapshot(&mut self.gr_context);
 
         let index = window_context.current_back_buffer_index();
         let surface_count = self.window_surfaces.len();
@@ -322,7 +322,7 @@ fn create_window_surfaces(
             &backend_target,
             SurfaceOrigin::TopLeft,
             ColorType::BGRA8888,
-            None,
+            skia_safe::ColorSpace::new_srgb(),
             None,
         )
         .ok_or_else(|| {

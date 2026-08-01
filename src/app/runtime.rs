@@ -65,6 +65,7 @@ enum ApplicationExitAction {
 struct UiCommandOutcome {
     exit_action: Option<ApplicationExitAction>,
     geometry_placement: Option<WindowPlacement>,
+    skip_visual_freeze: bool,
 }
 
 /// 当前尚未提交为墨迹 operation 的单次指针手势。
@@ -609,7 +610,17 @@ impl DesktopRuntime {
                     self.queue_recovery();
                 }
                 if let Some(placement) = outcome.geometry_placement {
-                    self.commit_window_geometry(placement, Some(frame));
+                    if outcome.skip_visual_freeze {
+                        // 退出批注时不冻结旧帧，直接调整窗口并重绘新UI
+                        if let Err(error) = self.window_context.apply_window_placement(placement) {
+                            tracing::warn!(?placement, %error, "提交窗口几何失败");
+                        } else {
+                            self.render_thread.resize(placement.size);
+                        }
+                        self.request_redraw();
+                    } else {
+                        self.commit_window_geometry(placement, Some(frame));
+                    }
                 } else {
                     self.render_thread.submit_frame(frame);
                     self.request_redraw();
@@ -654,6 +665,7 @@ impl DesktopRuntime {
             UiCommand::ExitAnnotation => {
                 if self.state.exit_normal_annotation() {
                     outcome.geometry_placement = Some(self.prepare_annotation_geometry(false));
+                    outcome.skip_visual_freeze = true;
                 }
             }
             UiCommand::SelectPen => self.tools.tool = InkTool::Pen,

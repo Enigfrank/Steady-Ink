@@ -278,6 +278,7 @@ fn render_annotation_toolbar(
     });
 
     let area_response = egui::Area::new(area_id)
+        .default_pos(state.position)
         .fixed_pos(state.position)
         .order(egui::Order::Foreground)
         .show(&context, |ui| {

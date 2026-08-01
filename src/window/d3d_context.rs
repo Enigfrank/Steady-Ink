@@ -466,9 +466,11 @@ impl D3DRenderContext {
         Ok(())
     }
 
-    /// 同步提交旧 visual 的临时偏移，使 HWND 改位后旧画面仍停留在原屏幕位置。
+    /// 提交旧 visual 的临时偏移，使 HWND 改位后旧画面仍停留在原屏幕位置。
+    /// 不等待合成完成：窗口已在同一事件批次内先移动到目标位置，本 Commit 与窗口位置
+    /// 会落在同一个 DWM 合成周期内原子生效，避免 offset 先生效而窗口未动产生的闪现帧。
     pub fn hold_visual_offset(&mut self, offset: PhysicalPosition<i32>) -> Result<(), AppError> {
-        self.commit_visual_offset(offset, "无法提交 DirectComposition 旧画面冻结")?;
+        self.commit_visual_offset_async(offset, "无法提交 DirectComposition 旧画面冻结")?;
         self.visual_offset_reset_armed = false;
         Ok(())
     }
@@ -476,16 +478,6 @@ impl D3DRenderContext {
     /// 标记目标首帧呈现时需要在同一次 composition commit 中清除临时偏移。
     pub const fn arm_visual_offset_reset(&mut self) {
         self.visual_offset_reset_armed = true;
-    }
-
-    /// 在窗口几何提交失败时立即把 visual 恢复到 HWND 原点。
-    pub fn reset_visual_offset_immediately(&mut self) -> Result<(), AppError> {
-        self.commit_visual_offset(
-            PhysicalPosition::new(0, 0),
-            "无法回滚 DirectComposition 旧画面冻结",
-        )?;
-        self.visual_offset_reset_armed = false;
-        Ok(())
     }
 
     /// 提交当前 back buffer，并原子替换新内容及清除旧 visual 的临时偏移。
@@ -516,8 +508,8 @@ impl D3DRenderContext {
         Ok(())
     }
 
-    /// 设置并同步提交 DirectComposition visual 的物理像素偏移。
-    fn commit_visual_offset(
+    /// 设置并提交 DirectComposition visual 的物理像素偏移，不等待合成完成。
+    fn commit_visual_offset_async(
         &self,
         offset: PhysicalPosition<i32>,
         context: &str,
@@ -526,10 +518,7 @@ impl D3DRenderContext {
             .map_err(|error| graphics_error("无法设置 DirectComposition visual 横向偏移", error))?;
         unsafe { self.composition_visual.SetOffsetY2(offset.y as f32) }
             .map_err(|error| graphics_error("无法设置 DirectComposition visual 纵向偏移", error))?;
-        unsafe { self.composition_device.Commit() }
-            .map_err(|error| graphics_error(context, error))?;
-        unsafe { self.composition_device.WaitForCommitCompletion() }
-            .map_err(|error| graphics_error("等待 DirectComposition visual 偏移生效失败", error))
+        unsafe { self.composition_device.Commit() }.map_err(|error| graphics_error(context, error))
     }
 
     /// 返回一份供事件线程展示的图形设备诊断快照。

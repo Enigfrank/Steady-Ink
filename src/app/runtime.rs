@@ -1228,18 +1228,21 @@ impl DesktopRuntime {
             }
         };
         let visual_offset = source.visual_offset_to(target);
+        // 先把 HWND 移动到目标几何，再设置反向 visual 偏移把画面冻结回原屏幕位置。
+        // 窗口移动与偏移提交落在同一 DWM 合成周期，避免偏移先生效而窗口未动产生的闪现帧。
+        if let Err(error) = self.window_context.apply_window_placement(target) {
+            tracing::warn!(?source, ?target, %error, "提交最终窗口几何失败");
+            if let Some(frame) = source_frame {
+                self.render_thread.submit_frame(frame);
+            }
+            self.request_redraw();
+            return;
+        }
         if let Err(error) = self
             .render_thread
             .hold_window_visual(visual_offset, source_frame)
         {
-            tracing::warn!(?source, ?target, %error, "冻结旧窗口画面失败，已取消窗口切换");
-            self.reset_window_visual_after_geometry_failure();
-            self.request_redraw();
-            return;
-        }
-        if let Err(error) = self.window_context.apply_window_placement(target) {
-            tracing::warn!(?source, ?target, %error, "提交最终窗口几何失败");
-            self.reset_window_visual_after_geometry_failure();
+            tracing::warn!(?source, ?target, %error, "冻结旧窗口画面失败");
             self.request_redraw();
             return;
         }
@@ -1247,13 +1250,6 @@ impl DesktopRuntime {
         self.render_thread.arm_window_visual_reset();
         self.render_thread.resize(target.size);
         self.queue_geometry_redraw();
-    }
-
-    /// 几何事务失败后同步清除临时 visual 偏移，并记录无法回滚的渲染错误。
-    fn reset_window_visual_after_geometry_failure(&self) {
-        if let Err(error) = self.render_thread.reset_window_visual() {
-            tracing::warn!(%error, "窗口几何切换失败后无法恢复 DirectComposition visual");
-        }
     }
 
     /// 排空渲染线程结果，并在 fatal error 时恢复统一 AppError 传播。

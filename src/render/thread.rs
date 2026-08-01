@@ -52,9 +52,6 @@ enum RenderControl {
         completed: mpsc::SyncSender<Result<(), String>>,
     },
     ArmWindowVisualReset,
-    ResetWindowVisual {
-        completed: mpsc::SyncSender<Result<(), String>>,
-    },
     Resize(PhysicalSize<u32>),
     ResizeSlideshowUi(PhysicalSize<u32>),
     SetAnnotationResourcesEnabled(bool),
@@ -347,22 +344,6 @@ impl RenderThread {
             .submit_control(RenderControl::ArmWindowVisualReset);
     }
 
-    /// 在 HWND 几何提交失败后同步恢复 visual 的零偏移。
-    pub fn reset_window_visual(&self) -> Result<(), AppError> {
-        let (completed_tx, completed_rx) = mpsc::sync_channel(1);
-        if !self
-            .mailbox
-            .submit_control(RenderControl::ResetWindowVisual {
-                completed: completed_tx,
-            })
-        {
-            return Err(AppError::Graphics(
-                "渲染线程已退出，无法恢复窗口画面".to_owned(),
-            ));
-        }
-        wait_for_visual_control(completed_rx, "恢复窗口画面")
-    }
-
     /// 请求在下一帧前调整 swap chain 和全部 Skia surface。
     pub fn resize(&self, size: PhysicalSize<u32>) {
         self.mailbox.submit_resize(size);
@@ -484,12 +465,6 @@ fn run_render_thread(
                 RenderControl::ArmWindowVisualReset => {
                     window_context.arm_visual_offset_reset();
                     Ok(())
-                }
-                RenderControl::ResetWindowVisual { completed } => {
-                    let result = window_context.reset_visual_offset_immediately();
-                    let completion = result.as_ref().map(|_| ()).map_err(ToString::to_string);
-                    let _ = completed.send(completion);
-                    result
                 }
                 RenderControl::Resize(size) => compositor.resize(&mut window_context, size.into()),
                 RenderControl::ResizeSlideshowUi(size) => {

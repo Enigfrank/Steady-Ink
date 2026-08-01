@@ -102,6 +102,11 @@ fn distance(left: CanvasPoint, right: CanvasPoint) -> f32 {
 
 /// 根据当前弧长位置生成短笔画保护或非对称起收笔宽度。
 fn width_at_distance(distance: f32, total_length: f32, body_width: f32) -> f32 {
+    // 单点笔画（落笔未移动）使用起笔宽度，避免出现大圆点
+    if total_length == 0.0 {
+        return body_width * START_TIP_WIDTH_RATIO;
+    }
+
     if total_length <= body_width * SHORT_STROKE_BODY_WIDTHS {
         return body_width;
     }
@@ -181,7 +186,7 @@ mod tests {
         assert!(points.iter().any(|point| point.width == body_width));
     }
 
-    /// 验证单点及不超过三个主体宽度的笔画全部保持主体宽度。
+    /// 验证单点使用起笔宽度避免大圆点，短笔画保持主体宽度。
     #[test]
     fn short_strokes_keep_the_body_width() {
         let body_width = 8.0;
@@ -191,7 +196,7 @@ mod tests {
         let short = horizontal_builder(body_width, body_width * 2.5, 1.0).finalized_points();
         let boundary = horizontal_builder(body_width, body_width * 3.0, 1.0).finalized_points();
 
-        assert_eq!(point[0].width, body_width);
+        assert_eq!(point[0].width, body_width * START_TIP_WIDTH_RATIO);
         assert!(short.iter().all(|point| point.width == body_width));
         assert!(boundary.iter().all(|point| point.width == body_width));
     }

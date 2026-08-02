@@ -4,7 +4,7 @@
 
 <h1 align="center">Steady Ink</h1>
 
-<p align="center">A Windows screen-annotation tool for classroom teaching</p>
+<p align="center">A simple Windows screen-annotation tool</p>
 
 <p align="center">
   <img src="https://img.shields.io/badge/status-early%20development-F59E0B" alt="Status: early development">
@@ -25,17 +25,6 @@
 - PowerPoint and WPS presentation detection, navigation, and annotation integration.
 - Local crash recovery, readable mode, machine-wide startup, and in-app restart.
 - Optional live performance monitoring, slow-frame logs, and local JSON performance-data export.
-
-## Status
-
-| Area | Status |
-| --- | --- |
-| Ink annotation, smooth antialiasing, erasing, and settings | Implemented |
-| Windows touch, palm rejection, and palm erasing | Implemented; target hardware tuning remains |
-| GPU render thread, resource reuse, and crash recovery | Implemented; broader GPU and device validation remains |
-| Performance monitoring and JSON export | Implemented; disabled by default |
-| PowerPoint presentation integration | Basic validation completed |
-| WPS presentation integration | Adapted; more real environments required |
 
 ## Installation
 

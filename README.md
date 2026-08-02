@@ -4,7 +4,7 @@
 
 <h1 align="center">Steady Ink</h1>
 
-<p align="center">面向课堂教学的 Windows 屏幕批注工具</p>
+<p align="center">一款简洁的 Windows 屏幕批注工具</p>
 
 <p align="center">
   <img src="https://img.shields.io/badge/status-early%20development-F59E0B" alt="项目状态：早期开发">
@@ -26,16 +26,6 @@
 - 本地崩溃恢复、易读模式、所有用户开机自启动和应用内重启。
 - 可选实时性能监控、慢帧日志和本地 JSON 性能数据导出。
 
-## 当前状态
-
-| 项目 | 状态 |
-| --- | --- |
-| 墨迹批注、平滑抗锯齿、橡皮擦和设置 | 已实现 |
-| Windows 触控、防误触和手掌橡皮擦 | 已在代码上实现， |
-| GPU 渲染线程、资源复用和崩溃恢复 | 已实现，仍需扩大显卡与设备覆盖验证 |
-| 性能监控和 JSON 导出 | 已实现 |
-| PowerPoint 放映联动 | 已适配 |
-| WPS 放映联动 | 已适配 |
 
 ## 安装
 

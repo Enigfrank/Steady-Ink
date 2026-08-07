@@ -495,7 +495,7 @@ fn is_small_rebuild_region(logical_size: [u32; 2], bounds: InkBounds) -> bool {
         && affected_area < canvas_width * canvas_height * MAX_INCREMENTAL_REBUILD_AREA_RATIO
 }
 
-/// 创建 1x 活动页墨迹离屏 GPU surface。
+/// 创建 1x 单采样活动页墨迹离屏 GPU surface；边缘抗锯齿由 Skia Paint 提供。
 fn create_gpu_surface(context: &mut DirectContext, size: [u32; 2]) -> Result<Surface, AppError> {
     let dimensions = (
         i32::try_from(size[0].max(1)).map_err(|error| AppError::Graphics(error.to_string()))?,
@@ -511,7 +511,7 @@ fn create_gpu_surface(context: &mut DirectContext, size: [u32; 2]) -> Result<Sur
         context,
         Budgeted::Yes,
         &image_info,
-        4,
+        0,
         SurfaceOrigin::TopLeft,
         None,
         false,

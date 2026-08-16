@@ -664,7 +664,7 @@ pub(crate) fn replay_active_stroke_regions(
         }
 
         let restore_count = canvas.save();
-        canvas.clip_irect(&dirty_pixels, ClipOp::Intersect);
+        canvas.clip_irect(dirty_pixels, ClipOp::Intersect);
         let mut replace = Paint::default();
         replace.set_blend_mode(BlendMode::Src);
         scratch.draw(

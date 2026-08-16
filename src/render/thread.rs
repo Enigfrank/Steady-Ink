@@ -8,9 +8,12 @@ use std::{
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 
 use super::{Compositor, EguiFrame, compositor::UiCompositor};
+pub use crate::performance::RenderDiagnostics;
 use crate::{
     error::AppError,
-    ink::{InkBounds, InkDocument, InkOperation, InkSyncKind, OwnedActiveInkPreview},
+    ink::{
+        ActiveStrokeDelta, InkBounds, InkDocument, InkOperation, InkSyncKind, OwnedActiveInkPreview,
+    },
     performance::{
         PerformanceFrameSample, PerformanceInkSync, PerformanceMonitor, PerformanceSnapshot,
         PerformanceSnapshotReader,
@@ -27,21 +30,51 @@ pub struct RenderPerformanceMetadata {
     pub input_started_at: Option<Instant>,
 }
 
+#[derive(Default)]
+struct RenderDiagnosticsCounters(Mutex<RenderDiagnostics>);
+
+impl RenderDiagnosticsCounters {
+    /// 在短锁内原子更新跨线程渲染诊断。
+    fn update(&self, update: impl FnOnce(&mut RenderDiagnostics)) {
+        update(&mut self.0.lock().expect("渲染诊断互斥量不应中毒"));
+    }
+
+    /// 复制当前诊断，不把锁带入 UI、日志或导出路径。
+    fn snapshot(&self) -> RenderDiagnostics {
+        *self.0.lock().expect("渲染诊断互斥量不应中毒")
+    }
+}
+
 /// 事件线程提交给渲染线程的完整 owned 画面快照。
 pub struct RenderFrame {
     pub generation: u64,
     pub document: InkDocument,
     pub active_preview: Option<OwnedActiveInkPreview>,
+    /// 固定宽/自然笔锋活动手势的增量原始采样；橡皮擦仍使用 active_preview。
+    pub(crate) active_stroke: Option<ActiveStrokeDelta>,
     pub egui: EguiFrame,
     pub slideshow_ui: EguiFrame,
     pub performance: Option<RenderPerformanceMetadata>,
 }
 
+/// 一个已接受画面的唯一终态。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FrameTerminal {
+    Presented,
+    Discarded,
+    Fatal(String),
+}
+
 /// 渲染线程异步返回给事件线程的状态变化。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RenderEvent {
+    FrameTerminal {
+        generation: u64,
+        outcome: FrameTerminal,
+    },
     InkRenderingError(Option<String>),
     GraphicsDiagnostics(GraphicsDiagnostics),
+    ActiveStrokeResyncRequested,
     Fatal(String),
 }
 
@@ -64,6 +97,8 @@ enum RenderControl {
 struct RenderWork {
     controls: VecDeque<RenderControl>,
     frame: Option<RenderFrame>,
+    discarded_generations: Vec<u64>,
+    mailbox_replacements: u64,
 }
 
 /// 一块原生呈现表面在线程启动时需要的 target 与 egui context。
@@ -79,6 +114,8 @@ struct MailboxState {
     frame: Option<RenderFrame>,
     skipped_texture_deltas: Vec<egui::TexturesDelta>,
     skipped_slideshow_texture_deltas: Vec<egui::TexturesDelta>,
+    discarded_generations: Vec<u64>,
+    mailbox_replacements: u64,
     closed: bool,
 }
 
@@ -91,12 +128,14 @@ struct RenderMailbox {
 
 impl RenderMailbox {
     /// 无阻塞地替换待渲染画面，并保留纹理命令和最早关联输入。
-    fn submit_frame(&self, frame: RenderFrame) {
+    fn submit_frame(&self, frame: RenderFrame) -> bool {
         let mut state = self.state.lock().expect("渲染邮箱互斥量不应中毒");
         if state.closed {
-            return;
+            return false;
         }
         if let Some(skipped) = state.frame.replace(frame) {
+            state.discarded_generations.push(skipped.generation);
+            state.mailbox_replacements = state.mailbox_replacements.saturating_add(1);
             let skipped_input = skipped
                 .performance
                 .and_then(|metadata| metadata.input_started_at);
@@ -118,6 +157,22 @@ impl RenderMailbox {
             }
         }
         self.ready.notify_one();
+        true
+    }
+
+    /// 只保留未提交几何 source frame 的纹理命令，不为其生成终态。
+    fn retain_source_frame_texture_deltas(&self, mut frame: RenderFrame) -> bool {
+        let mut state = self.state.lock().expect("渲染邮箱互斥量不应中毒");
+        if state.closed {
+            return false;
+        }
+        state
+            .skipped_texture_deltas
+            .append(&mut frame.egui.texture_deltas);
+        state
+            .skipped_slideshow_texture_deltas
+            .append(&mut frame.slideshow_ui.texture_deltas);
+        true
     }
 
     /// 追加控制命令；连续 resize 和资源驻留切换只保留最后一次目标。
@@ -159,6 +214,7 @@ impl RenderMailbox {
             return false;
         }
         if let Some(stale) = state.frame.take() {
+            state.discarded_generations.push(stale.generation);
             state
                 .skipped_texture_deltas
                 .extend(stale.egui.texture_deltas);
@@ -188,6 +244,7 @@ impl RenderMailbox {
             return;
         }
         if let Some(stale) = state.frame.take() {
+            state.discarded_generations.push(stale.generation);
             state
                 .skipped_texture_deltas
                 .extend(stale.egui.texture_deltas);
@@ -227,15 +284,22 @@ impl RenderMailbox {
         RenderWork {
             controls: std::mem::take(&mut state.controls),
             frame,
+            discarded_generations: std::mem::take(&mut state.discarded_generations),
+            mailbox_replacements: std::mem::take(&mut state.mailbox_replacements),
         }
     }
 
-    /// 令后续生产者立即返回，并唤醒等待中的消费者。
-    fn close(&self) {
+    /// 令后续生产者立即返回，并返回尚未消费画面的 generation。
+    fn close(&self) -> Vec<u64> {
         let mut state = self.state.lock().expect("渲染邮箱互斥量不应中毒");
         state.closed = true;
         state.controls.clear();
+        if let Some(frame) = state.frame.take() {
+            state.discarded_generations.push(frame.generation);
+        }
+        let discarded_generations = std::mem::take(&mut state.discarded_generations);
         self.ready.notify_all();
+        discarded_generations
     }
 }
 
@@ -247,6 +311,7 @@ pub struct RenderThread {
     diagnostics: GraphicsDiagnostics,
     initial_ink_error: Option<String>,
     performance: PerformanceSnapshotReader,
+    diagnostics_counters: Arc<RenderDiagnosticsCounters>,
 }
 
 impl RenderThread {
@@ -262,6 +327,8 @@ impl RenderThread {
         let worker_mailbox = Arc::clone(&mailbox);
         let performance_monitor = PerformanceMonitor::new();
         let performance = performance_monitor.snapshot_reader();
+        let diagnostics_counters = Arc::new(RenderDiagnosticsCounters::default());
+        let worker_diagnostics = Arc::clone(&diagnostics_counters);
         let (events_tx, events) = mpsc::channel();
         let (initialized_tx, initialized_rx) = mpsc::sync_channel(1);
         let main_surface = RenderSurfaceSetup {
@@ -282,6 +349,7 @@ impl RenderThread {
                     events_tx,
                     initialized_tx,
                     performance_monitor,
+                    worker_diagnostics,
                     &wake_event_loop,
                 );
             })
@@ -297,6 +365,7 @@ impl RenderThread {
             diagnostics,
             initial_ink_error,
             performance,
+            diagnostics_counters,
         })
     }
 
@@ -312,12 +381,45 @@ impl RenderThread {
 
     /// 复制渲染线程最新发布的固定大小性能快照。
     pub fn performance_snapshot(&self) -> PerformanceSnapshot {
-        self.performance.snapshot()
+        self.performance
+            .snapshot()
+            .with_render_diagnostics(self.render_diagnostics())
+    }
+
+    /// 返回事件线程和渲染线程共同维护的背压诊断计数。
+    pub fn render_diagnostics(&self) -> RenderDiagnostics {
+        self.diagnostics_counters.snapshot()
+    }
+
+    /// 记录一个已构造的候选画面及其活动点数。
+    pub(crate) fn record_generated(&self, active_samples: usize) {
+        self.diagnostics_counters.update(|diagnostics| {
+            diagnostics.generated = diagnostics.generated.saturating_add(1);
+            diagnostics.active_samples = active_samples as u64;
+        });
     }
 
     /// 提交最新 owned frame；若旧帧尚未消费则只保留其纹理命令。
-    pub fn submit_frame(&self, frame: RenderFrame) {
-        self.mailbox.submit_frame(frame);
+    pub fn submit_frame(&self, frame: RenderFrame) -> Result<(), AppError> {
+        let accepted = self
+            .mailbox
+            .submit_frame(frame)
+            .then_some(())
+            .ok_or_else(|| AppError::Graphics("渲染线程已退出，无法提交画面".to_owned()));
+        if accepted.is_ok() {
+            self.diagnostics_counters.update(|diagnostics| {
+                diagnostics.submitted = diagnostics.submitted.saturating_add(1);
+            });
+        }
+        accepted
+    }
+
+    /// 保留几何 source frame 的纹理命令，但不把它计为已接受画面。
+    pub fn retain_source_frame_texture_deltas(&self, frame: RenderFrame) -> Result<(), AppError> {
+        self.mailbox
+            .retain_source_frame_texture_deltas(frame)
+            .then_some(())
+            .ok_or_else(|| AppError::Graphics("渲染线程已退出，无法保留纹理命令".to_owned()))
     }
 
     /// 同步冻结当前 visual，并只保留几何命令帧携带的 egui 纹理增量。
@@ -403,6 +505,7 @@ impl Drop for RenderThread {
 }
 
 /// 在线程内创建全部 GPU 状态并持续处理控制命令和最新帧。
+#[allow(clippy::too_many_arguments)]
 fn run_render_thread(
     main_surface: RenderSurfaceSetup,
     slideshow_surface: RenderSurfaceSetup,
@@ -410,6 +513,7 @@ fn run_render_thread(
     events: mpsc::Sender<RenderEvent>,
     initialized: mpsc::SyncSender<Result<(GraphicsDiagnostics, Option<String>), String>>,
     mut performance_monitor: PerformanceMonitor,
+    diagnostics_counters: Arc<RenderDiagnosticsCounters>,
     wake_event_loop: &impl Fn(),
 ) {
     let initialization = D3DRenderContext::new(main_surface.target).and_then(|context| {
@@ -452,9 +556,25 @@ fn run_render_thread(
     }
 
     loop {
-        let work = mailbox.wait_for_work();
+        let RenderWork {
+            controls,
+            frame,
+            discarded_generations,
+            mailbox_replacements,
+        } = mailbox.wait_for_work();
+        diagnostics_counters.update(|diagnostics| {
+            diagnostics.mailbox_replacements = diagnostics
+                .mailbox_replacements
+                .saturating_add(mailbox_replacements);
+        });
+        send_discarded_generations(
+            &events,
+            discarded_generations,
+            &diagnostics_counters,
+            wake_event_loop,
+        );
         let mut shutdown = false;
-        for control in work.controls {
+        for control in controls {
             let result = match control {
                 RenderControl::HoldWindowVisual { offset, completed } => {
                     let result = window_context.hold_visual_offset(offset);
@@ -487,12 +607,14 @@ fn run_render_thread(
                 }
             };
             if let Err(error) = result {
-                send_render_event(
+                terminate_render_thread(
+                    &mailbox,
                     &events,
-                    RenderEvent::Fatal(error.to_string()),
+                    frame.as_ref().map(|frame| frame.generation),
+                    error.to_string(),
+                    &diagnostics_counters,
                     wake_event_loop,
                 );
-                mailbox.close();
                 return;
             }
             let diagnostics = window_context.diagnostics_snapshot();
@@ -505,12 +627,31 @@ fn run_render_thread(
                 );
             }
             if shutdown {
-                mailbox.close();
+                let mut discarded = frame
+                    .as_ref()
+                    .map(|frame| frame.generation)
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                discarded.extend(mailbox.close());
+                send_discarded_generations(
+                    &events,
+                    discarded,
+                    &diagnostics_counters,
+                    wake_event_loop,
+                );
                 return;
             }
         }
 
-        if let Some(frame) = work.frame {
+        if compositor.take_active_stroke_resync_requested() {
+            send_render_event(
+                &events,
+                RenderEvent::ActiveStrokeResyncRequested,
+                wake_event_loop,
+            );
+        }
+
+        if let Some(frame) = frame {
             let performance_metadata = frame.performance;
             let monitoring_started =
                 performance_monitor.set_enabled(performance_metadata.is_some());
@@ -521,7 +662,13 @@ fn run_render_thread(
                 .as_ref()
                 .map(OwnedActiveInkPreview::as_borrowed);
             let result = compositor
-                .paint(&window_context, &frame.document, preview, frame.egui)
+                .paint(
+                    &window_context,
+                    &frame.document,
+                    preview,
+                    frame.active_stroke,
+                    frame.egui,
+                )
                 .and_then(|ink_sync| window_context.present().map(|()| ink_sync))
                 .and_then(|ink_sync| {
                     slideshow_ui_compositor
@@ -532,15 +679,29 @@ fn run_render_thread(
             let ink_sync = match result {
                 Ok(ink_sync) => ink_sync,
                 Err(error) => {
-                    send_render_event(
+                    terminate_render_thread(
+                        &mailbox,
                         &events,
-                        RenderEvent::Fatal(error.to_string()),
+                        Some(generation),
+                        error.to_string(),
+                        &diagnostics_counters,
                         wake_event_loop,
                     );
-                    mailbox.close();
                     return;
                 }
             };
+            diagnostics_counters.update(|diagnostics| {
+                diagnostics.presented = diagnostics.presented.saturating_add(1);
+            });
+            let active_work = compositor.active_stroke_diagnostics();
+            diagnostics_counters.update(|diagnostics| {
+                diagnostics.incremental_primitives = diagnostics
+                    .incremental_primitives
+                    .saturating_add(active_work.1 as u64);
+                diagnostics.full_active_fallbacks = diagnostics
+                    .full_active_fallbacks
+                    .saturating_add(u64::from(active_work.2));
+            });
             if let (Some(metadata), Some(render_started_at)) =
                 (performance_metadata, render_started_at)
             {
@@ -574,6 +735,7 @@ fn run_render_thread(
                 });
                 if slow_frame {
                     let snapshot = performance_monitor.snapshot();
+                    let render_diagnostics = diagnostics_counters.snapshot();
                     tracing::warn!(
                         generation,
                         frame_time_micros = frame_time.as_micros(),
@@ -583,6 +745,14 @@ fn run_render_thread(
                         visible_operations = snapshot.visible_operations(),
                         ink_sync = ?performance_ink_sync,
                         managed_gpu_bytes,
+                        generated_frames = render_diagnostics.generated,
+                        submitted_frames = render_diagnostics.submitted,
+                        presented_frames = render_diagnostics.presented,
+                        discarded_frames = render_diagnostics.discarded,
+                        mailbox_replacements = render_diagnostics.mailbox_replacements,
+                        active_samples = render_diagnostics.active_samples,
+                        incremental_primitives = render_diagnostics.incremental_primitives,
+                        full_active_fallbacks = render_diagnostics.full_active_fallbacks,
                         "检测到异常渲染帧"
                     );
                 }
@@ -596,8 +766,69 @@ fn run_render_thread(
                     wake_event_loop,
                 );
             }
+            send_render_event(
+                &events,
+                frame_terminal_event(generation, FrameTerminal::Presented),
+                wake_event_loop,
+            );
+            if compositor.take_active_stroke_resync_requested() {
+                send_render_event(
+                    &events,
+                    RenderEvent::ActiveStrokeResyncRequested,
+                    wake_event_loop,
+                );
+            }
         }
     }
+}
+
+/// 构造一个 generation 的统一终态事件。
+fn frame_terminal_event(generation: u64, outcome: FrameTerminal) -> RenderEvent {
+    RenderEvent::FrameTerminal {
+        generation,
+        outcome,
+    }
+}
+
+/// 按 mailbox 记录顺序发送全部被丢弃画面的终态。
+fn send_discarded_generations(
+    events: &mpsc::Sender<RenderEvent>,
+    generations: Vec<u64>,
+    diagnostics_counters: &RenderDiagnosticsCounters,
+    wake_event_loop: &impl Fn(),
+) {
+    for generation in generations {
+        send_render_event(
+            events,
+            frame_terminal_event(generation, FrameTerminal::Discarded),
+            wake_event_loop,
+        );
+        diagnostics_counters.update(|diagnostics| {
+            diagnostics.discarded = diagnostics.discarded.saturating_add(1);
+        });
+    }
+}
+
+/// 发送当前画面的 Fatal 终态，并终结 mailbox 中剩余的 accepted generation。
+fn terminate_render_thread(
+    mailbox: &RenderMailbox,
+    events: &mpsc::Sender<RenderEvent>,
+    generation: Option<u64>,
+    detail: String,
+    diagnostics_counters: &RenderDiagnosticsCounters,
+    wake_event_loop: &impl Fn(),
+) {
+    if let Some(generation) = generation {
+        send_render_event(
+            events,
+            frame_terminal_event(generation, FrameTerminal::Fatal(detail)),
+            wake_event_loop,
+        );
+    } else {
+        send_render_event(events, RenderEvent::Fatal(detail), wake_event_loop);
+    }
+    let discarded = mailbox.close();
+    send_discarded_generations(events, discarded, diagnostics_counters, wake_event_loop);
 }
 
 /// 有界等待渲染线程完成一个同步 visual 控制，避免 fatal 退出时永久阻塞事件线程。
@@ -663,6 +894,7 @@ mod tests {
             generation,
             document: InkDocument::new(),
             active_preview: None,
+            active_stroke: None,
             egui: EguiFrame {
                 shapes: Vec::new(),
                 pixels_per_point: 1.0,
@@ -720,6 +952,8 @@ mod tests {
         mailbox.submit_frame(latest);
 
         let work = mailbox.wait_for_work();
+        assert_eq!(work.discarded_generations, vec![1, 2]);
+        assert_eq!(work.mailbox_replacements, 2);
         let frame = work.frame.expect("最新画面应可消费");
         let textures: Vec<_> = frame
             .egui
@@ -779,6 +1013,7 @@ mod tests {
         mailbox.submit_frame(test_frame(2, 22));
 
         let work = mailbox.wait_for_work();
+        assert_eq!(work.discarded_generations, vec![1]);
         let controls: Vec<_> = work.controls.into_iter().collect();
         assert!(matches!(
             controls.as_slice(),
@@ -802,6 +1037,7 @@ mod tests {
         ));
 
         let hold_work = mailbox.wait_for_work();
+        assert_eq!(hold_work.discarded_generations, vec![1]);
         assert!(hold_work.frame.is_none());
         assert!(matches!(
             hold_work.controls.front(),
@@ -846,6 +1082,136 @@ mod tests {
         );
     }
 
+    /// 验证 replacement、resize 和 visual hold 连续发生时终态与双纹理流仍严格保序。
+    #[test]
+    fn chained_discards_preserve_generation_and_texture_order() {
+        let mailbox = RenderMailbox::default();
+        assert!(mailbox.submit_frame(test_frame(1, 11)));
+        assert!(mailbox.submit_frame(test_frame(2, 22)));
+        mailbox.submit_resize(PhysicalSize::new(1_280, 720));
+        assert!(mailbox.submit_frame(test_frame(3, 33)));
+        let (completed, _receiver) = mpsc::sync_channel(1);
+        assert!(mailbox.submit_visual_hold(
+            PhysicalPosition::new(320, 180),
+            Some(test_frame(4, 44)),
+            completed,
+        ));
+
+        let hold_work = mailbox.wait_for_work();
+        assert_eq!(hold_work.discarded_generations, vec![1, 2, 3]);
+        assert!(hold_work.frame.is_none());
+
+        assert!(mailbox.submit_frame(test_frame(5, 55)));
+        let target_frame = mailbox
+            .wait_for_work()
+            .frame
+            .expect("目标几何帧应继承全部纹理命令");
+        let textures: Vec<_> = target_frame
+            .egui
+            .texture_deltas
+            .iter()
+            .flat_map(|delta| delta.free.iter())
+            .copied()
+            .collect();
+        let slideshow_textures: Vec<_> = target_frame
+            .slideshow_ui
+            .texture_deltas
+            .iter()
+            .flat_map(|delta| delta.free.iter())
+            .copied()
+            .collect();
+
+        assert_eq!(
+            textures,
+            vec![
+                TextureId::Managed(11),
+                TextureId::Managed(22),
+                TextureId::Managed(33),
+                TextureId::Managed(44),
+                TextureId::Managed(55),
+            ]
+        );
+        assert_eq!(
+            slideshow_textures,
+            vec![
+                TextureId::Managed(111),
+                TextureId::Managed(122),
+                TextureId::Managed(133),
+                TextureId::Managed(144),
+                TextureId::Managed(155),
+            ]
+        );
+    }
+
+    /// 验证几何 source frame 只转移纹理命令，不产生 accepted generation。
+    #[test]
+    fn geometry_source_frame_retains_textures_without_terminal_ack() {
+        let mailbox = RenderMailbox::default();
+        assert!(mailbox.retain_source_frame_texture_deltas(test_frame(7, 77)));
+        assert!(mailbox.submit_frame(test_frame(8, 88)));
+
+        let work = mailbox.wait_for_work();
+        assert!(work.discarded_generations.is_empty());
+        let frame = work.frame.expect("目标几何帧应可消费");
+        assert_eq!(frame.generation, 8);
+        assert_eq!(frame.egui.texture_deltas.len(), 2);
+        assert_eq!(frame.slideshow_ui.texture_deltas.len(), 2);
+    }
+
+    /// 验证 fatal 当前帧和 mailbox 中待处理帧各自产生且只产生一个终态。
+    #[test]
+    fn fatal_terminates_current_and_pending_generations_once() {
+        let mailbox = RenderMailbox::default();
+        assert!(mailbox.submit_frame(test_frame(10, 10)));
+        let current = mailbox
+            .wait_for_work()
+            .frame
+            .expect("当前画面应已被消费者接受");
+        assert!(mailbox.submit_frame(test_frame(11, 11)));
+        assert!(mailbox.submit_frame(test_frame(12, 12)));
+        let (events, receiver) = mpsc::channel();
+        let diagnostics = RenderDiagnosticsCounters::default();
+
+        terminate_render_thread(
+            &mailbox,
+            &events,
+            Some(current.generation),
+            "paint failed".to_owned(),
+            &diagnostics,
+            &|| {},
+        );
+        drop(events);
+
+        assert_eq!(
+            receiver.into_iter().collect::<Vec<_>>(),
+            vec![
+                frame_terminal_event(10, FrameTerminal::Fatal("paint failed".to_owned())),
+                frame_terminal_event(11, FrameTerminal::Discarded),
+                frame_terminal_event(12, FrameTerminal::Discarded),
+            ]
+        );
+        assert_eq!(diagnostics.snapshot().discarded, 2);
+    }
+
+    /// 验证每个 Discarded 终态都同步进入性能诊断计数。
+    #[test]
+    fn discarded_terminal_events_update_diagnostics() {
+        let (events, receiver) = mpsc::channel();
+        let diagnostics = RenderDiagnosticsCounters::default();
+
+        send_discarded_generations(&events, vec![21, 22], &diagnostics, &|| {});
+        drop(events);
+
+        assert_eq!(
+            receiver.into_iter().collect::<Vec<_>>(),
+            vec![
+                frame_terminal_event(21, FrameTerminal::Discarded),
+                frame_terminal_event(22, FrameTerminal::Discarded),
+            ]
+        );
+        assert_eq!(diagnostics.snapshot().discarded, 2);
+    }
+
     /// 验证 visual 偏移清零在目标 resize 和目标帧之前排队。
     #[test]
     fn visual_reset_is_ordered_before_target_resize_and_frame() {
@@ -881,6 +1247,18 @@ mod tests {
             receiver.try_recv(),
             Err(mpsc::TryRecvError::Disconnected)
         ));
+    }
+
+    /// 验证 close 返回全部尚未终结的 accepted generation，重复关闭不会重复终结。
+    #[test]
+    fn closing_mailbox_drains_accepted_generations_once() {
+        let mailbox = RenderMailbox::default();
+        assert!(mailbox.submit_frame(test_frame(1, 11)));
+        assert!(mailbox.submit_frame(test_frame(2, 22)));
+
+        assert_eq!(mailbox.close(), vec![1, 2]);
+        assert!(mailbox.close().is_empty());
+        assert!(!mailbox.submit_frame(test_frame(3, 33)));
     }
 
     /// 验证慢合成负载下事件线程提交 p95 至少比同步执行低 50%。

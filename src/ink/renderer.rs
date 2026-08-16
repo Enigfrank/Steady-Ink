@@ -1,6 +1,6 @@
 use skia_safe::{
-    AlphaType, BlendMode, Canvas, ClipOp, Color, ColorType, ImageInfo, Paint, PaintCap, PaintJoin,
-    PaintStyle, PathBuilder, Rect, Surface,
+    AlphaType, BlendMode, Canvas, ClipOp, Color, ColorType, IRect, ImageInfo, Paint, PaintCap,
+    PaintJoin, PaintStyle, PathBuilder, Rect, RoundOut, SamplingOptions, Surface,
     gpu::{self, Budgeted, DirectContext, SurfaceOrigin},
 };
 
@@ -8,9 +8,13 @@ use super::{
     BatchDrawer, CanvasPoint, EraseSample, EraseStroke, EraserSize, InkBounds, InkColor,
     InkDocument, InkOperation, InkSpatialIndex, InkTool, OperationId, PenWidth,
     VariableStrokePoint,
+    active_stroke::{
+        ActiveStrokeRenderCache, ActiveStrokeReplay, ActiveStrokeStyle, fixed_ink_bounds,
+        variable_ink_bounds,
+    },
     stroke_geometry::{
-        append_closed_bezier_path, append_open_bezier_path, light_filter_points,
-        light_filter_variable_points, variable_outline,
+        CubicBezierSegment, append_closed_bezier_path, append_open_bezier_path,
+        light_filter_points, light_filter_variable_points, variable_outline,
     },
 };
 use crate::error::AppError;
@@ -496,7 +500,10 @@ fn is_small_rebuild_region(logical_size: [u32; 2], bounds: InkBounds) -> bool {
 }
 
 /// 创建 1x 单采样活动页墨迹离屏 GPU surface；边缘抗锯齿由 Skia Paint 提供。
-fn create_gpu_surface(context: &mut DirectContext, size: [u32; 2]) -> Result<Surface, AppError> {
+pub(crate) fn create_gpu_surface(
+    context: &mut DirectContext,
+    size: [u32; 2],
+) -> Result<Surface, AppError> {
     let dimensions = (
         i32::try_from(size[0].max(1)).map_err(|error| AppError::Graphics(error.to_string()))?,
         i32::try_from(size[1].max(1)).map_err(|error| AppError::Graphics(error.to_string()))?,
@@ -590,6 +597,143 @@ pub(crate) fn draw_active_preview(canvas: &Canvas, preview: ActiveInkPreview<'_>
             }
         }
     }
+}
+
+/// 绘制已完成三点滤波的活动几何，供 retained cache 避免重复滤波。
+pub(crate) fn draw_active_filtered_preview(canvas: &Canvas, preview: ActiveInkPreview<'_>) {
+    match preview {
+        ActiveInkPreview::Tool {
+            points,
+            tool: InkTool::Pen,
+            color,
+            pen_width,
+            ..
+        } => draw_pen_path_filtered(canvas, points, color, pen_width),
+        ActiveInkPreview::VariableTool { points, color, .. } => {
+            draw_variable_pen_path_filtered(canvas, points, color)
+        }
+        _ => {}
+    }
+}
+
+/// 在兼容临时 surface 中无 dirty clip 光栅化，再以 Src 严格替换目标 dirty 像素。
+pub(crate) fn replay_active_stroke_regions(
+    canvas: &Canvas,
+    cache: &ActiveStrokeRenderCache,
+) -> bool {
+    for replay in cache.replay_regions() {
+        let dirty = replay.bounds();
+        let Some(dirty_pixels) = clipped_replay_pixels(canvas, dirty) else {
+            continue;
+        };
+        let raster_bounds =
+            replay_raster_bounds(cache, replay).map_or(dirty, |geometry| dirty.union(geometry));
+        let Some(raster_pixels) = clipped_replay_pixels(canvas, raster_bounds) else {
+            continue;
+        };
+        let scratch_info = canvas.image_info().with_dimensions(raster_pixels.size());
+        let Some(mut scratch) = canvas.new_surface(&scratch_info, None) else {
+            return false;
+        };
+        let scratch_canvas = scratch.canvas();
+        scratch_canvas.clear(Color::TRANSPARENT);
+        scratch_canvas.translate((-(raster_pixels.left as f32), -(raster_pixels.top as f32)));
+
+        match replay {
+            ActiveStrokeReplay::Fixed { segment_range, .. } => {
+                if let Some(ActiveStrokeStyle::Fixed { color, width }) = cache.style() {
+                    let segments = &cache.fixed_primitives()[segment_range.clone()];
+                    if segments.is_empty() {
+                        let (points, _) = cache.geometry();
+                        draw_pen_path_filtered(scratch_canvas, points, color, width);
+                    } else {
+                        draw_fixed_bezier_segments(scratch_canvas, segments, color, width);
+                    }
+                }
+            }
+            ActiveStrokeReplay::Natural { point_range, .. } => {
+                if let Some(ActiveStrokeStyle::Natural { color, .. }) = cache.style() {
+                    let (_, points) = cache.geometry();
+                    draw_variable_pen_path_filtered(
+                        scratch_canvas,
+                        &points[point_range.clone()],
+                        color,
+                    );
+                }
+            }
+        }
+
+        let restore_count = canvas.save();
+        canvas.clip_irect(&dirty_pixels, ClipOp::Intersect);
+        let mut replace = Paint::default();
+        replace.set_blend_mode(BlendMode::Src);
+        scratch.draw(
+            canvas,
+            (raster_pixels.left as f32, raster_pixels.top as f32),
+            SamplingOptions::default(),
+            Some(&replace),
+        );
+        canvas.restore_to_count(restore_count);
+    }
+    true
+}
+
+/// 返回局部 replay 新几何的完整 AA 栅格范围，不包含需要透明清理的旧范围。
+fn replay_raster_bounds(
+    cache: &ActiveStrokeRenderCache,
+    replay: &ActiveStrokeReplay,
+) -> Option<InkBounds> {
+    match replay {
+        ActiveStrokeReplay::Fixed { segment_range, .. } => {
+            let Some(ActiveStrokeStyle::Fixed { width, .. }) = cache.style() else {
+                return None;
+            };
+            let segments = &cache.fixed_primitives()[segment_range.clone()];
+            let (points, _) = cache.geometry();
+            fixed_ink_bounds(points, segments, width.pixels())
+        }
+        ActiveStrokeReplay::Natural { point_range, .. } => {
+            let (_, points) = cache.geometry();
+            variable_ink_bounds(points, point_range)
+        }
+    }
+}
+
+/// 把浮点 replay 范围向外取整并裁到 retained surface 的有效像素。
+fn clipped_replay_pixels(canvas: &Canvas, bounds: InkBounds) -> Option<IRect> {
+    let rect = Rect::new(bounds.left, bounds.top, bounds.right, bounds.bottom);
+    let pixels: IRect = rect.round_out();
+    IRect::intersect(&pixels, &IRect::from_size(canvas.base_layer_size()))
+}
+
+/// 使用 retained 的全局 clamp 后 cubic 段连续绘制一个固定宽局部子路径。
+fn draw_fixed_bezier_segments(
+    canvas: &Canvas,
+    segments: &[CubicBezierSegment],
+    color: InkColor,
+    width: PenWidth,
+) {
+    let Some(first) = segments.first() else {
+        return;
+    };
+    let mut path = PathBuilder::new();
+    path.move_to((first.start.x, first.start.y));
+    for segment in segments {
+        path.cubic_to(
+            (segment.control1.x, segment.control1.y),
+            (segment.control2.x, segment.control2.y),
+            (segment.end.x, segment.end.y),
+        );
+    }
+    let rgba = color.rgba();
+    let mut paint = Paint::default();
+    paint.set_anti_alias(true);
+    paint.set_color(Color::from_argb(rgba[3], rgba[0], rgba[1], rgba[2]));
+    paint.set_style(PaintStyle::Stroke);
+    paint.set_stroke_width(width.pixels());
+    paint.set_stroke_cap(PaintCap::Round);
+    paint.set_stroke_join(PaintJoin::Round);
+    canvas.draw_path(&path.detach(), &paint);
 }
 
 /// 滤波后以贝塞尔路径连续清除普通圆形橡皮擦路径，避免采样点之间留下间隙。
@@ -733,6 +877,16 @@ fn draw_pen_path(canvas: &Canvas, points: &[CanvasPoint], color: InkColor, width
     let Some(filtered_points) = light_filter_points(points) else {
         return;
     };
+    draw_pen_path_filtered(canvas, &filtered_points, color, width);
+}
+
+/// 使用已滤波固定宽点集绘制 Skia AA 开放路径。
+fn draw_pen_path_filtered(
+    canvas: &Canvas,
+    filtered_points: &[CanvasPoint],
+    color: InkColor,
+    width: PenWidth,
+) {
     let Some(first) = filtered_points.first() else {
         return;
     };
@@ -751,7 +905,7 @@ fn draw_pen_path(canvas: &Canvas, points: &[CanvasPoint], color: InkColor, width
     }
 
     let mut path_builder = PathBuilder::new();
-    if !append_open_bezier_path(&mut path_builder, &filtered_points) {
+    if !append_open_bezier_path(&mut path_builder, filtered_points) {
         return;
     }
     let path = path_builder.detach();
@@ -763,6 +917,15 @@ fn draw_variable_pen_path(canvas: &Canvas, points: &[VariableStrokePoint], color
     let Some(filtered_points) = light_filter_variable_points(points) else {
         return;
     };
+    draw_variable_pen_path_filtered(canvas, &filtered_points, color);
+}
+
+/// 使用已滤波自然笔锋点集绘制 Skia AA 闭合轮廓。
+fn draw_variable_pen_path_filtered(
+    canvas: &Canvas,
+    filtered_points: &[VariableStrokePoint],
+    color: InkColor,
+) {
     let Some(first) = filtered_points.first() else {
         return;
     };
@@ -776,7 +939,7 @@ fn draw_variable_pen_path(canvas: &Canvas, points: &[VariableStrokePoint], color
         canvas.draw_circle((first.point.x, first.point.y), first.width / 2.0, &paint);
         return;
     }
-    let Some(outline) = variable_outline(&filtered_points) else {
+    let Some(outline) = variable_outline(filtered_points) else {
         return;
     };
     let mut path_builder = PathBuilder::new();
@@ -824,6 +987,236 @@ fn draw_erase_sample_outline(canvas: &Canvas, sample: EraseSample) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 读取 raster surface 的完整 N32 premultiplied 像素。
+    fn raster_pixels(surface: &mut Surface, size: (i32, i32)) -> Vec<u8> {
+        let info = ImageInfo::new_n32_premul(size, None);
+        let row_bytes = info.min_row_bytes();
+        let mut pixels = vec![0; info.compute_min_byte_size()];
+        assert!(
+            surface
+                .canvas()
+                .read_pixels(&info, &mut pixels, row_bytes, (0, 0))
+        );
+        pixels
+    }
+
+    /// 使用生产 full helper 重画当前 retained 几何，作为增量 surface 的像素 oracle。
+    fn draw_active_cache_full(canvas: &Canvas, cache: &ActiveStrokeRenderCache) {
+        let (fixed, natural) = cache.geometry();
+        match cache.style() {
+            Some(ActiveStrokeStyle::Fixed { color, width }) => draw_active_filtered_preview(
+                canvas,
+                ActiveInkPreview::Tool {
+                    points: fixed,
+                    tool: InkTool::Pen,
+                    color,
+                    pen_width: width,
+                    eraser_size: EraserSize::default(),
+                },
+            ),
+            Some(ActiveStrokeStyle::Natural { color, .. }) => draw_active_filtered_preview(
+                canvas,
+                ActiveInkPreview::VariableTool {
+                    points: natural,
+                    color,
+                    eraser_size: EraserSize::default(),
+                },
+            ),
+            None => {}
+        }
+    }
+
+    /// 验证所有 dirty 矩形之外的 retained 像素在一次局部 replay 前后逐字节不变。
+    fn assert_pixels_outside_dirty_unchanged(
+        before: &[u8],
+        after: &[u8],
+        size: (i32, i32),
+        dirty: &[IRect],
+    ) {
+        for y in 0..size.1 {
+            for x in 0..size.0 {
+                if dirty.iter().any(|rect| {
+                    x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom
+                }) {
+                    continue;
+                }
+                let byte = ((y * size.0 + x) * 4) as usize;
+                assert_eq!(
+                    &before[byte..byte + 4],
+                    &after[byte..byte + 4],
+                    "dirty 外像素 ({x}, {y}) 被局部 Src replay 修改"
+                );
+            }
+        }
+    }
+
+    /// 验证 dirty clear + halo replay 在每个 revision 与完整 analytic-AA 重画逐像素一致。
+    fn assert_incremental_raster_matches_full(style: ActiveStrokeStyle, points: &[CanvasPoint]) {
+        let size = (192, 128);
+        let mut incremental = skia_safe::surfaces::raster_n32_premul(size).unwrap();
+        incremental.canvas().clear(Color::TRANSPARENT);
+        let mut oracle = skia_safe::surfaces::raster_n32_premul(size).unwrap();
+        let mut cache = ActiveStrokeRenderCache::default();
+
+        for (index, point) in points.iter().enumerate() {
+            let before = raster_pixels(&mut incremental, size);
+            let work = cache
+                .apply_delta(&super::super::active_stroke::ActiveStrokeDelta {
+                    gesture_id: 71,
+                    revision: index as u64 + 1,
+                    from_sample: index,
+                    samples: vec![*point],
+                    style,
+                    full_resync: false,
+                })
+                .unwrap();
+            if work.full_redraw {
+                incremental.canvas().clear(Color::TRANSPARENT);
+                draw_active_cache_full(incremental.canvas(), &cache);
+            } else {
+                let dirty = cache
+                    .replay_regions()
+                    .iter()
+                    .filter_map(|replay| {
+                        clipped_replay_pixels(incremental.canvas(), replay.bounds())
+                    })
+                    .collect::<Vec<_>>();
+                assert!(replay_active_stroke_regions(incremental.canvas(), &cache));
+                let after = raster_pixels(&mut incremental, size);
+                assert_pixels_outside_dirty_unchanged(&before, &after, size, &dirty);
+            }
+            oracle.canvas().clear(Color::TRANSPARENT);
+            draw_active_cache_full(oracle.canvas(), &cache);
+            let actual = raster_pixels(&mut incremental, size);
+            let expected = raster_pixels(&mut oracle, size);
+            assert!(
+                actual.iter().any(|byte| *byte != 0),
+                "{style:?} revision {} 的累计活动笔迹不应透明",
+                index + 1
+            );
+            if actual != expected {
+                let first_difference = actual
+                    .iter()
+                    .zip(&expected)
+                    .position(|(actual, expected)| actual != expected);
+                let difference_count = actual
+                    .iter()
+                    .zip(&expected)
+                    .filter(|(actual, expected)| actual != expected)
+                    .count();
+                panic!(
+                    "{style:?} revision {} 的 dirty replay 与 full helper 有 {difference_count} 个字节不同，首个索引 {first_difference:?}",
+                    index + 1
+                );
+            }
+        }
+    }
+
+    /// 验证一次完整重画后的下一次局部 fixed/natural replay 不会清除稳定前缀。
+    #[test]
+    fn local_replay_after_full_redraw_preserves_prefix_for_fixed_and_natural() {
+        let size = (192, 128);
+        let points = [
+            CanvasPoint::new(16.0, 64.0),
+            CanvasPoint::new(36.0, 48.0),
+            CanvasPoint::new(60.0, 72.0),
+            CanvasPoint::new(88.0, 44.0),
+            CanvasPoint::new(116.0, 76.0),
+            CanvasPoint::new(152.0, 56.0),
+        ];
+        for style in [
+            ActiveStrokeStyle::Fixed {
+                color: InkColor::Red,
+                width: PenWidth::Px8,
+            },
+            ActiveStrokeStyle::Natural {
+                color: InkColor::Red,
+                body_width: PenWidth::Px8,
+            },
+        ] {
+            let mut incremental = skia_safe::surfaces::raster_n32_premul(size).unwrap();
+            incremental.canvas().clear(Color::TRANSPARENT);
+            let mut oracle = skia_safe::surfaces::raster_n32_premul(size).unwrap();
+            let mut cache = ActiveStrokeRenderCache::default();
+            cache.apply_full(91, 5, style, &points[..5]).unwrap();
+            draw_active_cache_full(incremental.canvas(), &cache);
+            let before = raster_pixels(&mut incremental, size);
+
+            let work = cache
+                .apply_delta(&super::super::active_stroke::ActiveStrokeDelta {
+                    gesture_id: 91,
+                    revision: 6,
+                    from_sample: 5,
+                    samples: vec![points[5]],
+                    style,
+                    full_resync: false,
+                })
+                .unwrap();
+            assert!(!work.full_redraw, "追加尾点应走局部 replay");
+            let dirty = cache
+                .replay_regions()
+                .iter()
+                .filter_map(|replay| clipped_replay_pixels(incremental.canvas(), replay.bounds()))
+                .collect::<Vec<_>>();
+            assert!(replay_active_stroke_regions(incremental.canvas(), &cache));
+            let actual = raster_pixels(&mut incremental, size);
+            assert_pixels_outside_dirty_unchanged(&before, &actual, size, &dirty);
+
+            oracle.canvas().clear(Color::TRANSPARENT);
+            draw_active_cache_full(oracle.canvas(), &cache);
+            assert_eq!(actual, raster_pixels(&mut oracle, size), "{style:?}");
+        }
+    }
+
+    /// 验证四档固定/自然笔锋在多种急转和重复点序列中逐 revision 像素相同。
+    #[test]
+    fn dirty_region_raster_matches_full_fixed_and_natural_previews() {
+        let paths: [&[CanvasPoint]; 3] = [
+            &[
+                CanvasPoint::new(16.0, 64.0),
+                CanvasPoint::new(28.0, 48.0),
+                CanvasPoint::new(44.0, 72.0),
+                CanvasPoint::new(64.0, 40.0),
+                CanvasPoint::new(88.0, 76.0),
+                CanvasPoint::new(116.0, 52.0),
+                CanvasPoint::new(152.0, 68.0),
+            ],
+            &[
+                CanvasPoint::new(20.0, 20.0),
+                CanvasPoint::new(160.0, 20.0),
+                CanvasPoint::new(24.0, 24.0),
+                CanvasPoint::new(156.0, 104.0),
+                CanvasPoint::new(32.0, 100.0),
+            ],
+            &[
+                CanvasPoint::new(24.0, 64.0),
+                CanvasPoint::new(48.0, 64.0),
+                CanvasPoint::new(48.0, 64.0),
+                CanvasPoint::new(72.0, 32.0),
+                CanvasPoint::new(72.0, 96.0),
+                CanvasPoint::new(120.0, 64.0),
+            ],
+        ];
+        for points in paths {
+            for width in [PenWidth::Px4, PenWidth::Px6, PenWidth::Px8, PenWidth::Px16] {
+                assert_incremental_raster_matches_full(
+                    ActiveStrokeStyle::Fixed {
+                        color: InkColor::Red,
+                        width,
+                    },
+                    points,
+                );
+                assert_incremental_raster_matches_full(
+                    ActiveStrokeStyle::Natural {
+                        color: InkColor::Red,
+                        body_width: width,
+                    },
+                    points,
+                );
+            }
+        }
+    }
 
     /// 创建不依赖 GPU 的最小墨迹缓存，供状态机回归测试使用。
     fn raster_cache(logical_size: [u32; 2]) -> InkRenderCache {

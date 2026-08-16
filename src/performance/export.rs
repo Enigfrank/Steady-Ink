@@ -101,6 +101,14 @@ impl PerformanceExport {
                 region_rebuild_count: snapshot.region_rebuild_count(),
                 full_rebuild_count: snapshot.full_rebuild_count(),
                 slow_frame_count: snapshot.slow_frame_count(),
+                generated_frames: snapshot.generated_frames(),
+                submitted_frames: snapshot.submitted_frames(),
+                presented_frames: snapshot.presented_frames(),
+                discarded_frames: snapshot.discarded_frames(),
+                mailbox_replacements: snapshot.mailbox_replacements(),
+                active_samples: snapshot.active_samples(),
+                incremental_primitives: snapshot.incremental_primitives(),
+                full_active_fallbacks: snapshot.full_active_fallbacks(),
             },
             frame_times_ms: snapshot.frame_times_ms().to_vec(),
         }
@@ -133,6 +141,14 @@ struct ExportCounters {
     region_rebuild_count: u64,
     full_rebuild_count: u64,
     slow_frame_count: u64,
+    generated_frames: u64,
+    submitted_frames: u64,
+    presented_frames: u64,
+    discarded_frames: u64,
+    mailbox_replacements: u64,
+    active_samples: u64,
+    incremental_primitives: u64,
+    full_active_fallbacks: u64,
 }
 
 #[cfg(test)]
@@ -141,7 +157,8 @@ mod tests {
 
     use super::*;
     use crate::performance::{
-        PERFORMANCE_SAMPLE_CAPACITY, PerformanceFrameSample, PerformanceInkSync, PerformanceMonitor,
+        PERFORMANCE_SAMPLE_CAPACITY, PerformanceFrameSample, PerformanceInkSync,
+        PerformanceMonitor, RenderDiagnostics,
     };
 
     /// 验证导出 JSON 的 schema、内存语义和有界历史可被结构化解析。
@@ -171,7 +188,19 @@ mod tests {
                 .as_nanos()
         ));
 
-        let path = export_snapshot(&directory, monitor.snapshot()).expect("性能快照应能导出");
+        let snapshot = monitor
+            .snapshot()
+            .with_render_diagnostics(RenderDiagnostics {
+                generated: 9,
+                submitted: 8,
+                presented: 7,
+                discarded: 1,
+                mailbox_replacements: 2,
+                active_samples: 42,
+                incremental_primitives: 23,
+                full_active_fallbacks: 3,
+            });
+        let path = export_snapshot(&directory, snapshot).expect("性能快照应能导出");
         let json: serde_json::Value =
             serde_json::from_slice(&fs::read(&path).expect("导出文件应能读取"))
                 .expect("导出文件应是有效 JSON");
@@ -179,6 +208,14 @@ mod tests {
         assert_eq!(json["schema_version"], 1);
         assert_eq!(json["memory_scope"], MEMORY_SCOPE);
         assert_eq!(json["metrics"]["managed_gpu_bytes"], 1_024);
+        assert_eq!(json["counters"]["generated_frames"], 9);
+        assert_eq!(json["counters"]["submitted_frames"], 8);
+        assert_eq!(json["counters"]["presented_frames"], 7);
+        assert_eq!(json["counters"]["discarded_frames"], 1);
+        assert_eq!(json["counters"]["mailbox_replacements"], 2);
+        assert_eq!(json["counters"]["active_samples"], 42);
+        assert_eq!(json["counters"]["incremental_primitives"], 23);
+        assert_eq!(json["counters"]["full_active_fallbacks"], 3);
         assert_eq!(
             json["frame_times_ms"]
                 .as_array()

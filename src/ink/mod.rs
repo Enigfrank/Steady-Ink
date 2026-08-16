@@ -1,3 +1,4 @@
+mod active_stroke;
 mod batch_drawer;
 mod document;
 mod model;
@@ -7,6 +8,7 @@ pub(crate) mod renderer;
 mod spatial_index;
 mod stroke_geometry;
 
+pub(crate) use active_stroke::{ActiveStrokeDelta, ActiveStrokeRenderCache, ActiveStrokeStyle};
 pub(crate) use batch_drawer::BatchDrawer;
 pub use document::InkDocument;
 pub use model::{
@@ -15,6 +17,9 @@ pub use model::{
 };
 pub(crate) use natural_taper::NaturalStrokeBuilder;
 pub use page_store::{PageInkEntry, PageInkStore, PageKey};
-pub(crate) use renderer::draw_active_preview;
 pub use renderer::{ActiveInkPreview, InkRenderCache, InkSyncKind, OwnedActiveInkPreview};
+pub(crate) use renderer::{
+    create_gpu_surface, draw_active_filtered_preview, draw_active_preview,
+    replay_active_stroke_regions,
+};
 pub(crate) use spatial_index::InkSpatialIndex;

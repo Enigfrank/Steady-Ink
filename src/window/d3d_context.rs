@@ -3,7 +3,7 @@ use std::{cell::Cell, sync::Arc};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows::{
     Win32::{
-        Foundation::HWND,
+        Foundation::{HWND, POINT},
         Graphics::{
             Direct3D::D3D_FEATURE_LEVEL_11_0,
             Direct3D12::{D3D12CreateDevice, ID3D12CommandQueue, ID3D12Device},
@@ -20,6 +20,7 @@ use windows::{
                 DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIAdapter1, IDXGIDevice, IDXGIFactory4,
                 IDXGIOutput, IDXGISwapChain3,
             },
+            Gdi::ClientToScreen,
         },
         UI::WindowsAndMessaging::{
             GWL_EXSTYLE, GetWindowLongW, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
@@ -574,16 +575,51 @@ impl D3DWindowContext {
         }
     }
 
-    /// 根据窗口中心吸附到主显示器左侧或右侧，并返回新的边缘。
-    pub fn finish_idle_window_drag(&self, view: IdleWindowView) -> Result<DockSide, AppError> {
-        let window_position = self
-            .window
+    /// 将 winit 客户区物理坐标转换为当前 HWND 的屏幕物理坐标。
+    pub(crate) fn client_to_screen(
+        &self,
+        position: PhysicalPosition<f64>,
+    ) -> Result<PhysicalPosition<i32>, AppError> {
+        let mut point = POINT {
+            x: position.x.round() as i32,
+            y: position.y.round() as i32,
+        };
+        // SAFETY: HWND 属于当前事件线程，POINT 指向本栈帧内的可写坐标。
+        if !unsafe { ClientToScreen(self.render_target.hwnd(), &mut point) }.as_bool() {
+            return Err(AppError::Graphics(
+                "无法把工具栏触摸客户区坐标转换为屏幕坐标".to_owned(),
+            ));
+        }
+        Ok(PhysicalPosition::new(point.x, point.y))
+    }
+
+    /// 返回手动触摸拖动开始时窗口的物理 outer 位置。
+    pub(crate) fn outer_position(&self) -> Result<PhysicalPosition<i32>, AppError> {
+        self.window
             .outer_position()
-            .unwrap_or_else(|_| self.idle_placement(view).position);
+            .map_err(|error| AppError::Graphics(format!("无法读取当前窗口位置: {error}")))
+    }
+
+    /// 把非批注窗口移动到手动触摸状态机计算出的物理 outer 位置。
+    pub(crate) fn set_outer_position(&self, position: PhysicalPosition<i32>) {
+        self.window.set_outer_position(position);
+    }
+
+    /// 根据窗口中心吸附到主显示器左侧或右侧，并返回新的边缘。
+    pub fn finish_idle_window_drag(
+        &self,
+        view: IdleWindowView,
+        manual_touch_position: Option<PhysicalPosition<i32>>,
+    ) -> Result<DockSide, AppError> {
+        let window_position = manual_touch_position.unwrap_or_else(|| {
+            self.window
+                .outer_position()
+                .unwrap_or_else(|_| self.idle_placement(view).position)
+        });
         let window_size = self.window.inner_size();
-        let monitor_center =
-            self.geometry.annotation_position.x + self.geometry.annotation_size.width as i32 / 2;
-        let window_center = window_position.x + window_size.width as i32 / 2;
+        let monitor_center = i64::from(self.geometry.annotation_position.x)
+            + i64::from(self.geometry.annotation_size.width) / 2;
+        let window_center = i64::from(window_position.x) + i64::from(window_size.width) / 2;
         let side = if window_center < monitor_center {
             DockSide::Left
         } else {

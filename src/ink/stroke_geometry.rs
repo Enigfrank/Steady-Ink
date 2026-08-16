@@ -209,6 +209,25 @@ pub(crate) fn for_each_open_bezier_segment(
     true
 }
 
+/// 返回开放曲线指定索引尚未应用全局 bounds clamp 的 Catmull-Rom 段。
+pub(crate) fn open_bezier_segment_unclamped_at(
+    filtered_points: &[CanvasPoint],
+    index: usize,
+) -> Option<CubicBezierSegment> {
+    if index + 1 >= filtered_points.len() {
+        return None;
+    }
+    let previous = if index == 0 {
+        filtered_points[index]
+    } else {
+        filtered_points[index - 1]
+    };
+    let start = filtered_points[index];
+    let end = filtered_points[index + 1];
+    let next = filtered_points.get(index + 2).copied().unwrap_or(end);
+    Some(catmull_rom_segment_unclamped(previous, start, end, next))
+}
+
 /// 遍历已经滤波的闭合轮廓对应的 Catmull-Rom 贝塞尔段。
 pub(crate) fn for_each_closed_bezier_segment(
     filtered_points: &[CanvasPoint],
@@ -238,20 +257,40 @@ fn catmull_rom_segment(
     next: CanvasPoint,
     bounds: PointBounds,
 ) -> CubicBezierSegment {
-    let control1 = bounds.clamp(CanvasPoint::new(
+    clamp_cubic_segment(
+        catmull_rom_segment_unclamped(previous, start, end, next),
+        bounds,
+    )
+}
+
+/// 把一段 Catmull-Rom 相邻点转换为尚未应用全局 bounds 的三次贝塞尔段。
+fn catmull_rom_segment_unclamped(
+    previous: CanvasPoint,
+    start: CanvasPoint,
+    end: CanvasPoint,
+    next: CanvasPoint,
+) -> CubicBezierSegment {
+    let control1 = CanvasPoint::new(
         start.x + (end.x - previous.x) * CATMULL_ROM_CONTROL_SCALE,
         start.y + (end.y - previous.y) * CATMULL_ROM_CONTROL_SCALE,
-    ));
-    let control2 = bounds.clamp(CanvasPoint::new(
+    );
+    let control2 = CanvasPoint::new(
         end.x - (next.x - start.x) * CATMULL_ROM_CONTROL_SCALE,
         end.y - (next.y - start.y) * CATMULL_ROM_CONTROL_SCALE,
-    ));
+    );
     CubicBezierSegment {
         start,
         control1,
         control2,
         end,
     }
+}
+
+/// 仅限制一段曲线的控制点，端点已经来自全局 bounds 内的滤波序列。
+fn clamp_cubic_segment(mut segment: CubicBezierSegment, bounds: PointBounds) -> CubicBezierSegment {
+    segment.control1 = bounds.clamp(segment.control1);
+    segment.control2 = bounds.clamp(segment.control2);
+    segment
 }
 
 /// 把一个贝塞尔段追加到 Skia 路径。

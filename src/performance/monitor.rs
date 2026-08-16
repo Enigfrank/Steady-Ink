@@ -8,6 +8,19 @@ pub const SLOW_FRAME_THRESHOLD: Duration = Duration::from_millis(33);
 const ACTIVE_INTERVAL_LIMIT: Duration = Duration::from_secs(1);
 const BYTES_PER_MEBIBYTE: f32 = 1024.0 * 1024.0;
 
+/// 事件线程与渲染线程共同维护的背压和活动增量诊断。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RenderDiagnostics {
+    pub generated: u64,
+    pub submitted: u64,
+    pub presented: u64,
+    pub discarded: u64,
+    pub mailbox_replacements: u64,
+    pub active_samples: u64,
+    pub incremental_primitives: u64,
+    pub full_active_fallbacks: u64,
+}
+
 /// 一帧墨迹同步对持久缓存执行的工作类型。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PerformanceInkSync {
@@ -52,6 +65,7 @@ pub struct PerformanceSnapshot {
     full_rebuild_count: u64,
     slow_frame_count: u64,
     managed_gpu_bytes: u64,
+    render_diagnostics: RenderDiagnostics,
     frame_history_ms: [f32; PERFORMANCE_SAMPLE_CAPACITY],
     frame_history_len: usize,
 }
@@ -79,6 +93,7 @@ impl Default for PerformanceSnapshot {
             full_rebuild_count: 0,
             slow_frame_count: 0,
             managed_gpu_bytes: 0,
+            render_diagnostics: RenderDiagnostics::default(),
             frame_history_ms: [0.0; PERFORMANCE_SAMPLE_CAPACITY],
             frame_history_len: 0,
         }
@@ -179,6 +194,52 @@ impl PerformanceSnapshot {
     /// 返回应用自有 GPU 渲染资源的保守估算字节数。
     pub const fn managed_gpu_bytes(self) -> u64 {
         self.managed_gpu_bytes
+    }
+
+    /// 返回候选画面构造总数。
+    pub const fn generated_frames(self) -> u64 {
+        self.render_diagnostics.generated
+    }
+
+    /// 返回被渲染邮箱接受的普通画面总数。
+    pub const fn submitted_frames(self) -> u64 {
+        self.render_diagnostics.submitted
+    }
+
+    /// 返回成功完成两块目标呈现的画面总数。
+    pub const fn presented_frames(self) -> u64 {
+        self.render_diagnostics.presented
+    }
+
+    /// 返回获得 Discarded 终态的画面总数。
+    pub const fn discarded_frames(self) -> u64 {
+        self.render_diagnostics.discarded
+    }
+
+    /// 返回 latest-frame mailbox 发生替换的累计次数。
+    pub const fn mailbox_replacements(self) -> u64 {
+        self.render_diagnostics.mailbox_replacements
+    }
+
+    /// 返回最近候选画面携带的活动原始采样数。
+    pub const fn active_samples(self) -> u64 {
+        self.render_diagnostics.active_samples
+    }
+
+    /// 返回本次会话累计重算的活动几何 primitive 数。
+    pub const fn incremental_primitives(self) -> u64 {
+        self.render_diagnostics.incremental_primitives
+    }
+
+    /// 返回真实执行的活动几何 full fallback 总数。
+    pub const fn full_active_fallbacks(self) -> u64 {
+        self.render_diagnostics.full_active_fallbacks
+    }
+
+    /// 合并不参与采样调度的 render-side 诊断投影。
+    pub(crate) const fn with_render_diagnostics(mut self, diagnostics: RenderDiagnostics) -> Self {
+        self.render_diagnostics = diagnostics;
+        self
     }
 
     /// 返回应用自有 GPU 渲染资源估算，单位为 MiB。
@@ -565,5 +626,31 @@ mod tests {
 
         assert!(monitor.record_frame(sample(Instant::now(), 0, 33)));
         assert_eq!(monitor.snapshot().slow_frame_count(), 1);
+    }
+
+    /// 验证 render-side 背压与活动增量诊断完整投影到现有性能快照。
+    #[test]
+    fn render_diagnostics_are_projected_into_snapshot() {
+        let diagnostics = RenderDiagnostics {
+            generated: 11,
+            submitted: 10,
+            presented: 8,
+            discarded: 2,
+            mailbox_replacements: 1,
+            active_samples: 99,
+            incremental_primitives: 27,
+            full_active_fallbacks: 3,
+        };
+
+        let snapshot = PerformanceSnapshot::default().with_render_diagnostics(diagnostics);
+        assert_eq!(snapshot.generated_frames(), 11);
+        assert_eq!(snapshot.submitted_frames(), 10);
+        assert_eq!(snapshot.presented_frames(), 8);
+        assert_eq!(snapshot.discarded_frames(), 2);
+        assert_eq!(snapshot.mailbox_replacements(), 1);
+        assert_eq!(snapshot.active_samples(), 99);
+        assert_eq!(snapshot.incremental_primitives(), 27);
+        assert_eq!(snapshot.full_active_fallbacks(), 3);
+        assert_eq!(snapshot.frame_count(), 0);
     }
 }

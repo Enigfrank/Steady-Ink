@@ -2,7 +2,10 @@ use super::egui_skia::{EguiFrame, EguiSkiaPainter};
 use crate::{
     error::AppError,
     ink::{
-        ActiveInkPreview, InkBounds, InkDocument, InkRenderCache, InkSyncKind, draw_active_preview,
+        ActiveInkPreview, ActiveStrokeDelta, ActiveStrokeRenderCache, ActiveStrokeStyle,
+        EraserSize, InkBounds, InkDocument, InkRenderCache, InkSyncKind, InkTool,
+        create_gpu_surface, draw_active_filtered_preview, draw_active_preview,
+        replay_active_stroke_regions,
     },
     window::{D3DRenderContext, SWAP_CHAIN_BUFFER_COUNT},
 };
@@ -33,6 +36,17 @@ pub struct Compositor {
     ink_rendering_error: Option<String>,
     window_surfaces: Vec<SwapChainSurface>,
     gr_context: DirectContext,
+    active_stroke_cache: ActiveStrokeRenderCache,
+    active_surface: Option<Surface>,
+    active_surface_size: [u32; 2],
+    active_resync_requested: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActiveSurfacePlan {
+    Unavailable,
+    Reuse,
+    Recreate([u32; 2]),
 }
 
 /// 仅为独立放映控件窗口合成透明背景和 egui，不创建墨迹缓存。
@@ -76,7 +90,7 @@ impl UiCompositor {
     }
 
     /// 清空透明背景并把一帧 egui 绘制到控件窗口 back buffer。
-    pub fn paint(
+    pub(crate) fn paint(
         &mut self,
         window_context: &D3DRenderContext,
         egui_frame: EguiFrame,
@@ -131,6 +145,10 @@ impl Compositor {
                 ink_rendering_error: None,
                 window_surfaces,
                 gr_context,
+                active_stroke_cache: ActiveStrokeRenderCache::default(),
+                active_surface: None,
+                active_surface_size: size,
+                active_resync_requested: false,
             },
             None,
         ))
@@ -169,6 +187,9 @@ impl Compositor {
             self.ink_rendering_error = None;
             self.gr_context.release_resources_and_abandon();
             self.gr_context = replacement_context;
+            self.active_surface = None;
+            self.active_surface_size = size;
+            self.lose_active_stroke_cache();
             self.reset_graphics_on_next_resize = false;
             return Ok(());
         }
@@ -177,6 +198,9 @@ impl Compositor {
         window_context.recreate_swap_chain(physical_size)?;
         self.window_surfaces = create_window_surfaces(&mut self.gr_context, window_context, size)?;
         self.ink_cache = InkRenderCache::new(&mut self.gr_context, size)?;
+        self.active_surface = None;
+        self.active_surface_size = size;
+        self.lose_active_stroke_cache();
         self.ink_rendering_error = None;
         Ok(())
     }
@@ -193,6 +217,9 @@ impl Compositor {
         }
 
         self.ink_cache = InkRenderCache::new(&mut self.gr_context, [1, 1])?;
+        self.active_surface = None;
+        self.active_surface_size = [1, 1];
+        self.lose_active_stroke_cache();
         self.gr_context.flush_and_submit();
         self.gr_context
             .purge_unlocked_resources(gpu::PurgeResourceOptions::AllResources);
@@ -215,26 +242,38 @@ impl Compositor {
         let offscreen_bytes = self
             .ink_cache
             .estimated_bytes()
+            .saturating_add(estimate_active_surface_bytes(
+                self.active_surface.is_some(),
+                self.active_surface_size,
+            ))
             .saturating_add(self.egui.estimated_texture_bytes());
         swap_chain_bytes.saturating_add(u64::try_from(offscreen_bytes).unwrap_or(u64::MAX))
     }
 
     /// 完成透明清理、Skia 墨迹、egui、Skia submit 的一帧 D3D12 合成。
-    pub fn paint(
+    pub(crate) fn paint(
         &mut self,
         window_context: &D3DRenderContext,
         document: &InkDocument,
         active_preview: Option<ActiveInkPreview<'_>>,
+        active_stroke: Option<ActiveStrokeDelta>,
         egui_frame: EguiFrame,
     ) -> Result<InkSyncKind, AppError> {
         self.gr_context.reset(None);
         let ink_sync = self.ink_cache.sync(document);
 
+        self.update_active_stroke(
+            active_stroke.as_ref(),
+            window_context.swap_chain_size().into(),
+        )?;
         if let Some(preview) = active_preview {
             self.ink_cache.commit_deferred_erase_before_preview(preview);
+        } else if active_stroke.is_some() {
+            self.commit_deferred_erase_for_retained_preview();
         }
         let ink_image = self.ink_cache.snapshot(&mut self.gr_context);
 
+        let active_image = self.active_surface_image();
         let index = window_context.current_back_buffer_index();
         let surface_count = self.window_surfaces.len();
         let target = self.window_surfaces.get_mut(index).ok_or_else(|| {
@@ -247,6 +286,9 @@ impl Compositor {
         canvas.clear(Color::TRANSPARENT);
         canvas.draw_image(&ink_image, (0.0, 0.0), None);
         self.ink_cache.draw_deferred_erase(canvas);
+        if let Some(active_image) = active_image {
+            canvas.draw_image(&active_image, (0.0, 0.0), None);
+        }
         if let Some(preview) = active_preview {
             draw_active_preview(canvas, preview);
         }
@@ -265,6 +307,160 @@ impl Compositor {
     pub fn invalidate_ink_region(&mut self, bounds: InkBounds) {
         self.ink_cache.invalidate_region(bounds);
     }
+
+    /// 返回最近一次活动增量的采样、primitive 和 full fallback 工作量。
+    pub(crate) fn active_stroke_diagnostics(&self) -> (usize, usize, bool) {
+        let work = self.active_stroke_cache.last_work();
+        (
+            self.active_stroke_cache.sample_count(),
+            work.recomputed_primitives,
+            work.full_fallback,
+        )
+    }
+
+    /// 消费一次由 resize、设备重建或序列断裂产生的活动笔画重同步请求。
+    pub(crate) fn take_active_stroke_resync_requested(&mut self) -> bool {
+        std::mem::take(&mut self.active_resync_requested)
+    }
+
+    /// 应用增量几何并在透明 retained surface 中保留最后一次活动预览。
+    fn update_active_stroke(
+        &mut self,
+        delta: Option<&ActiveStrokeDelta>,
+        target_size: [u32; 2],
+    ) -> Result<(), AppError> {
+        let Some(delta) = delta else {
+            self.active_stroke_cache.clear();
+            self.active_surface = None;
+            self.active_resync_requested = false;
+            return Ok(());
+        };
+        if !self.ensure_active_surface(target_size)? {
+            self.active_resync_requested = true;
+            return Ok(());
+        }
+        let work = match self.active_stroke_cache.apply_delta(delta) {
+            Ok(work) => work,
+            Err(_) => {
+                self.active_resync_requested = true;
+                return Ok(());
+            }
+        };
+        if delta.from_sample == 0 {
+            self.active_resync_requested = false;
+        }
+        if work.appended_samples == 0 && !work.full_redraw {
+            return Ok(());
+        }
+        let surface = self
+            .active_surface
+            .as_mut()
+            .expect("批注活动笔画必须拥有 retained surface");
+        if work.full_redraw {
+            surface.canvas().clear(Color::TRANSPARENT);
+            draw_cached_active_stroke(surface.canvas(), &self.active_stroke_cache);
+        } else if !replay_active_stroke_regions(surface.canvas(), &self.active_stroke_cache) {
+            surface.canvas().clear(Color::TRANSPARENT);
+            draw_cached_active_stroke(surface.canvas(), &self.active_stroke_cache);
+            self.active_stroke_cache.record_render_full_fallback();
+        }
+        Ok(())
+    }
+
+    /// 在固定宽或自然笔锋活动预览开始前固化上一笔待定擦除。
+    fn commit_deferred_erase_for_retained_preview(&mut self) {
+        let Some(style) = self.active_stroke_cache.style() else {
+            return;
+        };
+        let (fixed, natural) = self.active_stroke_cache.geometry();
+        match style {
+            ActiveStrokeStyle::Fixed { color, width } if !fixed.is_empty() => {
+                self.ink_cache
+                    .commit_deferred_erase_before_preview(ActiveInkPreview::Tool {
+                        points: fixed,
+                        tool: InkTool::Pen,
+                        color,
+                        pen_width: width,
+                        eraser_size: EraserSize::default(),
+                    });
+            }
+            ActiveStrokeStyle::Natural { color, .. } if !natural.is_empty() => {
+                self.ink_cache.commit_deferred_erase_before_preview(
+                    ActiveInkPreview::VariableTool {
+                        points: natural,
+                        color,
+                        eraser_size: EraserSize::default(),
+                    },
+                );
+            }
+            _ => {}
+        }
+    }
+
+    /// 提交活动 surface 的写入并取得当前透明图像快照。
+    fn active_surface_image(&mut self) -> Option<skia_safe::Image> {
+        let surface = self.active_surface.as_mut()?;
+        self.gr_context.flush_and_submit_surface(surface, None);
+        Some(surface.image_snapshot())
+    }
+
+    /// 首次活动笔画到达时按当前批注 swap-chain 容量延迟创建透明 surface。
+    fn ensure_active_surface(&mut self, target_size: [u32; 2]) -> Result<bool, AppError> {
+        let plan = active_surface_plan(
+            self.annotation_resources_enabled,
+            self.active_surface.is_some(),
+            self.active_surface_size,
+            target_size,
+        );
+        let size = match plan {
+            ActiveSurfacePlan::Unavailable => return Ok(false),
+            ActiveSurfacePlan::Reuse => return Ok(true),
+            ActiveSurfacePlan::Recreate(size) => size,
+        };
+        self.active_surface = None;
+        self.active_surface_size = size;
+        self.lose_active_stroke_cache();
+        let mut surface = create_gpu_surface(&mut self.gr_context, size)?;
+        surface.canvas().clear(Color::TRANSPARENT);
+        self.active_surface = Some(surface);
+        Ok(true)
+    }
+
+    /// 丢失 render-side retained 状态时保留一次显式 sample-zero 重同步请求。
+    fn lose_active_stroke_cache(&mut self) {
+        self.active_resync_requested |= self.active_stroke_cache.sample_count() > 0;
+        self.active_stroke_cache.clear();
+    }
+}
+
+/// 使用现有滤波、宽度、Skia Paint AA 和路径 helper 完整绘制 retained 活动几何。
+fn draw_cached_active_stroke(canvas: &skia_safe::Canvas, cache: &ActiveStrokeRenderCache) {
+    let (fixed, natural) = cache.geometry();
+    match cache.style() {
+        Some(ActiveStrokeStyle::Fixed { color, width }) if !fixed.is_empty() => {
+            draw_active_filtered_preview(
+                canvas,
+                ActiveInkPreview::Tool {
+                    points: fixed,
+                    tool: InkTool::Pen,
+                    color,
+                    pen_width: width,
+                    eraser_size: EraserSize::default(),
+                },
+            );
+        }
+        Some(ActiveStrokeStyle::Natural { color, .. }) if !natural.is_empty() => {
+            draw_active_filtered_preview(
+                canvas,
+                ActiveInkPreview::VariableTool {
+                    points: natural,
+                    color,
+                    eraser_size: EraserSize::default(),
+                },
+            );
+        }
+        _ => {}
+    }
 }
 
 /// 返回现有批注 swap chain 是否足以覆盖新的可见客户区。
@@ -276,6 +472,49 @@ fn can_reuse_annotation_capacity(
     annotation_resources_enabled
         && requested.width <= current.width
         && requested.height <= current.height
+}
+
+/// 估算透明活动 surface 的颜色缓冲字节数。
+fn estimate_surface_bytes(size: [u32; 2]) -> usize {
+    (size[0] as usize)
+        .saturating_mul(size[1] as usize)
+        .saturating_mul(4)
+}
+
+/// 只有批注资源启用后才允许按当前窗口容量创建活动 surface。
+fn active_surface_allocation_size(
+    annotation_resources_enabled: bool,
+    size: [u32; 2],
+) -> Option<[u32; 2]> {
+    annotation_resources_enabled.then_some(size)
+}
+
+/// 依据当前 back buffer 容量决定活动层是否可用、可复用或必须重建。
+fn active_surface_plan(
+    annotation_resources_enabled: bool,
+    allocated: bool,
+    retained_size: [u32; 2],
+    target_size: [u32; 2],
+) -> ActiveSurfacePlan {
+    let Some(target_size) =
+        active_surface_allocation_size(annotation_resources_enabled, target_size)
+    else {
+        return ActiveSurfacePlan::Unavailable;
+    };
+    if allocated && retained_size == target_size {
+        ActiveSurfacePlan::Reuse
+    } else {
+        ActiveSurfacePlan::Recreate(target_size)
+    }
+}
+
+/// 只统计实际已分配的活动 surface，空闲占位状态保持零额外驻留。
+fn estimate_active_surface_bytes(allocated: bool, size: [u32; 2]) -> usize {
+    if allocated {
+        estimate_surface_bytes(size)
+    } else {
+        0
+    }
 }
 
 /// 从窗口当前 D3D12 设备创建 Skia DirectContext。
@@ -360,5 +599,39 @@ mod tests {
             current,
             winit::dpi::PhysicalSize::new(1600, 900),
         ));
+    }
+
+    /// 验证 idle 不创建活动 surface，批注启用后才使用当前窗口容量。
+    #[test]
+    fn active_surface_allocation_requires_annotation_resources() {
+        let size = [3840, 2160];
+
+        assert_eq!(active_surface_allocation_size(false, size), None);
+        assert_eq!(active_surface_allocation_size(true, size), Some(size));
+        assert_eq!(estimate_active_surface_bytes(false, size), 0);
+        assert_eq!(estimate_active_surface_bytes(true, size), 3840 * 2160 * 4);
+    }
+
+    /// 验证活动层不会复用资源释放阶段留下的 1x1 尺寸，并始终覆盖当前 back buffer。
+    #[test]
+    fn active_surface_plan_rebuilds_stale_surface_at_back_buffer_size() {
+        let target_size = [3840, 2160];
+
+        assert_eq!(
+            active_surface_plan(true, false, [1, 1], target_size),
+            ActiveSurfacePlan::Recreate(target_size)
+        );
+        assert_eq!(
+            active_surface_plan(true, true, [1, 1], target_size),
+            ActiveSurfacePlan::Recreate(target_size)
+        );
+        assert_eq!(
+            active_surface_plan(true, true, target_size, target_size),
+            ActiveSurfacePlan::Reuse
+        );
+        assert_eq!(
+            active_surface_plan(false, false, [1, 1], target_size),
+            ActiveSurfacePlan::Unavailable
+        );
     }
 }

@@ -3,7 +3,7 @@ use std::{
     ffi::c_void,
     sync::{
         Arc,
-        atomic::{AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -49,6 +49,22 @@ const MIN_CONTACT_RADIUS: f32 = 8.0;
 const MAX_TOUCH_HISTORY_ITEMS: usize = 4_096;
 const MAX_WM_TOUCH_INPUTS: usize = 256;
 const DEFAULT_WINDOWS_DPI: f32 = 96.0;
+
+/// 在运行时模式状态与原生消息 hook 之间同步启发式手掌接管门。
+#[derive(Clone, Default)]
+pub struct SharedCanvasPalmCapture(Arc<AtomicBool>);
+
+impl SharedCanvasPalmCapture {
+    /// 原子更新当前画布是否允许启发式手掌接管，并返回状态是否变化。
+    pub fn store(&self, enabled: bool) -> bool {
+        self.0.swap(enabled, Ordering::AcqRel) != enabled
+    }
+
+    /// 读取当前画布启发式手掌接管门。
+    fn load(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
 
 /// 在原生消息 hook 与应用设置之间同步手掌尺寸预设。
 #[derive(Clone)]
@@ -224,15 +240,22 @@ pub struct WindowsPointerTracker {
     touch_history: Vec<POINTER_TOUCH_INFO>,
     wm_touch_inputs: Vec<TOUCHINPUT>,
     wm_touch_updates: Vec<WmTouchPalmUpdate>,
+    wm_touch_read_failed: bool,
+    wm_touch_contacts: HashMap<u32, WmTouchContact>,
+    wm_touch_candidate_ids: HashSet<u32>,
+    wm_touch_owned_ids: HashSet<u32>,
+    wm_touch_passthrough_ids: HashSet<u32>,
     wm_touch_palms: HashMap<u32, ContactGeometry>,
     clock_start: Instant,
     qpc_frequency: Option<f64>,
     pen_time_sources: HashMap<u32, PenTimeState>,
     touches: HashMap<u32, TouchContact>,
+    touch_passthrough_ids: HashSet<u32>,
     candidate_ids: HashSet<u32>,
     palm_ids: HashSet<u32>,
     palm_started: bool,
     palm_size_preset: SharedPalmSizePreset,
+    canvas_palm_capture: SharedCanvasPalmCapture,
 }
 
 impl Default for WindowsPointerTracker {
@@ -245,15 +268,22 @@ impl Default for WindowsPointerTracker {
             touch_history: Vec::new(),
             wm_touch_inputs: Vec::new(),
             wm_touch_updates: Vec::new(),
+            wm_touch_read_failed: false,
+            wm_touch_contacts: HashMap::new(),
+            wm_touch_candidate_ids: HashSet::new(),
+            wm_touch_owned_ids: HashSet::new(),
+            wm_touch_passthrough_ids: HashSet::new(),
             wm_touch_palms: HashMap::new(),
             clock_start: Instant::now(),
             qpc_frequency: query_qpc_frequency(),
             pen_time_sources: HashMap::new(),
             touches: HashMap::new(),
+            touch_passthrough_ids: HashSet::new(),
             candidate_ids: HashSet::new(),
             palm_ids: HashSet::new(),
             palm_started: false,
             palm_size_preset: SharedPalmSizePreset::default(),
+            canvas_palm_capture: SharedCanvasPalmCapture::default(),
         }
     }
 }
@@ -300,6 +330,18 @@ impl WindowsPointerTracker {
     pub fn with_palm_size_preset(palm_size_preset: SharedPalmSizePreset) -> Self {
         Self {
             palm_size_preset,
+            ..Self::default()
+        }
+    }
+
+    /// 创建同时使用共享尺寸预设和画布启发式接管门的原生 Pointer 跟踪器。
+    pub fn with_palm_configuration(
+        palm_size_preset: SharedPalmSizePreset,
+        canvas_palm_capture: SharedCanvasPalmCapture,
+    ) -> Self {
+        Self {
+            palm_size_preset,
+            canvas_palm_capture,
             ..Self::default()
         }
     }
@@ -353,10 +395,11 @@ impl WindowsPointerTracker {
         }
     }
 
-    /// 读取 winit 注册的 WM_TOUCH，并只接管 Windows 明确标记的手掌接触。
+    /// 读取 winit 注册的 WM_TOUCH，并按批次决定由应用或 winit 单独拥有句柄。
     fn capture_wm_touch_message(&mut self, message: &MSG) -> Option<WindowsPointerDispatch> {
         let input_count = message.wParam.0 & 0xffff;
         if input_count == 0 || input_count > MAX_WM_TOUCH_INPUTS {
+            tracing::debug!(input_count, "WM_TOUCH 输入数量无效，交回 winit");
             return None;
         }
 
@@ -373,50 +416,307 @@ impl WindowsPointerTracker {
         }
         .is_err()
         {
+            if !self.wm_touch_read_failed {
+                tracing::debug!(input_count, "读取 WM_TOUCH 失败，句柄交回 winit");
+                self.wm_touch_read_failed = true;
+            }
             return None;
         }
+        if self.wm_touch_read_failed {
+            tracing::debug!(input_count, "WM_TOUCH 读取已恢复");
+            self.wm_touch_read_failed = false;
+        }
 
+        let now = Instant::now();
+        let dpi_scale = window_dpi_scale(message.hwnd);
+        let gate_enabled = self.canvas_palm_capture.load();
+        let thresholds = PalmThresholds::for_preset(self.palm_size_preset.load(), dpi_scale);
         self.wm_touch_updates.clear();
-        let mut claimed = false;
         for input in &self.wm_touch_inputs {
-            let tracked = self.wm_touch_palms.contains_key(&input.dwID);
-            if !wm_touch_input_is_claimed(input, tracked) {
-                continue;
-            }
-            claimed = true;
+            let geometry = wm_touch_contact_geometry(input, message.hwnd);
+            let has_contact_area = input.dwMask.contains(TOUCHINPUTMASKF_CONTACTAREA);
             if input.dwFlags.contains(TOUCHEVENTF_DOWN)
                 || input.dwFlags.contains(TOUCHEVENTF_MOVE)
                 || input.dwFlags.contains(TOUCHEVENTF_UP)
             {
                 self.wm_touch_updates.push(WmTouchPalmUpdate {
                     id: input.dwID,
-                    geometry: wm_touch_contact_geometry(input, message.hwnd),
+                    geometry,
+                    measured_geometry: has_contact_area.then_some(geometry).flatten(),
+                    system_palm: input.dwFlags.contains(TOUCHEVENTF_PALM),
+                    started: input.dwFlags.contains(TOUCHEVENTF_DOWN),
                     ended: input.dwFlags.contains(TOUCHEVENTF_UP),
                 });
             }
+            if input.dwFlags.contains(TOUCHEVENTF_DOWN) {
+                tracing::debug!(
+                    source = "WM_TOUCH",
+                    pointer_id = input.dwID,
+                    flags = ?input.dwFlags,
+                    area_mask = has_contact_area,
+                    width = geometry.map(ContactGeometry::width),
+                    height = geometry.map(ContactGeometry::height),
+                    dpi_scale,
+                    gate_enabled,
+                    single_min_area = thresholds.single_min_area,
+                    single_min_major_axis = thresholds.single_min_major_axis,
+                    "观察到 WM_TOUCH 接触按下"
+                );
+            }
         }
-        if !claimed {
+
+        let updates = std::mem::take(&mut self.wm_touch_updates);
+        let outcome = self.process_wm_touch_updates(&updates, dpi_scale, now);
+        let has_transition = updates.iter().any(|update| update.started || update.ended);
+        self.wm_touch_updates = updates;
+        if !outcome.claimed {
+            if has_transition {
+                tracing::debug!(
+                    source = "WM_TOUCH",
+                    gate_enabled,
+                    swallow_winit = false,
+                    close_handle = false,
+                    "WM_TOUCH 批次保持由 winit 拥有"
+                );
+            }
             return None;
         }
 
-        let palm_event =
-            apply_wm_touch_palm_updates(&mut self.wm_touch_palms, &self.wm_touch_updates);
         // SAFETY: 返回 true 后 winit 不再分发该 WM_TOUCH，句柄所有权由本分支承担。
-        if let Err(error) = unsafe { CloseTouchInputHandle(touch_handle) } {
-            tracing::warn!(%error, "关闭已接管的 WM_TOUCH 输入句柄失败");
+        close_wm_touch_batch_if_claimed(outcome.claimed, || {
+            if let Err(error) = unsafe { CloseTouchInputHandle(touch_handle) } {
+                tracing::warn!(%error, "关闭已接管的 WM_TOUCH 输入句柄失败");
+            }
+        });
+        if has_transition {
+            tracing::debug!(
+                source = "WM_TOUCH",
+                gate_enabled,
+                swallow_winit = true,
+                close_handle = true,
+                "WM_TOUCH 批次已由应用接管"
+            );
         }
 
         let event = if self.pen_ids.is_empty() {
-            palm_event.map(|(phase, sample)| WindowsPointerEvent::PalmErase { phase, sample })
+            outcome.event
         } else {
             Some(WindowsPointerEvent::PalmSupport {
-                point: palm_event.map(|(_, sample)| sample.center),
+                point: outcome
+                    .event
+                    .as_ref()
+                    .and_then(WindowsPointerEvent::position),
             })
         };
         Some(WindowsPointerDispatch {
             event,
             swallow_winit: true,
         })
+    }
+
+    /// 应用一批已转换的 WM_TOUCH 接触并返回批次所有权和高层手掌语义。
+    fn process_wm_touch_updates(
+        &mut self,
+        updates: &[WmTouchPalmUpdate],
+        dpi_scale: f32,
+        now: Instant,
+    ) -> WmTouchBatchOutcome {
+        let gate_enabled = self.canvas_palm_capture.load();
+        let thresholds = PalmThresholds::for_preset(self.palm_size_preset.load(), dpi_scale);
+        let was_active = !self.wm_touch_palms.is_empty();
+        let session_owned = !self.wm_touch_owned_ids.is_empty();
+        let tracked_in_batch = updates
+            .iter()
+            .any(|update| self.wm_touch_owned_ids.contains(&update.id));
+        let system_palm_in_batch = updates.iter().any(|update| update.system_palm);
+        for update in updates
+            .iter()
+            .filter(|update| update.system_palm || self.wm_touch_owned_ids.contains(&update.id))
+        {
+            self.wm_touch_passthrough_ids.remove(&update.id);
+        }
+
+        for update in updates.iter().filter(|update| !update.ended) {
+            if update.started && update.measured_geometry.is_none() {
+                self.wm_touch_contacts.remove(&update.id);
+            }
+            if let Some(geometry) = update.measured_geometry {
+                match self.wm_touch_contacts.entry(update.id) {
+                    std::collections::hash_map::Entry::Occupied(mut entry) => {
+                        entry.get_mut().geometry = geometry;
+                        if update.started {
+                            entry.get_mut().started_at = now;
+                        }
+                    }
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(WmTouchContact {
+                            geometry,
+                            started_at: now,
+                        });
+                    }
+                }
+            }
+        }
+
+        let new_candidate = if gate_enabled {
+            refresh_wm_touch_candidates(
+                &self.wm_touch_contacts,
+                &mut self.wm_touch_candidate_ids,
+                &self.wm_touch_passthrough_ids,
+                thresholds,
+                dpi_scale,
+            )
+        } else {
+            false
+        };
+        let candidate_touched = updates
+            .iter()
+            .any(|update| self.wm_touch_candidate_ids.contains(&update.id));
+        let ending_candidates: HashSet<_> = updates
+            .iter()
+            .filter(|update| update.ended)
+            .map(|update| update.id)
+            .filter(|id| self.wm_touch_candidate_ids.contains(id))
+            .collect();
+        let candidate_confirmed = self
+            .wm_touch_candidate_ids
+            .iter()
+            .filter(|id| !ending_candidates.contains(id))
+            .filter_map(|id| self.wm_touch_contacts.get(id))
+            .map(|contact| contact.started_at)
+            .min()
+            .is_some_and(|started_at| now.duration_since(started_at) >= PALM_CONFIRMATION_DELAY);
+
+        for update in updates {
+            if !update.system_palm && !self.wm_touch_palms.contains_key(&update.id) {
+                continue;
+            }
+            let geometry = update
+                .measured_geometry
+                .or_else(|| {
+                    self.wm_touch_contacts
+                        .get(&update.id)
+                        .map(|contact| contact.geometry)
+                })
+                .or_else(|| update.system_palm.then_some(update.geometry).flatten())
+                .or_else(|| self.wm_touch_palms.get(&update.id).copied());
+            if let Some(geometry) = geometry {
+                self.wm_touch_palms.insert(update.id, geometry);
+            }
+        }
+
+        let promoted = candidate_confirmed
+            && self
+                .wm_touch_candidate_ids
+                .iter()
+                .any(|id| !ending_candidates.contains(id) && !self.wm_touch_palms.contains_key(id));
+        if candidate_confirmed {
+            for pointer_id in self
+                .wm_touch_candidate_ids
+                .iter()
+                .filter(|id| !ending_candidates.contains(id))
+            {
+                if let Some(contact) = self.wm_touch_contacts.get(pointer_id) {
+                    self.wm_touch_palms.insert(*pointer_id, contact.geometry);
+                }
+            }
+        }
+        if promoted {
+            tracing::debug!(
+                source = "WM_TOUCH",
+                gate_enabled,
+                candidate_count = self.wm_touch_candidate_ids.len(),
+                "WM_TOUCH 几何候选已提升为手掌"
+            );
+        }
+
+        let sample = wm_touch_palm_sample(&self.wm_touch_palms);
+        for update in updates.iter().filter(|update| update.ended) {
+            self.wm_touch_palms.remove(&update.id);
+        }
+        let is_active = !self.wm_touch_palms.is_empty();
+        let palm_event = match (was_active, is_active) {
+            (false, true) => sample.map(|sample| WindowsPointerEvent::PalmErase {
+                phase: PalmErasePhase::Begin,
+                sample,
+            }),
+            (true, true) if candidate_touched || system_palm_in_batch => {
+                sample.map(|sample| WindowsPointerEvent::PalmErase {
+                    phase: PalmErasePhase::Move,
+                    sample,
+                })
+            }
+            (true, false) => sample.map(|sample| WindowsPointerEvent::PalmErase {
+                phase: PalmErasePhase::End,
+                sample,
+            }),
+            _ => None,
+        };
+
+        let claimed = session_owned
+            || tracked_in_batch
+            || system_palm_in_batch
+            || new_candidate
+            || !self.wm_touch_candidate_ids.is_empty()
+            || was_active
+            || is_active;
+        if claimed {
+            self.wm_touch_owned_ids.extend(
+                updates
+                    .iter()
+                    .filter(|update| {
+                        !update.ended && !self.wm_touch_passthrough_ids.contains(&update.id)
+                    })
+                    .map(|update| update.id),
+            );
+        } else if !gate_enabled {
+            self.wm_touch_passthrough_ids.extend(
+                updates
+                    .iter()
+                    .filter(|update| !update.ended)
+                    .map(|update| update.id),
+            );
+        }
+
+        let candidate_point = self
+            .wm_touch_candidate_ids
+            .iter()
+            .filter_map(|id| self.wm_touch_contacts.get(id).map(|contact| (*id, contact)))
+            .min_by(|(left_id, left), (right_id, right)| {
+                left.started_at
+                    .cmp(&right.started_at)
+                    .then_with(|| left_id.cmp(right_id))
+            })
+            .map(|(_, contact)| contact.geometry.center());
+        for update in updates.iter().filter(|update| update.ended) {
+            self.wm_touch_contacts.remove(&update.id);
+            self.wm_touch_candidate_ids.remove(&update.id);
+            self.wm_touch_owned_ids.remove(&update.id);
+            self.wm_touch_passthrough_ids.remove(&update.id);
+        }
+        let candidate_session_ended = self.wm_touch_candidate_ids.is_empty();
+        let event = palm_event.or_else(|| {
+            if !ending_candidates.is_empty() {
+                Some(WindowsPointerEvent::CandidateCancelled {
+                    session_ended: candidate_session_ended,
+                })
+            } else if (new_candidate || candidate_touched) && candidate_point.is_some() {
+                Some(WindowsPointerEvent::PalmCandidate {
+                    point: candidate_point.expect("候选位置已经检查"),
+                })
+            } else {
+                None
+            }
+        });
+        if updates.iter().any(|update| update.ended) && (system_palm_in_batch || tracked_in_batch) {
+            tracing::debug!(
+                source = "WM_TOUCH",
+                remaining_palms = self.wm_touch_palms.len(),
+                remaining_owned = self.wm_touch_owned_ids.len(),
+                "WM_TOUCH 已接管接触结束"
+            );
+        }
+        WmTouchBatchOutcome { claimed, event }
     }
 
     /// 更新触控笔靠近和接触状态，并输出原生批量书写采样。
@@ -435,6 +735,8 @@ impl WindowsPointerTracker {
             self.candidate_ids.clear();
             self.palm_ids.clear();
             self.palm_started = false;
+            self.wm_touch_contacts.clear();
+            self.wm_touch_candidate_ids.clear();
             self.wm_touch_palms.clear();
         }
         let was_in_contact = self.pen_contact_ids.contains(&pointer_id);
@@ -610,9 +912,27 @@ impl WindowsPointerTracker {
             return self.finish_touch(pointer_id);
         }
 
-        self.refresh_candidates(window_dpi_scale(message.hwnd));
+        let dpi_scale = window_dpi_scale(message.hwnd);
+        let gate_enabled = self.refresh_candidates_for_message(dpi_scale);
+        if !gate_enabled
+            && message.message == WM_POINTERDOWN
+            && let Some(touch) = self.touches.get(&pointer_id)
+        {
+            tracing::debug!(
+                source = "WM_POINTER",
+                pointer_id,
+                gate_enabled,
+                confident = touch.confident,
+                width = touch.geometry.width(),
+                height = touch.geometry.height(),
+                dpi_scale,
+                swallow_winit = false,
+                "画布门已关闭，未标记 WM_POINTER 接触保持由 winit 拥有"
+            );
+        }
         if self.candidate_ids.contains(&pointer_id) {
             if self.candidate_confirmed(now) {
+                let was_started = self.palm_started;
                 self.palm_ids.extend(self.candidate_ids.iter().copied());
                 let Some(sample) = self.palm_sample() else {
                     return WindowsPointerDispatch {
@@ -631,6 +951,14 @@ impl WindowsPointerTracker {
                     self.palm_started = true;
                     PalmErasePhase::Begin
                 };
+                if !was_started {
+                    tracing::debug!(
+                        source = "WM_POINTER",
+                        gate_enabled,
+                        palm_count = self.palm_ids.len(),
+                        "WM_POINTER 候选已提升为手掌"
+                    );
+                }
                 return WindowsPointerDispatch {
                     event: Some(WindowsPointerEvent::PalmErase { phase, sample }),
                     swallow_winit: true,
@@ -781,6 +1109,7 @@ impl WindowsPointerTracker {
         if ended {
             self.palm_started = false;
             self.candidate_ids.clear();
+            tracing::debug!(source = "WM_POINTER", pointer_id, "WM_POINTER 手掌会话结束");
         }
         WindowsPointerDispatch {
             event: sample.map(|sample| WindowsPointerEvent::PalmErase {
@@ -795,31 +1124,94 @@ impl WindowsPointerTracker {
         }
     }
 
+    /// 按画布门分类当前消息，并保留 gate 关闭时已交给 winit 的接触所有权。
+    fn refresh_candidates_for_message(&mut self, dpi_scale: f32) -> bool {
+        let enabled = self.canvas_palm_capture.load();
+        if enabled {
+            self.refresh_candidates(dpi_scale);
+        } else {
+            self.touch_passthrough_ids.extend(
+                self.touches
+                    .keys()
+                    .filter(|pointer_id| {
+                        !self.candidate_ids.contains(pointer_id)
+                            && !self.palm_ids.contains(pointer_id)
+                    })
+                    .copied(),
+            );
+        }
+        enabled
+    }
+
     /// 根据单接触面积、置信度和聚集多触点联合范围更新候选集合。
     fn refresh_candidates(&mut self, dpi_scale: f32) {
         let thresholds = PalmThresholds::for_preset(self.palm_size_preset.load(), dpi_scale);
-        for (pointer_id, touch) in &self.touches {
-            if !touch.confident
-                || (touch.geometry.area() >= thresholds.single_min_area
-                    && touch.geometry.major_axis() >= thresholds.single_min_major_axis)
+        for (pointer_id, touch) in self
+            .touches
+            .iter()
+            .filter(|(pointer_id, _)| !self.touch_passthrough_ids.contains(pointer_id))
+        {
+            let reason = if !touch.confident {
+                Some("low_confidence")
+            } else if geometry_is_single_palm(touch.geometry, thresholds) {
+                Some("size")
+            } else {
+                None
+            };
+            if let Some(reason) = reason
+                && self.candidate_ids.insert(*pointer_id)
             {
-                self.candidate_ids.insert(*pointer_id);
+                tracing::debug!(
+                    source = "WM_POINTER",
+                    pointer_id,
+                    reason,
+                    confident = touch.confident,
+                    width = touch.geometry.width(),
+                    height = touch.geometry.height(),
+                    area = touch.geometry.area(),
+                    major_axis = touch.geometry.major_axis(),
+                    dpi_scale,
+                    single_min_area = thresholds.single_min_area,
+                    single_min_major_axis = thresholds.single_min_major_axis,
+                    "WM_POINTER 接触进入手掌候选"
+                );
             }
         }
 
-        if self.touches.len() >= 2 {
+        let eligible_count = self
+            .touches
+            .keys()
+            .filter(|pointer_id| !self.touch_passthrough_ids.contains(pointer_id))
+            .count();
+        if eligible_count >= 2 {
             let union = self
                 .touches
-                .values()
-                .map(|touch| touch.geometry)
+                .iter()
+                .filter(|(pointer_id, _)| !self.touch_passthrough_ids.contains(pointer_id))
+                .map(|(_, touch)| touch.geometry)
                 .reduce(ContactGeometry::union);
-            if let Some(union) = union {
-                let major_axis = union.major_axis();
-                if union.area() >= thresholds.cluster_min_area
-                    && (thresholds.cluster_min_major_axis..=thresholds.cluster_max_major_axis)
-                        .contains(&major_axis)
+            if let Some(union) = union
+                && geometry_is_palm_cluster(union, thresholds)
+            {
+                for pointer_id in self
+                    .touches
+                    .keys()
+                    .filter(|pointer_id| !self.touch_passthrough_ids.contains(pointer_id))
                 {
-                    self.candidate_ids.extend(self.touches.keys().copied());
+                    if self.candidate_ids.insert(*pointer_id) {
+                        tracing::debug!(
+                            source = "WM_POINTER",
+                            pointer_id,
+                            reason = "cluster",
+                            cluster_area = union.area(),
+                            cluster_major_axis = union.major_axis(),
+                            dpi_scale,
+                            cluster_min_area = thresholds.cluster_min_area,
+                            cluster_min_major_axis = thresholds.cluster_min_major_axis,
+                            cluster_max_major_axis = thresholds.cluster_max_major_axis,
+                            "WM_POINTER 接触簇进入手掌候选"
+                        );
+                    }
                 }
             }
         }
@@ -863,6 +1255,7 @@ impl WindowsPointerTracker {
     /// 从所有跟踪集合中移除一个触摸标识。
     fn remove_touch(&mut self, pointer_id: u32) {
         self.touches.remove(&pointer_id);
+        self.touch_passthrough_ids.remove(&pointer_id);
         self.candidate_ids.remove(&pointer_id);
         self.palm_ids.remove(&pointer_id);
     }
@@ -914,15 +1307,121 @@ fn chronological_touch_history(
 struct WmTouchPalmUpdate {
     id: u32,
     geometry: Option<ContactGeometry>,
+    measured_geometry: Option<ContactGeometry>,
+    system_palm: bool,
+    started: bool,
     ended: bool,
 }
 
-/// 判断 WM_TOUCH 接触是否由系统手掌分支负责，已跟踪接触需持续接管到结束。
-fn wm_touch_input_is_claimed(input: &TOUCHINPUT, tracked: bool) -> bool {
-    tracked || input.dwFlags.contains(TOUCHEVENTF_PALM)
+/// 一个带有效 CONTACTAREA 的 WM_TOUCH 接触及其首次观察时间。
+struct WmTouchContact {
+    geometry: ContactGeometry,
+    started_at: Instant,
+}
+
+/// 一批 WM_TOUCH 状态更新产生的句柄所有权与可选高层事件。
+struct WmTouchBatchOutcome {
+    claimed: bool,
+    event: Option<WindowsPointerEvent>,
+}
+
+/// 判断显式系统手掌或已跟踪接触是否必须继续由应用拥有。
+#[cfg(test)]
+fn wm_touch_input_is_claimed(system_palm: bool, tracked: bool) -> bool {
+    tracked || system_palm
+}
+
+/// 仅对已接管 WM_TOUCH 批次执行一次关闭动作。
+fn close_wm_touch_batch_if_claimed(claimed: bool, mut close: impl FnMut()) {
+    if claimed {
+        close();
+    }
+}
+
+/// 按单接触与多接触阈值更新 WM_TOUCH 候选集合，并记录首次分类原因。
+fn refresh_wm_touch_candidates(
+    contacts: &HashMap<u32, WmTouchContact>,
+    candidate_ids: &mut HashSet<u32>,
+    passthrough_ids: &HashSet<u32>,
+    thresholds: PalmThresholds,
+    dpi_scale: f32,
+) -> bool {
+    let mut changed = false;
+    for (pointer_id, contact) in contacts
+        .iter()
+        .filter(|(pointer_id, _)| !passthrough_ids.contains(pointer_id))
+    {
+        if geometry_is_single_palm(contact.geometry, thresholds)
+            && candidate_ids.insert(*pointer_id)
+        {
+            changed = true;
+            tracing::debug!(
+                source = "WM_TOUCH",
+                pointer_id,
+                reason = "size",
+                width = contact.geometry.width(),
+                height = contact.geometry.height(),
+                area = contact.geometry.area(),
+                major_axis = contact.geometry.major_axis(),
+                dpi_scale,
+                single_min_area = thresholds.single_min_area,
+                single_min_major_axis = thresholds.single_min_major_axis,
+                "WM_TOUCH 接触进入手掌候选"
+            );
+        }
+    }
+
+    let eligible_count = contacts
+        .keys()
+        .filter(|pointer_id| !passthrough_ids.contains(pointer_id))
+        .count();
+    if eligible_count >= 2
+        && let Some(union) = contacts
+            .iter()
+            .filter(|(pointer_id, _)| !passthrough_ids.contains(pointer_id))
+            .map(|(_, contact)| contact.geometry)
+            .reduce(ContactGeometry::union)
+        && geometry_is_palm_cluster(union, thresholds)
+    {
+        for pointer_id in contacts
+            .keys()
+            .filter(|pointer_id| !passthrough_ids.contains(pointer_id))
+        {
+            if candidate_ids.insert(*pointer_id) {
+                changed = true;
+                tracing::debug!(
+                    source = "WM_TOUCH",
+                    pointer_id,
+                    reason = "cluster",
+                    cluster_area = union.area(),
+                    cluster_major_axis = union.major_axis(),
+                    dpi_scale,
+                    cluster_min_area = thresholds.cluster_min_area,
+                    cluster_min_major_axis = thresholds.cluster_min_major_axis,
+                    cluster_max_major_axis = thresholds.cluster_max_major_axis,
+                    "WM_TOUCH 接触簇进入手掌候选"
+                );
+            }
+        }
+    }
+    changed
+}
+
+/// 返回单个接触是否达到当前 DPI 与预设下的手掌几何阈值。
+fn geometry_is_single_palm(geometry: ContactGeometry, thresholds: PalmThresholds) -> bool {
+    geometry.area() >= thresholds.single_min_area
+        && geometry.major_axis() >= thresholds.single_min_major_axis
+}
+
+/// 返回接触联合范围是否达到当前 DPI 与预设下的手掌簇阈值。
+fn geometry_is_palm_cluster(geometry: ContactGeometry, thresholds: PalmThresholds) -> bool {
+    geometry.area() >= thresholds.cluster_min_area
+        && (thresholds.cluster_min_major_axis..=thresholds.cluster_max_major_axis)
+            .contains(&geometry.major_axis())
 }
 
 /// 应用一批系统手掌更新，并把活动集合变化归一化为一个擦除阶段。
+#[cfg(test)]
 fn apply_wm_touch_palm_updates(
     palms: &mut HashMap<u32, ContactGeometry>,
     updates: &[WmTouchPalmUpdate],
@@ -1328,6 +1827,9 @@ mod tests {
         WmTouchPalmUpdate {
             id,
             geometry: Some(geometry),
+            measured_geometry: Some(geometry),
+            system_palm: true,
+            started: !ended,
             ended,
         }
     }
@@ -1341,9 +1843,18 @@ mod tests {
             ..TOUCHINPUT::default()
         };
 
-        assert!(!wm_touch_input_is_claimed(&ordinary, false));
-        assert!(wm_touch_input_is_claimed(&system_palm, false));
-        assert!(wm_touch_input_is_claimed(&ordinary, true));
+        assert!(!wm_touch_input_is_claimed(
+            ordinary.dwFlags.contains(TOUCHEVENTF_PALM),
+            false
+        ));
+        assert!(wm_touch_input_is_claimed(
+            system_palm.dwFlags.contains(TOUCHEVENTF_PALM),
+            false
+        ));
+        assert!(wm_touch_input_is_claimed(
+            ordinary.dwFlags.contains(TOUCHEVENTF_PALM),
+            true
+        ));
     }
 
     /// 验证系统手掌从按下、移动到抬起产生完整且会清理状态的擦除生命周期。
@@ -1426,6 +1937,486 @@ mod tests {
         let measured = wm_touch_geometry_from_center(&measured_input, center);
         assert_eq!(measured.width(), 40.0);
         assert_eq!(measured.height(), 60.0);
+    }
+
+    /// 创建可直接送入 WM_TOUCH 纯状态机的归一化接触更新。
+    fn wm_touch_state_update(
+        id: u32,
+        geometry: ContactGeometry,
+        has_contact_area: bool,
+        system_palm: bool,
+        started: bool,
+        ended: bool,
+    ) -> WmTouchPalmUpdate {
+        WmTouchPalmUpdate {
+            id,
+            geometry: Some(geometry),
+            measured_geometry: has_contact_area.then_some(geometry),
+            system_palm,
+            started,
+            ended,
+        }
+    }
+
+    /// 创建启用画布几何接管门的 WM_TOUCH 跟踪器。
+    fn wm_touch_canvas_tracker() -> (WindowsPointerTracker, SharedCanvasPalmCapture) {
+        let gate = SharedCanvasPalmCapture::default();
+        gate.store(true);
+        (
+            WindowsPointerTracker::with_palm_configuration(
+                SharedPalmSizePreset::default(),
+                gate.clone(),
+            ),
+            gate,
+        )
+    }
+
+    /// 验证无笔设备的未标记大接触经过候选确认后产生完整擦除生命周期。
+    #[test]
+    fn wm_touch_unflagged_large_contact_erases_without_pen() {
+        let (mut tracker, _) = wm_touch_canvas_tracker();
+        let now = Instant::now();
+        let large = contact_geometry(0.0, 0.0, 80.0, 80.0);
+
+        let down = tracker.process_wm_touch_updates(
+            &[wm_touch_state_update(7, large, true, false, true, false)],
+            1.0,
+            now,
+        );
+        assert!(down.claimed);
+        assert!(matches!(
+            down.event,
+            Some(WindowsPointerEvent::PalmCandidate { .. })
+        ));
+        assert!(tracker.pen_ids.is_empty());
+
+        let moved = tracker.process_wm_touch_updates(
+            &[wm_touch_state_update(7, large, true, false, false, false)],
+            1.0,
+            now + PALM_CONFIRMATION_DELAY,
+        );
+        assert!(matches!(
+            moved.event,
+            Some(WindowsPointerEvent::PalmErase {
+                phase: PalmErasePhase::Begin,
+                ..
+            })
+        ));
+
+        let up = tracker.process_wm_touch_updates(
+            &[wm_touch_state_update(7, large, false, false, false, true)],
+            1.0,
+            now + PALM_CONFIRMATION_DELAY,
+        );
+        assert!(up.claimed);
+        assert!(matches!(
+            up.event,
+            Some(WindowsPointerEvent::PalmErase {
+                phase: PalmErasePhase::End,
+                ..
+            })
+        ));
+        assert!(tracker.wm_touch_owned_ids.is_empty());
+    }
+
+    /// 验证普通手指和缺少 CONTACTAREA 的未标记接触始终交回 winit。
+    #[test]
+    fn wm_touch_ordinary_or_missing_area_contact_is_pass_through() {
+        let (mut tracker, _) = wm_touch_canvas_tracker();
+        let now = Instant::now();
+        let finger = contact_geometry(0.0, 0.0, 60.0, 60.0);
+        let large = contact_geometry(0.0, 0.0, 100.0, 100.0);
+
+        let finger_down = tracker.process_wm_touch_updates(
+            &[wm_touch_state_update(1, finger, true, false, true, false)],
+            1.0,
+            now,
+        );
+        assert!(!finger_down.claimed);
+        assert!(finger_down.event.is_none());
+
+        let missing_area = tracker.process_wm_touch_updates(
+            &[wm_touch_state_update(2, large, false, false, true, false)],
+            1.0,
+            now,
+        );
+        assert!(!missing_area.claimed);
+        assert!(missing_area.event.is_none());
+    }
+
+    /// 验证显式系统手掌缺少面积时仍使用安全几何，并由已跟踪无标记 Up 结束。
+    #[test]
+    fn wm_touch_system_palm_uses_fallback_and_claims_unflagged_up() {
+        let mut tracker = WindowsPointerTracker::default();
+        let now = Instant::now();
+        let fallback = contact_geometry(-8.0, -8.0, 8.0, 8.0);
+
+        let down = tracker.process_wm_touch_updates(
+            &[wm_touch_state_update(9, fallback, false, true, true, false)],
+            1.0,
+            now,
+        );
+        assert!(down.claimed);
+        assert!(matches!(
+            down.event,
+            Some(WindowsPointerEvent::PalmErase {
+                phase: PalmErasePhase::Begin,
+                sample: EraseSample {
+                    radius_x: MIN_CONTACT_RADIUS,
+                    radius_y: MIN_CONTACT_RADIUS,
+                    ..
+                }
+            })
+        ));
+
+        let up = tracker.process_wm_touch_updates(
+            &[wm_touch_state_update(
+                9, fallback, false, false, false, true,
+            )],
+            1.0,
+            now,
+        );
+        assert!(up.claimed);
+        assert!(matches!(
+            up.event,
+            Some(WindowsPointerEvent::PalmErase {
+                phase: PalmErasePhase::End,
+                ..
+            })
+        ));
+    }
+
+    /// 验证 100% 至 250% DPI 下等价大接触都进入候选，普通手指都旁路。
+    #[test]
+    fn wm_touch_geometry_fallback_preserves_supported_dpi_classification() {
+        for dpi_scale in [1.0, 1.5, 2.0, 2.5] {
+            let (mut tracker, _) = wm_touch_canvas_tracker();
+            let now = Instant::now();
+            let finger = contact_geometry(0.0, 0.0, 60.0 * dpi_scale, 60.0 * dpi_scale);
+            let palm = contact_geometry(0.0, 0.0, 80.0 * dpi_scale, 80.0 * dpi_scale);
+
+            assert!(
+                !tracker
+                    .process_wm_touch_updates(
+                        &[wm_touch_state_update(1, finger, true, false, true, false)],
+                        dpi_scale,
+                        now,
+                    )
+                    .claimed
+            );
+            assert!(
+                tracker
+                    .process_wm_touch_updates(
+                        &[wm_touch_state_update(2, palm, true, false, true, false)],
+                        dpi_scale,
+                        now,
+                    )
+                    .claimed
+            );
+        }
+    }
+
+    /// 验证双触点簇可成为候选，且混合批次的普通接触保持所有权直到 Up。
+    #[test]
+    fn wm_touch_cluster_and_mixed_batch_preserve_batch_ownership() {
+        let (mut cluster_tracker, _) = wm_touch_canvas_tracker();
+        let now = Instant::now();
+        let left = contact_geometry(0.0, 0.0, 40.0, 60.0);
+        let right = contact_geometry(70.0, 0.0, 110.0, 60.0);
+        let cluster = cluster_tracker.process_wm_touch_updates(
+            &[
+                wm_touch_state_update(1, left, true, false, true, false),
+                wm_touch_state_update(2, right, true, false, true, false),
+            ],
+            1.0,
+            now,
+        );
+        assert!(cluster.claimed);
+        assert!(matches!(
+            cluster.event,
+            Some(WindowsPointerEvent::PalmCandidate {
+                point: CanvasPoint { x: 20.0, y: 30.0 }
+            })
+        ));
+        assert_eq!(cluster_tracker.wm_touch_candidate_ids.len(), 2);
+
+        let (mut mixed_tracker, _) = wm_touch_canvas_tracker();
+        let palm = contact_geometry(0.0, 0.0, 80.0, 80.0);
+        let ordinary = contact_geometry(500.0, 0.0, 530.0, 30.0);
+        let mixed = mixed_tracker.process_wm_touch_updates(
+            &[
+                wm_touch_state_update(7, palm, true, false, true, false),
+                wm_touch_state_update(8, ordinary, true, false, true, false),
+            ],
+            1.0,
+            now,
+        );
+        assert!(mixed.claimed);
+        assert!(mixed_tracker.wm_touch_owned_ids.contains(&8));
+        assert!(!mixed_tracker.wm_touch_candidate_ids.contains(&8));
+
+        let palm_up = mixed_tracker.process_wm_touch_updates(
+            &[wm_touch_state_update(7, palm, false, false, false, true)],
+            1.0,
+            now,
+        );
+        assert!(palm_up.claimed);
+        assert!(mixed_tracker.wm_touch_owned_ids.contains(&8));
+
+        let ordinary_up = mixed_tracker.process_wm_touch_updates(
+            &[wm_touch_state_update(
+                8, ordinary, false, false, false, true,
+            )],
+            1.0,
+            now,
+        );
+        assert!(ordinary_up.claimed);
+        assert!(mixed_tracker.wm_touch_owned_ids.is_empty());
+    }
+
+    /// 验证模式门关闭后不新增候选，但已接管 ID 仍完整处理到 Up。
+    #[test]
+    fn wm_touch_mode_switch_preserves_claimed_contact_lifecycle() {
+        let (mut tracker, gate) = wm_touch_canvas_tracker();
+        let now = Instant::now();
+        let palm = contact_geometry(0.0, 0.0, 80.0, 80.0);
+        assert!(
+            tracker
+                .process_wm_touch_updates(
+                    &[wm_touch_state_update(7, palm, true, false, true, false)],
+                    1.0,
+                    now,
+                )
+                .claimed
+        );
+
+        gate.store(false);
+        let moved = tracker.process_wm_touch_updates(
+            &[wm_touch_state_update(7, palm, true, false, false, false)],
+            1.0,
+            now + PALM_CONFIRMATION_DELAY,
+        );
+        assert!(moved.claimed);
+        assert!(matches!(
+            moved.event,
+            Some(WindowsPointerEvent::PalmErase {
+                phase: PalmErasePhase::Begin,
+                ..
+            })
+        ));
+        assert!(
+            tracker
+                .process_wm_touch_updates(
+                    &[wm_touch_state_update(7, palm, false, false, false, true)],
+                    1.0,
+                    now + PALM_CONFIRMATION_DELAY,
+                )
+                .claimed
+        );
+
+        let next = tracker.process_wm_touch_updates(
+            &[wm_touch_state_update(10, palm, true, false, true, false)],
+            1.0,
+            now + PALM_CONFIRMATION_DELAY,
+        );
+        assert!(!next.claimed);
+    }
+
+    /// 验证 idle 中已交给 winit 的接触不会在进入批注后被同一生命周期追回。
+    #[test]
+    fn wm_touch_idle_passthrough_stays_winit_owned_until_up() {
+        let gate = SharedCanvasPalmCapture::default();
+        let mut tracker = WindowsPointerTracker::with_palm_configuration(
+            SharedPalmSizePreset::default(),
+            gate.clone(),
+        );
+        let now = Instant::now();
+        let palm_geometry = contact_geometry(0.0, 0.0, 80.0, 80.0);
+
+        let idle_down = tracker.process_wm_touch_updates(
+            &[wm_touch_state_update(
+                7,
+                palm_geometry,
+                true,
+                false,
+                true,
+                false,
+            )],
+            1.0,
+            now,
+        );
+        assert!(!idle_down.claimed);
+        assert!(tracker.wm_touch_passthrough_ids.contains(&7));
+
+        gate.store(true);
+        let annotation_move = tracker.process_wm_touch_updates(
+            &[wm_touch_state_update(
+                7,
+                palm_geometry,
+                true,
+                false,
+                false,
+                false,
+            )],
+            1.0,
+            now + PALM_CONFIRMATION_DELAY,
+        );
+        assert!(!annotation_move.claimed);
+
+        let up = tracker.process_wm_touch_updates(
+            &[wm_touch_state_update(
+                7,
+                palm_geometry,
+                false,
+                false,
+                false,
+                true,
+            )],
+            1.0,
+            now + PALM_CONFIRMATION_DELAY,
+        );
+        assert!(!up.claimed);
+        assert!(!tracker.wm_touch_passthrough_ids.contains(&7));
+
+        let next_down = tracker.process_wm_touch_updates(
+            &[wm_touch_state_update(
+                7,
+                palm_geometry,
+                true,
+                false,
+                true,
+                false,
+            )],
+            1.0,
+            now + PALM_CONFIRMATION_DELAY,
+        );
+        assert!(next_down.claimed);
+    }
+
+    /// 验证混合接管批次不会夺回模式切换前已交给 winit 的其他接触。
+    #[test]
+    fn wm_touch_mixed_batch_preserves_existing_winit_owned_contact() {
+        let gate = SharedCanvasPalmCapture::default();
+        let mut tracker = WindowsPointerTracker::with_palm_configuration(
+            SharedPalmSizePreset::default(),
+            gate.clone(),
+        );
+        let now = Instant::now();
+        let ordinary = contact_geometry(500.0, 0.0, 530.0, 30.0);
+        let palm = contact_geometry(0.0, 0.0, 80.0, 80.0);
+
+        let idle_down = tracker.process_wm_touch_updates(
+            &[wm_touch_state_update(7, ordinary, true, false, true, false)],
+            1.0,
+            now,
+        );
+        assert!(!idle_down.claimed);
+        assert!(tracker.wm_touch_passthrough_ids.contains(&7));
+
+        gate.store(true);
+        let mixed = tracker.process_wm_touch_updates(
+            &[
+                wm_touch_state_update(7, ordinary, true, false, false, false),
+                wm_touch_state_update(8, palm, true, true, true, false),
+            ],
+            1.0,
+            now,
+        );
+        assert!(mixed.claimed);
+        assert!(tracker.wm_touch_passthrough_ids.contains(&7));
+        assert!(!tracker.wm_touch_owned_ids.contains(&7));
+        assert!(tracker.wm_touch_owned_ids.contains(&8));
+
+        let palm_up = tracker.process_wm_touch_updates(
+            &[wm_touch_state_update(8, palm, false, false, false, true)],
+            1.0,
+            now,
+        );
+        assert!(palm_up.claimed);
+
+        let ordinary_up = tracker.process_wm_touch_updates(
+            &[wm_touch_state_update(
+                7, ordinary, false, false, false, true,
+            )],
+            1.0,
+            now,
+        );
+        assert!(!ordinary_up.claimed);
+        assert!(!tracker.wm_touch_passthrough_ids.contains(&7));
+    }
+
+    /// 验证同一接触后来获得系统手掌标志时可覆盖旧的 winit 所有权。
+    #[test]
+    fn wm_touch_system_palm_overrides_existing_winit_ownership() {
+        let gate = SharedCanvasPalmCapture::default();
+        let mut tracker =
+            WindowsPointerTracker::with_palm_configuration(SharedPalmSizePreset::default(), gate);
+        let now = Instant::now();
+        let palm = contact_geometry(0.0, 0.0, 80.0, 80.0);
+
+        let ordinary_down = tracker.process_wm_touch_updates(
+            &[wm_touch_state_update(9, palm, true, false, true, false)],
+            1.0,
+            now,
+        );
+        assert!(!ordinary_down.claimed);
+        assert!(tracker.wm_touch_passthrough_ids.contains(&9));
+
+        let flagged_move = tracker.process_wm_touch_updates(
+            &[wm_touch_state_update(9, palm, true, true, false, false)],
+            1.0,
+            now,
+        );
+        assert!(flagged_move.claimed);
+        assert!(!tracker.wm_touch_passthrough_ids.contains(&9));
+        assert!(tracker.wm_touch_owned_ids.contains(&9));
+        assert!(matches!(
+            flagged_move.event,
+            Some(WindowsPointerEvent::PalmErase {
+                phase: PalmErasePhase::Begin,
+                ..
+            })
+        ));
+    }
+
+    /// 验证已接管批次的关闭动作执行一次，旁路批次不执行关闭动作。
+    #[test]
+    fn wm_touch_batch_close_action_runs_exactly_once_when_claimed() {
+        let mut close_count = 0;
+        close_wm_touch_batch_if_claimed(true, || close_count += 1);
+        assert_eq!(close_count, 1);
+
+        let mut pass_through_close_count = 0;
+        close_wm_touch_batch_if_claimed(false, || pass_through_close_count += 1);
+        assert_eq!(pass_through_close_count, 0);
+    }
+
+    /// 验证 idle 门关闭时 low-confidence WM_POINTER 不进入候选，开启后才接管。
+    #[test]
+    fn wm_pointer_low_confidence_heuristic_obeys_canvas_gate() {
+        let gate = SharedCanvasPalmCapture::default();
+        let mut tracker = WindowsPointerTracker::with_palm_configuration(
+            SharedPalmSizePreset::default(),
+            gate.clone(),
+        );
+        let mut contact = touch_contact();
+        contact.confident = false;
+        tracker.touches.insert(7, contact);
+
+        assert!(!tracker.refresh_candidates_for_message(1.0));
+        assert!(tracker.candidate_ids.is_empty());
+        assert!(tracker.touch_passthrough_ids.contains(&7));
+
+        gate.store(true);
+        assert!(tracker.refresh_candidates_for_message(1.0));
+        assert!(tracker.candidate_ids.is_empty());
+
+        tracker.remove_touch(7);
+        let mut next_contact = touch_contact();
+        next_contact.confident = false;
+        tracker.touches.insert(8, next_contact);
+        assert!(tracker.refresh_candidates_for_message(1.0));
+        assert!(tracker.candidate_ids.contains(&8));
     }
 
     /// 验证接触标记在更新消息中消失时立即取消旧笔会话。
@@ -1605,10 +2596,10 @@ mod tests {
     /// 验证 DPI 放大后的同一逻辑接触保持普通手指或手掌的原分类结果。
     #[test]
     fn dpi_scaled_thresholds_preserve_logical_contact_classification() {
-        assert!(!square_contact_is_candidate(60.0, 1.0));
-        assert!(!square_contact_is_candidate(120.0, 2.0));
-        assert!(square_contact_is_candidate(80.0, 1.0));
-        assert!(square_contact_is_candidate(160.0, 2.0));
+        for dpi_scale in [1.0, 1.5, 2.0, 2.5] {
+            assert!(!square_contact_is_candidate(60.0 * dpi_scale, dpi_scale));
+            assert!(square_contact_is_candidate(80.0 * dpi_scale, dpi_scale));
+        }
     }
 
     /// 验证无效 DPI 比例统一退化为 100% 分类阈值。

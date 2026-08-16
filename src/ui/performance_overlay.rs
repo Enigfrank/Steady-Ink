@@ -54,6 +54,35 @@ pub(super) fn render(context: &egui::Context, snapshot: PerformanceSnapshot, rea
                     metric_row(ui, "可见笔画", snapshot.visible_strokes().to_string());
                     metric_row(
                         ui,
+                        "画面 G/S/P",
+                        format!(
+                            "{}/{}/{}",
+                            snapshot.generated_frames(),
+                            snapshot.submitted_frames(),
+                            snapshot.presented_frames()
+                        ),
+                    );
+                    metric_row(
+                        ui,
+                        "丢弃 / 替换",
+                        format!(
+                            "{} / {}",
+                            snapshot.discarded_frames(),
+                            snapshot.mailbox_replacements()
+                        ),
+                    );
+                    metric_row(
+                        ui,
+                        "活动点 / 增量",
+                        format!(
+                            "{} / {}",
+                            snapshot.active_samples(),
+                            snapshot.incremental_primitives()
+                        ),
+                    );
+                    metric_row(ui, "活动回退", snapshot.full_active_fallbacks().to_string());
+                    metric_row(
+                        ui,
                         "缓存重建",
                         format!(
                             "{} / {}",

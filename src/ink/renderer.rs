@@ -9,8 +9,8 @@ use super::{
     InkDocument, InkOperation, InkSpatialIndex, InkTool, OperationId, PenWidth,
     VariableStrokePoint,
     active_stroke::{
-        ActiveStrokeRenderCache, ActiveStrokeReplay, ActiveStrokeStyle, fixed_ink_bounds,
-        variable_ink_bounds,
+        ACTIVE_AA_PAD, ActiveStrokeRenderCache, ActiveStrokeReplay, ActiveStrokeStyle,
+        fixed_ink_bounds, variable_ink_bounds,
     },
     stroke_geometry::{
         CubicBezierSegment, append_closed_bezier_path, append_open_bezier_path,
@@ -626,8 +626,9 @@ pub(crate) fn replay_active_stroke_regions(
         let Some(dirty_pixels) = clipped_replay_pixels(canvas, dirty) else {
             continue;
         };
-        let raster_bounds =
-            replay_raster_bounds(cache, replay).map_or(dirty, |geometry| dirty.union(geometry));
+        let raster_bounds = replay_raster_bounds(cache, replay)
+            .map_or(dirty, |geometry| dirty.union(geometry))
+            .expanded(ACTIVE_AA_PAD * 2.0);
         let Some(raster_pixels) = clipped_replay_pixels(canvas, raster_bounds) else {
             continue;
         };
@@ -1123,7 +1124,7 @@ mod tests {
             CanvasPoint::new(60.0, 72.0),
             CanvasPoint::new(88.0, 44.0),
             CanvasPoint::new(116.0, 76.0),
-            CanvasPoint::new(152.0, 56.0),
+            CanvasPoint::new(152.0, 100.0),
         ];
         for style in [
             ActiveStrokeStyle::Fixed {

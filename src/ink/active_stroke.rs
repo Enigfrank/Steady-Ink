@@ -537,8 +537,11 @@ impl ActiveStrokeRenderCache {
             work.full_redraw = true;
             return;
         }
+        let replay_bounds =
+            fixed_ink_bounds(&[], &self.primitives[segment_range.clone()], width.pixels())
+                .map_or(dirty, |bounds| dirty.union(bounds));
         self.replay_regions.push(ActiveStrokeReplay::Fixed {
-            bounds: dirty,
+            bounds: replay_bounds,
             segment_range,
         });
     }
@@ -656,8 +659,10 @@ impl ActiveStrokeRenderCache {
                 self.replay_regions.clear();
                 return;
             };
+            let replay_bounds = variable_ink_bounds(&self.filtered_variable_points, &point_range)
+                .map_or(dirty, |bounds| dirty.union(bounds));
             self.replay_regions.push(ActiveStrokeReplay::Natural {
-                bounds: dirty,
+                bounds: replay_bounds,
                 point_range,
             });
         }
@@ -771,7 +776,7 @@ struct Bounds {
     bottom: f32,
 }
 
-const ACTIVE_AA_PAD: f32 = 2.0;
+pub(crate) const ACTIVE_AA_PAD: f32 = 2.0;
 const ACTIVE_SPATIAL_CELL_SIZE: f32 = 128.0;
 const MAX_SPATIAL_CELLS_PER_PRIMITIVE: i64 = 4096;
 const MAX_REPLAY_HALO_SCAN: usize = 64;
